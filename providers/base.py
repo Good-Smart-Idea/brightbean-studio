@@ -262,6 +262,20 @@ class SocialProvider(ABC):
     # Token management
     # ------------------------------------------------------------------
 
+    def get_granted_scopes(self, access_token: str) -> set[str] | None:
+        """Which of the requested scopes the platform actually granted.
+
+        Meta silently drops permissions it has not approved, or that the user
+        declined, rather than failing the grant — so a connection reports
+        healthy and only breaks later, at publish or insights time, with an
+        opaque platform error. Asking up front turns that into something we can
+        name while the user is still looking at the screen.
+
+        Returns ``None`` when the platform offers no way to ask, which callers
+        must treat as "unknown", never as "nothing granted".
+        """
+        return None
+
     def revoke_token(self, access_token: str) -> bool:
         """Revoke an OAuth token. Returns True if successful."""
         return False
