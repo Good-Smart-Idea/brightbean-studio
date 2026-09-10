@@ -70,6 +70,14 @@ class SocialAccount(models.Model):
     # a reconnect, and by the user pressing "Try again".
     webhook_retry_count = models.PositiveSmallIntegerField(default=0)
 
+    # Scopes we asked for that the grant came back without. Meta drops
+    # unapproved or declined permissions silently rather than failing the
+    # grant, so without this the account looks healthy and only breaks later at
+    # publish or insights time with an opaque platform error. Empty means
+    # "everything we asked for was granted", or that the platform gives us no
+    # way to ask.
+    missing_scopes = models.JSONField(default=list, blank=True)
+
     # Connection health
     connection_status = models.CharField(
         max_length=20,
@@ -246,6 +254,21 @@ class SocialAccount(models.Model):
     def field_config(self) -> dict:
         """Return field configuration for this platform."""
         return {**self.PLATFORM_FIELD_DEFAULTS, **self.PLATFORM_FIELD_CONFIG.get(self.platform, {})}
+
+    @property
+    def keeps_platform_grant_on_disconnect(self) -> bool:
+        """True when disconnecting here cannot revoke the platform's grant.
+
+        The Facebook-Page flows share one grant across every Page and Instagram
+        account that person connected, so the only endpoint that would revoke
+        it takes all of them down at once — see
+        ``FacebookProvider.revoke_token``. Instagram Login is excluded: its
+        token belongs to the one account, so disconnect does revoke it.
+        """
+        return self.platform in {
+            PlatformCredential.Platform.FACEBOOK,
+            PlatformCredential.Platform.INSTAGRAM,
+        }
 
     def supports_first_comment(self) -> bool:
         """Whether this account can have a first comment posted by the worker.
