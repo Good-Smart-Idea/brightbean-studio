@@ -55,11 +55,13 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
             <div x-show="confirmDisconnect" x-cloak @click.away="confirmDisconnect = false"
                  class="absolute right-4 top-12 z-10 w-64 bg-white rounded-xl shadow-xl border border-stone-200 p-4">
                 <p class="text-sm text-stone-700 mb-2">Disconnect <strong>{{ account.account_name|default:account.account_handle }}</strong>? Historical data will be preserved.</p>
-                {# Disconnecting drops our copy of the credentials; it cannot
-                   revoke the grant, because the only endpoint that would do so
-                   revokes this app for the whole person and would sever their
-                   other connected accounts. Say so rather than let "Disconnect"
-                   imply a revocation it never performs. #}
+                {% comment %}
+                Disconnecting drops our copy of the credentials; it cannot
+                revoke the grant, because the only endpoint that would do so
+                revokes this app for the whole person and would sever their
+                other connected accounts. Say so rather than let "Disconnect"
+                imply a revocation it never performs.
+                {% endcomment %}
                 {% if account.keeps_platform_grant_on_disconnect %}
                 <p class="text-xs text-stone-500 mb-3">
                     This removes the account from BrightBean only. To revoke our access entirely,
