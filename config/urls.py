@@ -17,6 +17,8 @@ urlpatterns = [
     # /organizations/api-keys/ so the page sits alongside General,
     # Workspaces, Team Members in the settings sidebar.
     path("organizations/api-keys/", include("apps.api_keys.urls")),
+    # Org-level BYOK AI provider settings (F-5.3), alongside API Keys.
+    path("organizations/ai-providers/", include("apps.credentials.urls")),
     path("workspaces/", include("apps.workspaces.urls")),
     path("members/", include("apps.members.urls")),
     path("settings/", include("apps.settings_manager.urls")),

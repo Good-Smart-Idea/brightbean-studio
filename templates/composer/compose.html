@@ -476,6 +476,13 @@
                             </div>
                             {% endif %}
                             <button type="button"
+                                    @click="showAiPanel = !showAiPanel"
+                                    {% if not ai_enabled %}title="Configure an AI provider in Organization Settings to enable this feature"{% endif %}
+                                    class="text-xs font-semibold py-1.5 px-3 rounded-full border border-stone-200 text-stone-500 hover:border-stone-300 hover:text-stone-700 transition-colors flex items-center gap-1">
+                                <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M9.5 3l1.2 3.6L14 8l-3.3 1.4L9.5 13l-1.2-3.6L5 8l3.3-1.4L9.5 3zm7 8l.8 2.4L20 14l-2.7 1L16.5 17l-.8-2.4L13 14l2.7-1L16.5 11z"/></svg>
+                                AI Assist
+                            </button>
+                            <button type="button"
                                     @click="showTemplatePicker = !showTemplatePicker; if (showTemplatePicker) $nextTick(() => htmx.trigger($refs.templatePicker, 'load-picker'))"
                                     class="text-xs font-semibold py-1.5 px-3 rounded-full border border-stone-200 text-stone-500 hover:border-stone-300 hover:text-stone-700 transition-colors flex items-center gap-1">
                                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
@@ -495,6 +502,134 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- AI Assist panel (F-2.1 / F-5.3) -->
+                    <div x-show="showAiPanel" x-cloak x-transition
+                         x-data="{ tab: 'generate', loading: false, error: '', topic: '', tone: 'professional', variations: [], hashtags: [], rewritten: '' }"
+                         class="mb-3 border border-stone-200 rounded-xl bg-stone-50 p-4">
+                        {% if ai_enabled %}
+                        <div class="flex items-center gap-2 mb-3">
+                            <button type="button" @click="tab = 'generate'; error = ''"
+                                    :class="tab === 'generate' ? 'bg-white border-stone-300 text-stone-800' : 'border-transparent text-stone-400'"
+                                    class="text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors">Generate Caption</button>
+                            <button type="button" @click="tab = 'hashtags'; error = ''"
+                                    :class="tab === 'hashtags' ? 'bg-white border-stone-300 text-stone-800' : 'border-transparent text-stone-400'"
+                                    class="text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors">Suggest Hashtags</button>
+                            <button type="button" @click="tab = 'rewrite'; error = ''"
+                                    :class="tab === 'rewrite' ? 'bg-white border-stone-300 text-stone-800' : 'border-transparent text-stone-400'"
+                                    class="text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors">Rewrite Tone</button>
+                            <button type="button" @click="showAiPanel = false" class="ml-auto text-stone-400 hover:text-stone-600 cursor-pointer">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                            </button>
+                        </div>
+
+                        <template x-if="tab === 'generate'">
+                            <div>
+                                <div class="flex gap-2 mb-2">
+                                    <input type="text" x-model="topic" placeholder="Topic or instruction, e.g. “promote our new latte”…"
+                                           class="form-input flex-1 text-sm">
+                                    <button type="button" class="btn-brand text-xs py-1.5 px-3 whitespace-nowrap disabled:opacity-50"
+                                            :disabled="loading || !topic.trim()"
+                                            @click="loading = true; error = ''; variations = [];
+                                                fetch('{% url 'composer:ai_assist' workspace_id=workspace.id %}', {
+                                                    method: 'POST',
+                                                    headers: { 'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value, 'Content-Type': 'application/x-www-form-urlencoded' },
+                                                    body: 'ai_action=generate_caption&prompt=' + encodeURIComponent(topic)
+                                                }).then(r => r.json()).then(data => {
+                                                    loading = false;
+                                                    if (data.error) { error = data.message || data.error; return; }
+                                                    variations = data.variations || [];
+                                                }).catch(() => { loading = false; error = 'Something went wrong. Try again.'; });">
+                                        <span x-show="!loading">Generate</span>
+                                        <span x-show="loading">Generating…</span>
+                                    </button>
+                                </div>
+                                <p x-show="error" x-text="error" class="text-xs text-red-500 mb-2"></p>
+                                <div class="space-y-2">
+                                    <template x-for="(v, i) in variations" :key="i">
+                                        <div class="flex items-start gap-2 bg-white border border-stone-200 rounded-lg p-2">
+                                            <p class="text-xs text-stone-700 flex-1" x-text="v"></p>
+                                            <button type="button" class="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
+                                                    @click="caption = v; debouncedPreviewUpdate(); variations = []">Insert</button>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                        </template>
+
+                        <template x-if="tab === 'hashtags'">
+                            <div>
+                                <button type="button" class="btn-brand text-xs py-1.5 px-3 mb-2 disabled:opacity-50"
+                                        :disabled="loading || !caption.trim()"
+                                        @click="loading = true; error = ''; hashtags = [];
+                                            fetch('{% url 'composer:ai_assist' workspace_id=workspace.id %}', {
+                                                method: 'POST',
+                                                headers: { 'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value, 'Content-Type': 'application/x-www-form-urlencoded' },
+                                                body: 'ai_action=suggest_hashtags&caption=' + encodeURIComponent(caption)
+                                            }).then(r => r.json()).then(data => {
+                                                loading = false;
+                                                if (data.error) { error = data.message || data.error; return; }
+                                                hashtags = data.hashtags || [];
+                                            }).catch(() => { loading = false; error = 'Something went wrong. Try again.'; });">
+                                    <span x-show="!loading">Suggest Hashtags</span>
+                                    <span x-show="loading">Thinking…</span>
+                                </button>
+                                <p x-show="!caption.trim()" class="text-xs text-stone-400 mb-2">Write a caption first.</p>
+                                <p x-show="error" x-text="error" class="text-xs text-red-500 mb-2"></p>
+                                <div class="flex flex-wrap gap-1.5">
+                                    <template x-for="(tag, i) in hashtags" :key="i">
+                                        <button type="button"
+                                                class="text-xs font-medium px-2 py-1 rounded-full bg-white border border-stone-200 text-stone-600 hover:border-orange-300 hover:text-orange-600 cursor-pointer"
+                                                @click="caption = (caption.trim() + ' ' + tag).trim(); debouncedPreviewUpdate();"
+                                                x-text="tag"></button>
+                                    </template>
+                                </div>
+                            </div>
+                        </template>
+
+                        <template x-if="tab === 'rewrite'">
+                            <div>
+                                <div class="flex gap-2 mb-2">
+                                    <select x-model="tone" class="form-input text-sm">
+                                        <option value="professional">Professional</option>
+                                        <option value="casual">Casual</option>
+                                        <option value="humorous">Humorous</option>
+                                        <option value="inspirational">Inspirational</option>
+                                        <option value="urgent">Urgent</option>
+                                    </select>
+                                    <button type="button" class="btn-brand text-xs py-1.5 px-3 whitespace-nowrap disabled:opacity-50"
+                                            :disabled="loading || !caption.trim()"
+                                            @click="loading = true; error = ''; rewritten = '';
+                                                fetch('{% url 'composer:ai_assist' workspace_id=workspace.id %}', {
+                                                    method: 'POST',
+                                                    headers: { 'X-CSRFToken': document.querySelector('[name=csrfmiddlewaretoken]').value, 'Content-Type': 'application/x-www-form-urlencoded' },
+                                                    body: 'ai_action=rewrite_tone&caption=' + encodeURIComponent(caption) + '&tone=' + encodeURIComponent(tone)
+                                                }).then(r => r.json()).then(data => {
+                                                    loading = false;
+                                                    if (data.error) { error = data.message || data.error; return; }
+                                                    rewritten = data.text || '';
+                                                }).catch(() => { loading = false; error = 'Something went wrong. Try again.'; });">
+                                        <span x-show="!loading">Rewrite</span>
+                                        <span x-show="loading">Rewriting…</span>
+                                    </button>
+                                </div>
+                                <p x-show="!caption.trim()" class="text-xs text-stone-400 mb-2">Write a caption first.</p>
+                                <p x-show="error" x-text="error" class="text-xs text-red-500 mb-2"></p>
+                                <div x-show="rewritten" class="flex items-start gap-2 bg-white border border-stone-200 rounded-lg p-2">
+                                    <p class="text-xs text-stone-700 flex-1" x-text="rewritten"></p>
+                                    <button type="button" class="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
+                                            @click="caption = rewritten; debouncedPreviewUpdate(); rewritten = ''">Insert</button>
+                                </div>
+                            </div>
+                        </template>
+                        {% else %}
+                        <div class="flex items-center justify-between gap-3">
+                            <p class="text-xs text-stone-500">Add your API key in Organization Settings → AI Providers to use AI Assist.</p>
+                            <a href="{% url 'credentials:ai_providers' %}" class="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap">Configure →</a>
+                        </div>
+                        {% endif %}
+                    </div>
+
                     <div class="caption-wrap">
                         <textarea name="caption"
                                   class="caption-editor"
@@ -1988,6 +2123,7 @@ function composerApp() {
         advancedOpen: {},
         platformExtras: JSON.parse(document.getElementById('composer-platform-extras').textContent) || {},
         showMediaPicker: false,
+        showAiPanel: false,
         showThumbnailPicker: false,
         thumbnailPickerAccId: null,
         thumbnailUploading: {},

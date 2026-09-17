@@ -1,12 +1,17 @@
 """Tests for platform credential resolution, derivation, the admin form, and the
 removal of the dormant /credentials/ placeholder."""
 
+from unittest.mock import MagicMock, patch
+
+import httpx
 import pytest
 from django.test import override_settings
 from django.urls import NoReverseMatch, Resolver404, resolve, reverse
 
+from apps.credentials.ai_providers import AIProviderError, generate_text
 from apps.credentials.forms import PlatformCredentialAdminForm
 from apps.credentials.models import (
+    AIProviderConfig,
     PlatformCredential,
     derive_is_configured,
     resolve_app_secret,
@@ -416,3 +421,94 @@ def test_env_dominates_db_for_every_platform(platform, organization):
         credentials={"client_id": "DB", "client_secret": "DB", "client_key": "DB"},
     )
     assert resolve_platform_credentials(platform, organization.id) == REALISTIC_ENV[platform]
+
+
+# ---------------------------------------------------------------------------
+# AIProviderConfig model — encrypted-at-rest storage, one default per org
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_ai_provider_config_encrypts_api_key_at_rest(organization):
+    from django.db import connection
+
+    config = AIProviderConfig.objects.create(
+        organization=organization, provider="openai", api_key="sk-super-secret", model="gpt-4o-mini"
+    )
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT api_key FROM credentials_ai_provider_config WHERE id = %s", [str(config.id)])
+        (stored,) = cursor.fetchone()
+    assert "sk-super-secret" not in stored
+    config.refresh_from_db()
+    assert config.api_key == "sk-super-secret"
+
+
+@pytest.mark.django_db
+def test_only_one_default_per_org(organization):
+    first = AIProviderConfig.objects.create(
+        organization=organization, provider="openai", api_key="k1", model="gpt-4o-mini", is_default=True
+    )
+    second = AIProviderConfig.objects.create(
+        organization=organization, provider="anthropic", api_key="k2", model="claude-haiku-4-5-20251001", is_default=True
+    )
+    first.refresh_from_db()
+    second.refresh_from_db()
+    assert first.is_default is False
+    assert second.is_default is True
+
+
+# ---------------------------------------------------------------------------
+# ai_providers.generate_text — provider abstraction (HTTP mocked, no real spend)
+# ---------------------------------------------------------------------------
+
+
+def _mock_response(json_data):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = json_data
+    return resp
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_openai(mock_post):
+    mock_post.return_value = _mock_response({"choices": [{"message": {"content": "  Hello there  "}}]})
+    result = generate_text("openai", "sk-test", "gpt-4o-mini", "say hi")
+    assert result == "Hello there"
+    assert mock_post.call_args.args[0] == "https://api.openai.com/v1/chat/completions"
+    assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer sk-test"
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_anthropic(mock_post):
+    mock_post.return_value = _mock_response({"content": [{"text": "Hello there"}]})
+    result = generate_text("anthropic", "sk-ant-test", "claude-haiku-4-5-20251001", "say hi")
+    assert result == "Hello there"
+    assert mock_post.call_args.args[0] == "https://api.anthropic.com/v1/messages"
+    assert mock_post.call_args.kwargs["headers"]["x-api-key"] == "sk-ant-test"
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_openrouter(mock_post):
+    mock_post.return_value = _mock_response({"choices": [{"message": {"content": "Hello there"}}]})
+    result = generate_text("openrouter", "sk-or-test", "anthropic/claude-sonnet-4", "say hi")
+    assert result == "Hello there"
+    assert mock_post.call_args.args[0] == "https://openrouter.ai/api/v1/chat/completions"
+
+
+def test_generate_text_unknown_provider_raises():
+    with pytest.raises(AIProviderError):
+        generate_text("unknown", "key", "model", "prompt")
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_http_error_wrapped(mock_post):
+    mock_post.side_effect = httpx.ConnectTimeout("timed out")
+    with pytest.raises(AIProviderError):
+        generate_text("openai", "sk-test", "gpt-4o-mini", "say hi")
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_malformed_response_wrapped(mock_post):
+    mock_post.return_value = _mock_response({"unexpected": "shape"})
+    with pytest.raises(AIProviderError):
+        generate_text("openai", "sk-test", "gpt-4o-mini", "say hi")
