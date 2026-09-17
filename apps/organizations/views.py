@@ -11,9 +11,11 @@ from django.shortcuts import redirect, render
 from django.utils import timezone as django_tz
 from django.views.decorators.http import require_http_methods
 
+from apps.composer import ai as ai_module
 from apps.composer.models import PlatformPost, Post, Tag
 from apps.members.decorators import require_org_role
 from apps.members.models import OrgMembership, WorkspaceMembership
+from apps.settings_manager.models import AIProviderConfig
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
@@ -64,14 +66,41 @@ def settings_view(request):
             return _handle_immediate_org_deletion(request, org)
         elif action == "cancel_deletion":
             _handle_cancel_deletion(request, org)
+        elif action == "save_ai_provider":
+            _handle_save_ai_provider(request, org)
+        elif action == "delete_ai_provider":
+            _handle_delete_ai_provider(request, org)
+        elif action == "set_default_ai_provider":
+            _handle_set_default_ai_provider(request, org)
+        elif action == "test_ai_provider":
+            _handle_test_ai_provider(request, org)
         return redirect("organizations:settings")
 
+    # AI Providers (F-5.3, BYOK). Keys are shown masked; they decrypt only
+    # server-side when an AI feature actually calls the provider.
+    ai_provider_configs = []
+    for config in AIProviderConfig.objects.for_org(org.id).order_by("provider"):
+        ai_provider_configs.append(
+            {
+                "obj": config,
+                "model": config.default_model,
+                "masked_key": config.masked_api_key,
+                "configured": config.is_configured(),
+                "test_result": config.test_result,
+                "test_message": config.test_message,
+            }
+        )
     context = {
         "organization": org,
         "settings_active": "general",
         "is_owner": is_owner,
         "common_timezones": COMMON_TIMEZONES,
         "all_timezones": sorted(available_timezones()),
+        "ai_provider_configs": ai_provider_configs,
+        "ai_providers": AIProviderConfig.Provider.choices,
+        "ai_model_suggestions": ai_module.MODEL_SUGGESTIONS,
+        "ai_any_configured": any(c["configured"] for c in ai_provider_configs),
+        "existing_ai_providers": {c["obj"].provider for c in ai_provider_configs if c["configured"]},
     }
     return render(request, "organizations/settings.html", context)
 
@@ -416,3 +445,90 @@ def _build_day_context(base_pps, target_date, today):
         "prev_date": (target_date - timedelta(days=1)).isoformat(),
         "next_date": (target_date + timedelta(days=1)).isoformat(),
     }
+
+
+# ════════════════════════════════════════════════════════════════════
+# AI Providers (F-5.3 - BYOK org-level AI provider configuration)
+# ════════════════════════════════════════════════════════════════════
+
+
+def _get_ai_config(org, provider):
+    if provider not in dict(AIProviderConfig.Provider.choices):
+        return None
+    try:
+        return AIProviderConfig.objects.for_org(org.id).get(provider=provider)
+    except AIProviderConfig.DoesNotExist:
+        return None
+
+
+def _handle_save_ai_provider(request, org):
+    provider = request.POST.get("provider") or ""
+    if provider not in dict(AIProviderConfig.Provider.choices):
+        messages.error(request, "Unknown AI provider.")
+        return
+    config = _get_ai_config(org, provider) or AIProviderConfig(organization=org, provider=provider)
+    api_key = (request.POST.get("api_key") or "").strip()
+    if api_key:
+        # Leave an existing stored key intact when the field is blank.
+        config.api_key = api_key
+    elif not config.api_key:
+        messages.error(request, "Enter an API key for this provider.")
+        return
+    model = (request.POST.get("default_model") or "").strip()
+    if model:
+        config.default_model = model
+    if not config.default_model:
+        messages.error(request, "Enter a default model for this provider.")
+        return
+    config.is_active = True
+    config.test_result = AIProviderConfig.TestResult.UNTESTED
+    config.test_message = ""
+    make_default = request.POST.get("make_default") == "on"
+    other_default = (
+        AIProviderConfig.objects.for_org(org.id).filter(is_default=True, is_active=True).exclude(pk=config.pk).exists()
+    )
+    if make_default or not other_default:
+        config.is_default = True
+    config.save()
+    messages.success(request, f"{config.get_provider_display()} saved. Use “Test” to verify the key.")
+
+
+def _handle_delete_ai_provider(request, org):
+    config = _get_ai_config(org, request.POST.get("provider") or "")
+    if config is None:
+        messages.error(request, "Unknown AI provider.")
+        return
+    was_default = config.is_default
+    config.delete()
+    if was_default:
+        remaining = [c for c in AIProviderConfig.objects.for_org(org.id).filter(is_active=True) if c.is_configured()]
+        if remaining:
+            remaining[0].is_default = True
+            remaining[0].save()
+    messages.success(request, "AI provider removed.")
+
+
+def _handle_set_default_ai_provider(request, org):
+    config = _get_ai_config(org, request.POST.get("provider") or "")
+    if config is None or not config.is_configured():
+        messages.error(request, "Configure this provider (API key + model) before making it the default.")
+        return
+    config.is_default = True
+    config.save()  # save() clears the default flag on sibling configs
+    messages.success(request, f"{config.get_provider_display()} is now the default AI provider.")
+
+
+def _handle_test_ai_provider(request, org):
+    config = _get_ai_config(org, request.POST.get("provider") or "")
+    if config is None or not config.is_configured():
+        messages.error(request, "Add an API key and model before testing.")
+        return
+    ok, detail, latency_ms = ai_module.test_provider_config(config)
+    config.tested_at = django_tz.now()
+    config.test_result = AIProviderConfig.TestResult.SUCCESS if ok else AIProviderConfig.TestResult.FAILURE
+    config.test_message = detail[:255] if ok else (detail or "Test failed.")[:255]
+    config.save()
+    if ok:
+        messages.success(request, f"{config.get_provider_display()} is working. {detail} · {latency_ms} ms")
+    else:
+        messages.error(request, f"{config.get_provider_display()} test failed: {detail}")

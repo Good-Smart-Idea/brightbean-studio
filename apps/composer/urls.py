@@ -36,6 +36,9 @@ urlpatterns = [
     path("compose/<uuid:post_id>/autosave/", views.autosave, name="autosave_edit"),
     # Live preview
     path("compose/preview/", views.preview, name="preview"),
+    # AI Assist (F-2.1 / F-5.3, BYOK)
+    path("compose/ai/panel/", views.ai_panel, name="ai_panel"),
+    path("compose/ai/generate/", views.ai_generate, name="ai_generate"),
     # Media
     path("compose/media-picker/", views.media_picker, name="media_picker"),
     path("compose/thumbnail-picker/", views.thumbnail_picker, name="thumbnail_picker"),

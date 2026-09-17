@@ -54,8 +54,95 @@
         </div>
     </form>
 
-    {% if is_owner %}
+    <!-- AI Providers (F-5.3 - BYOK) -->
     <hr class="my-10" style="border-color: var(--border);">
+
+    <div id="ai-providers" class="max-w-2xl">
+        <h2 class="text-xl font-semibold mb-1" style="color: var(--text-primary);">AI Providers</h2>
+        <p class="text-sm mb-6" style="color: var(--text-tertiary);">
+            Use your own API key for AI Assist in the composer. Keys are stored encrypted at rest and never shared across organizations.
+        </p>
+
+        {% for item in ai_provider_configs %}
+        <div class="rounded-lg p-4 mb-3 flex items-center justify-between gap-4" style="border: 1px solid var(--border); background: var(--surface-0);">
+            <div class="min-w-0">
+                <p class="text-sm font-semibold" style="color: var(--text-primary);">
+                    {{ item.obj.get_provider_display }}
+                    {% if item.obj.is_default %}<span class="ml-2 text-xs px-2 py-0.5 rounded-full" style="background: var(--neutral-100); color: var(--text-secondary);">Default</span>{% endif %}
+                    {% if item.test_result == 'success' %}<span class="ml-1 text-xs" style="color: var(--success-600, #16A34A);">✓ {{ item.test_message }}</span>
+                    {% elif item.test_result == 'failure' %}<span class="ml-1 text-xs" style="color: var(--error-500, #EF4444);">✗ {{ item.test_message }}</span>{% endif %}
+                </p>
+                <p class="text-xs" style="color: var(--text-tertiary);">
+                    {% if item.configured %}Model: {{ item.model }} · Key {{ item.masked_key }}{% else %}Not configured{% endif %}
+                </p>
+            </div>
+            <div class="flex gap-2 shrink-0">
+                {% if item.configured %}
+                <form method="POST">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="test_ai_provider">
+                    <input type="hidden" name="provider" value="{{ item.obj.provider }}">
+                    <button type="submit" class="btn-neutral px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer" style="background: var(--neutral-100); color: var(--text-primary);">Test</button>
+                </form>
+                <form method="POST">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="set_default_ai_provider">
+                    <input type="hidden" name="provider" value="{{ item.obj.provider }}">
+                    <button type="submit" {% if item.obj.is_default %}disabled{% endif %} class="btn-neutral px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer disabled:opacity-40" style="background: var(--neutral-100); color: var(--text-primary);">Set default</button>
+                </form>
+                <form method="POST">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="delete_ai_provider">
+                    <input type="hidden" name="provider" value="{{ item.obj.provider }}">
+                    <button type="submit" class="px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer" style="color: var(--error-500, #EF4444);">Remove</button>
+                </form>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+
+        {% for provider_slug, provider_label in ai_providers %}
+        <form method="POST" class="mb-3 rounded-lg p-4" style="border: 1px dashed var(--border); background: var(--surface-0);">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="save_ai_provider">
+            <input type="hidden" name="provider" value="{{ provider_slug }}">
+            <p class="text-sm font-semibold mb-3" style="color: var(--text-primary);">{{ provider_label }}</p>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+                <div>
+                    <label class="block text-xs font-semibold mb-1" style="color: var(--text-secondary);">API key</label>
+                    <input type="password" name="api_key" autocomplete="off" placeholder="{% if provider_slug in existing_ai_providers %}(unchanged){% else %}sk-…{% endif %}"
+                           class="input-focus w-full px-3 py-2 text-sm rounded-lg outline-none transition-colors"
+                           style="border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-0);">
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold mb-1" style="color: var(--text-secondary);">Default model</label>
+                    {% if ai_model_suggestions.items %}
+                    <input type="text" name="default_model" list="ai-models-{{ provider_slug }}"
+                           value="{% for item in ai_provider_configs %}{% if item.obj.provider == provider_slug %}{{ item.model }}{% endif %}{% endfor %}"
+                           class="input-focus w-full px-3 py-2 text-sm rounded-lg outline-none transition-colors"
+                           style="border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-0);">
+                    <datalist id="ai-models-{{ provider_slug }}">
+                        {% for m in ai_model_suggestions.items %}{% if provider_slug == m.0 %}{% for model in m.1 %}<option value="{{ model }}"></option>{% endfor %}{% endif %}{% endfor %}
+                    </datalist>
+                    {% else %}
+                    <input type="text" name="default_model" placeholder="e.g. anthropic/claude-sonnet-4"
+                           class="input-focus w-full px-3 py-2 text-sm rounded-lg outline-none transition-colors"
+                           style="border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-0);">
+                    {% endif %}
+                </div>
+            </div>
+            <div class="flex items-center justify-between">
+                <label class="text-xs flex items-center gap-2 cursor-pointer" style="color: var(--text-secondary);">
+                    <input type="checkbox" name="make_default" class="rounded"> Make default provider
+                </label>
+                <button type="submit" class="btn-neutral px-4 py-1.5 text-xs font-medium rounded-full cursor-pointer" style="background: var(--neutral-100); color: var(--text-primary);">Save</button>
+            </div>
+        </form>
+        {% endfor %}
+    </div>
+
+    {% if is_owner %}
+
 
     <!-- Delete Organization section -->
     {% if organization.is_deletion_pending %}

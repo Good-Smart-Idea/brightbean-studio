@@ -34,6 +34,7 @@ from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 from providers.tiktok import VALID_PRIVACY_LEVELS as TIKTOK_PRIVACY_LEVELS
 
+from . import ai as ai_module
 from .forms import ContentCategoryForm, PostForm
 from .models import (
     ContentCategory,
@@ -630,6 +631,9 @@ def compose(request, workspace_id, post_id=None):
         "failed_platform_posts": failed_platform_posts,
         "failed_first_comments": failed_first_comments,
         "unsplash_enabled": bool(settings.UNSPLASH_ACCESS_KEY),
+        # AI Assist availability (BYOK org config) drives the panel's
+        # configured vs "add your API key in settings" state (F-2.1).
+        "ai_enabled": ai_module.resolve_ai_provider(workspace.organization_id) is not None,
     }
     return render(request, "composer/compose.html", context)
 
@@ -3933,3 +3937,92 @@ def _render_explore(request, workspace, category):
             "curated_feeds": curated,
         },
     )
+
+
+# ════════════════════════════════════════════════════════════════════
+# Composer AI Assist (F-2.1 AI Assist, F-5.3 AI Integration)
+# BYOK: providers are configured per-org in Organization Settings; there is
+# no platform-held AI secret. Panel is a server-rendered partial; generation
+# is a small JSON POST endpoint backed by apps/composer/ai.py.
+# ════════════════════════════════════════════════════════════════════
+
+AI_ACTION_CAPTION = "caption"
+AI_ACTION_HASHTAGS = "hashtags"
+AI_ACTION_REWRITE = "rewrite"
+AI_ACTION_SET = {AI_ACTION_CAPTION, AI_ACTION_HASHTAGS, AI_ACTION_REWRITE}
+
+AI_MAX_INPUT_CHARS = 4000
+
+
+@login_required
+@require_GET
+def ai_panel(request, workspace_id):
+    """Render the AI Assist panel partial for the composer modal.
+
+    Shows a configured panel (three actions) or, when the org has no active
+    AI provider, a clear "add your API key in settings" state — never a
+    broken/silent button.
+    """
+    workspace = _get_workspace(request, workspace_id)
+    config = ai_module.resolve_ai_provider(workspace.organization_id)
+    context = {
+        "workspace": workspace,
+        "ai_configured": config is not None,
+        "ai_provider_label": f"{config.get_provider_display()} · {config.default_model}" if config else "",
+        "ai_tones": ai_module.TONES,
+        "ai_actions": (AI_ACTION_CAPTION, AI_ACTION_HASHTAGS, AI_ACTION_REWRITE),
+    }
+    return render(request, "composer/partials/ai_panel.html", context)
+
+
+@login_required
+@require_POST
+def ai_generate(request, workspace_id):
+    """Run one AI Assist action and return JSON results.
+
+    Body: action (caption|hashtags|rewrite), text (topic/caption), tone
+    (rewrite only). Caption returns ``variations`` (list), hashtags returns
+    ``hashtags`` (list), rewrite returns ``text``.
+    """
+    workspace = _get_workspace(request, workspace_id)
+    config = ai_module.resolve_ai_provider(workspace.organization_id)
+    if config is None:
+        return JsonResponse(
+            {
+                "error": "No AI provider configured. An organization admin can add an "
+                "API key in Organization Settings → AI Providers.",
+            },
+            status=409,
+        )
+
+    action = request.POST.get("action", "")
+    if action not in AI_ACTION_SET:
+        return JsonResponse({"error": "Unknown AI action."}, status=400)
+
+    text = (request.POST.get("text") or "")[:AI_MAX_INPUT_CHARS].strip()
+    if not text:
+        return JsonResponse({"error": "Add some text first."}, status=400)
+    if action == AI_ACTION_REWRITE:
+        tone = (request.POST.get("tone") or "").strip()
+        if tone not in {slug for slug, _ in ai_module.TONES}:
+            return JsonResponse({"error": "Choose a tone to rewrite with."}, status=400)
+    else:
+        tone = None
+
+    try:
+        system, prompt = ai_module.build_ai_prompt(action, text, tone=tone)
+        raw = ai_module.generate_text(
+            config.provider,
+            config.api_key,
+            prompt,
+            model=config.default_model,
+            system=system,
+        )
+    except ai_module.AIProviderError as exc:
+        return JsonResponse({"error": str(exc)}, status=502)
+
+    if action == AI_ACTION_CAPTION:
+        return JsonResponse({"variations": ai_module.split_variations(raw) or [raw.strip()]})
+    if action == AI_ACTION_HASHTAGS:
+        return JsonResponse({"hashtags": ai_module.parse_hashtags(raw)})
+    return JsonResponse({"text": raw.strip()})

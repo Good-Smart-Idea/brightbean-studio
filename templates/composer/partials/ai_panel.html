@@ -1,0 +1,203 @@
+{% comment %}
+Composer AI Assist panel (F-2.1 AI Assist, F-5.3 AI Integration - BYOK).
+Loaded via htmx into the composer's AI Assist modal. Two states:
+configured (three actions) or unconfigured ("add your API key in settings").
+{% endcomment %}
+
+<div id="ai-panel-root" data-generate-url="{% url 'composer:ai_generate' workspace_id=workspace.id %}">
+  <form class="hidden"><input type="hidden" id="ai-csrf" value="{{ csrf_token }}"></form>
+
+  {% if not ai_configured %}
+  <div class="flex flex-col items-center justify-center text-center py-16 px-6 gap-4">
+    <span class="w-12 h-12 rounded-xl bg-stone-100 flex items-center justify-center">
+      <svg class="w-6 h-6 text-stone-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z"/></svg>
+    </span>
+    <div>
+      <p class="text-sm font-medium text-stone-900">AI Assist isn't set up yet</p>
+      <p class="text-xs text-stone-500 mt-1 max-w-xs">
+        Add your own API key (OpenAI, Anthropic or OpenRouter) in
+        <strong>Organization Settings &rarr; AI Providers</strong> to use AI Assist.
+      </p>
+    </div>
+    <a href="{% url 'organizations:settings' %}#ai-providers"
+       class="inline-flex items-center px-4 py-2 rounded-full text-xs font-medium bg-stone-900 text-white hover:bg-stone-700 transition-colors">
+      Go to settings
+    </a>
+  </div>
+  {% else %}
+  <p class="text-xs text-stone-400 mb-4 flex items-center gap-1.5">
+    <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+    {{ ai_provider_label }}
+  </p>
+
+  <!-- Generate caption -->
+  <div class="rounded-lg border border-stone-200 bg-white p-4 mb-3">
+    <h4 class="text-xs font-semibold text-stone-900 uppercase tracking-wider mb-2">Generate caption</h4>
+    <textarea id="ai-caption-prompt" rows="2" maxlength="4000"
+              class="w-full text-sm rounded-md border border-stone-200 px-3 py-2 outline-none focus:border-stone-400 transition-colors resize-none"
+              placeholder="Describe the post, e.g. “promo for a coffee shop's new latte”"></textarea>
+    <div class="flex justify-end mt-2">
+      <button type="button" data-ai-action="caption" data-ai-source="#ai-caption-prompt"
+              class="ai-run-btn px-3 py-1.5 rounded-full text-xs font-medium bg-stone-900 text-white hover:bg-stone-700 transition-colors cursor-pointer disabled:opacity-50">
+        Generate
+      </button>
+    </div>
+    <div class="ai-result mt-2 hidden" data-ai-result="caption">
+      <p class="text-[11px] uppercase tracking-wider text-stone-400 font-semibold mb-1">Variations</p>
+      <div class="ai-caption-variations space-y-2"></div>
+    </div>
+  </div>
+
+  <!-- Suggest hashtags -->
+  <div class="rounded-lg border border-stone-200 bg-white p-4 mb-3">
+    <h4 class="text-xs font-semibold text-stone-900 uppercase tracking-wider mb-2">Suggest hashtags</h4>
+    <p class="text-xs text-stone-500 mb-2">Based on the caption you've written.</p>
+    <div class="flex justify-end">
+      <button type="button" data-ai-action="hashtags" data-ai-source="[name=caption]"
+              class="ai-run-btn px-3 py-1.5 rounded-full text-xs font-medium border border-stone-200 text-stone-700 hover:border-stone-400 transition-colors cursor-pointer disabled:opacity-50">
+        Suggest
+      </button>
+    </div>
+    <div class="ai-result mt-2 hidden" data-ai-result="hashtags">
+      <div class="ai-hashtag-list flex flex-wrap gap-1.5"></div>
+    </div>
+  </div>
+
+  <!-- Rewrite for tone -->
+  <div class="rounded-lg border border-stone-200 bg-white p-4">
+    <h4 class="text-xs font-semibold text-stone-900 uppercase tracking-wider mb-2">Rewrite for tone</h4>
+    <p class="text-xs text-stone-500 mb-2">Rewrites your current caption.</p>
+    <select id="ai-tone" class="w-full text-sm rounded-md border border-stone-200 px-3 py-2 outline-none focus:border-stone-400 transition-colors mb-2 bg-white">
+      {% for slug, label in ai_tones %}
+      <option value="{{ slug }}">{{ label }}</option>
+      {% endfor %}
+    </select>
+    <div class="flex justify-end">
+      <button type="button" data-ai-action="rewrite" data-ai-source="[name=caption]" data-ai-tone="#ai-tone"
+              class="ai-run-btn px-3 py-1.5 rounded-full text-xs font-medium border border-stone-200 text-stone-700 hover:border-stone-400 transition-colors cursor-pointer disabled:opacity-50">
+        Rewrite
+      </button>
+    </div>
+    <div class="ai-result mt-2 hidden" data-ai-result="rewrite">
+      <p class="text-sm text-stone-800 whitespace-pre-wrap ai-rewrite-text"></p>
+      <div class="flex justify-end mt-2">
+        <button type="button" class="ai-insert-rewrite px-3 py-1.5 rounded-full text-xs font-medium bg-stone-900 text-white hover:bg-stone-700 cursor-pointer">Insert</button>
+      </div>
+    </div>
+  </div>
+
+  <p class="ai-error text-xs text-red-600 mt-3 hidden"></p>
+
+  <script>
+    (function () {
+      var root = document.getElementById("ai-panel-root");
+      if (!root || root.dataset.initialized) return;
+      root.dataset.initialized = "1";
+      var generateUrl = root.dataset.generateUrl;
+      var csrf = document.getElementById("ai-csrf").value;
+      var errorEl = root.querySelector(".ai-error");
+
+      function getCaption() {
+        var ta = document.querySelector("[name=caption]");
+        return ta ? ta.value : "";
+      }
+      function insertIntoCaption(text) {
+        var ta = document.querySelector("[name=caption]");
+        if (!ta) return;
+        ta.value = (ta.value ? ta.value.trim() + "\n\n" : "") + text.trim();
+        ta.dispatchEvent(new Event("input", { bubbles: true }));
+        ta.focus();
+      }
+      function setLoading(btn, loading) {
+        btn.disabled = loading;
+        var orig = btn.dataset.origLabel || (btn.dataset.origLabel = btn.textContent);
+        btn.textContent = loading ? "Working…" : orig;
+      }
+      function showError(msg) {
+        errorEl.textContent = msg;
+        errorEl.classList.remove("hidden");
+      }
+
+      function run(btn) {
+        var action = btn.dataset.aiAction;
+        var src = document.querySelector(btn.dataset.aiSource);
+        var text = (src ? src.value : "").trim();
+        errorEl.classList.add("hidden");
+        if (!text) { showError("Add some text first."); return; }
+        var body = new FormData();
+        body.append("action", action);
+        body.append("text", text);
+        if (btn.dataset.aiTone) body.append("tone", document.querySelector(btn.dataset.aiTone).value);
+        setLoading(btn, true);
+        fetch(generateUrl, { method: "POST", body: body, headers: { "X-CSRFToken": csrf } })
+          .then(function (resp) { return resp.json().then(function (data) { return { ok: resp.ok, data: data }; }); })
+          .then(function (r) {
+            setLoading(btn, false);
+            if (!r.ok) { showError(r.data.error || "AI request failed."); return; }
+            renderResults(action, r.data);
+          })
+          .catch(function () { setLoading(btn, false); showError("Could not reach the server. Try again."); });
+      }
+
+      function captionVarRow(text) {
+        var row = document.createElement("div");
+        row.className = "rounded-md border border-stone-100 bg-stone-50 p-2 flex items-start justify-between gap-2";
+        var p = document.createElement("p");
+        p.className = "text-sm text-stone-800 whitespace-pre-wrap flex-1";
+        p.textContent = text;
+        var b = document.createElement("button");
+        b.type = "button";
+        b.className = "px-2 py-1 rounded-full text-[11px] font-medium bg-stone-900 text-white hover:bg-stone-700 cursor-pointer flex-shrink-0";
+        b.textContent = "Insert";
+        b.addEventListener("click", function () { insertIntoCaption(text); });
+        row.appendChild(p); row.appendChild(b);
+        return row;
+      }
+
+      function renderResults(action, data) {
+        if (action === "caption") {
+          var box = root.querySelector('[data-ai-result="caption"]');
+          var list = box.querySelector(".ai-caption-variations");
+          list.innerHTML = "";
+          (data.variations || []).forEach(function (v) { list.appendChild(captionVarRow(v)); });
+          box.classList.remove("hidden");
+        } else if (action === "hashtags") {
+          var hbox = root.querySelector('[data-ai-result="hashtags"]');
+          var hlist = hbox.querySelector(".ai-hashtag-list");
+          hlist.innerHTML = "";
+          (data.hashtags || []).forEach(function (tag) {
+            var chip = document.createElement("button");
+            chip.type = "button";
+            chip.className = "px-2 py-0.5 rounded-full text-xs border border-stone-200 text-stone-700 hover:border-stone-400 cursor-pointer";
+            chip.textContent = tag;
+            chip.title = "Add to caption";
+            chip.addEventListener("click", function () {
+              var ta = document.querySelector("[name=caption]");
+              if (!ta) return;
+              ta.value = (ta.value.trim() + " " + tag).trim();
+              ta.dispatchEvent(new Event("input", { bubbles: true }));
+              chip.disabled = true; chip.classList.add("opacity-40");
+            });
+            hlist.appendChild(chip);
+          });
+          hbox.classList.remove("hidden");
+        } else if (action === "rewrite") {
+          var rbox = root.querySelector('[data-ai-result="rewrite"]');
+          rbox.querySelector(".ai-rewrite-text").textContent = data.text || "";
+          var insertBtn = rbox.querySelector(".ai-insert-rewrite");
+          var newBtn = insertBtn.cloneNode(true);
+          insertBtn.replaceWith(newBtn);
+          newBtn.addEventListener("click", function () {
+            insertIntoCaption(data.text || "");
+          });
+          rbox.classList.remove("hidden");
+        }
+      }
+
+      root.querySelectorAll(".ai-run-btn").forEach(function (btn) {
+        btn.addEventListener("click", function () { run(btn); });
+      });
+    })();
+  </script>
+  {% endif %}
+</div>

@@ -522,6 +522,10 @@
                                 <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7.5 6.75V0h9v6.75h-9zm9 3.75H24V24H0V10.5h7.5v6.75h9V10.5z"/></svg>
                             </button>
                             {% endif %}
+                            <button type="button" class="media-unsplash-btn" title="AI Assist"
+                                    @click="openAiPanel()">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z"/></svg>
+                            </button>
                             <!-- display:contents keeps appended thumbs flowing in this row -->
                             <div id="media-list" class="contents">
                                 {% if post %}
@@ -1639,10 +1643,52 @@
 
     </div><!-- /panels -->
 
-    <!-- ════════════════════════════════════════════════════════════
+    <!-- ══════════════════════════════════════════════════════════
+         AI ASSIST PANEL (F-2.1 AI Assist, F-5.3 BYOK)
+         Panel content loads via htmx; the partial itself renders either the
+         configured actions or the "add your API key in settings" state.
+         ══════════════════════════════════════════════════════════ -->
+    <div x-show="showAiPanel" x-cloak
+         class="fixed inset-0 z-[60] flex items-center justify-center"
+         @keydown.escape.window="showAiPanel && (showAiPanel = false)"
+         x-transition:enter="transition ease-out duration-200"
+         x-transition:enter-start="opacity-0"
+         x-transition:enter-end="opacity-100"
+         x-transition:leave="transition ease-in duration-150"
+         x-transition:leave-start="opacity-100"
+         x-transition:leave-end="opacity-0">
+        <div class="absolute inset-0 bg-stone-900/40 backdrop-blur-sm" @click="showAiPanel = false"></div>
+        <div class="relative bg-white rounded-2xl shadow-xl border border-stone-200 w-[calc(100vw-1rem)] sm:w-[520px] mx-2 sm:mx-0 h-[640px] max-h-[85vh] flex flex-col overflow-hidden"
+             x-transition:enter="transition ease-out duration-200"
+             x-transition:enter-start="opacity-0 scale-95"
+             x-transition:enter-end="opacity-100 scale-100">
+            <div class="px-4 sm:px-6 py-4 border-b border-stone-100 flex items-center gap-3">
+                <span class="w-9 h-9 rounded-lg bg-stone-900 text-white flex items-center justify-center flex-shrink-0">
+                    <svg class="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z"/></svg>
+                </span>
+                <div class="min-w-0">
+                    <h2 class="text-base font-semibold text-stone-900">AI Assist</h2>
+                    <p class="text-xs text-stone-400 truncate">Generate captions, hashtags &amp; rewrites</p>
+                </div>
+                <button @click="showAiPanel = false"
+                        class="ml-auto w-8 h-8 rounded-lg border border-stone-200 text-stone-400 hover:text-stone-600 hover:border-stone-300 flex items-center justify-center transition-all duration-150 cursor-pointer">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-4 panel-scroll"
+                 hx-get="{% url 'composer:ai_panel' workspace_id=workspace.id %}"
+                 hx-trigger="intersect once"
+                 hx-swap="innerHTML">
+                <div class="flex items-center justify-center py-12 text-stone-400">
+                    <svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════════════
          MEDIA PICKER MODAL
-         ════════════════════════════════════════════════════════════ -->
-    <div x-show="showMediaPicker" x-cloak
+<div x-show="showMediaPicker" x-cloak
          class="fixed inset-0 z-[60] flex items-center justify-center"
          x-transition:enter="transition ease-out duration-200"
          x-transition:enter-start="opacity-0"
@@ -1992,6 +2038,7 @@ function composerApp() {
         thumbnailPickerAccId: null,
         thumbnailUploading: {},
         showPreviewPanel: false,
+        showAiPanel: false,
         showSaveToast: false,
         formError: '',
         lastSaved: null,
@@ -2298,6 +2345,10 @@ function composerApp() {
         },
 
         // ── Unsplash ────────────────────────────────────────────────
+        openAiPanel() {
+            this.showAiPanel = true;
+        },
+
         openUnsplashModal() {
             this.showUnsplashModal = true;
             if (!this.unsplashResults.length && !this.unsplashLoading) {
