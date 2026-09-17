@@ -1,7 +1,57 @@
 from django import forms
 from django.utils.safestring import mark_safe
 
-from .models import REQUIRED_CREDENTIAL_KEYS, PlatformCredential, derive_is_configured
+from .models import REQUIRED_CREDENTIAL_KEYS, AIProviderConfig, PlatformCredential, derive_is_configured
+
+AI_MODEL_SUGGESTIONS = {
+    "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o3-mini"],
+    "anthropic": ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"],
+    "openrouter": [],  # free-text — OpenRouter hosts hundreds of models
+}
+
+_AI_INPUT_CLASSES = "input-focus w-full px-3 py-2 text-sm rounded-lg outline-none transition-colors"
+_AI_INPUT_STYLE = "border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-0);"
+
+
+class AIProviderConfigForm(forms.ModelForm):
+    """Org-settings self-service form for one AI provider's BYOK key + model."""
+
+    api_key = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(
+            render_value=False,
+            attrs={"autocomplete": "off", "class": _AI_INPUT_CLASSES, "style": _AI_INPUT_STYLE},
+        ),
+        help_text="Leave blank to keep the existing key.",
+    )
+
+    class Meta:
+        model = AIProviderConfig
+        # ``is_default`` is deliberately excluded — it's toggled by the
+        # dedicated "Make default" action, not this save form, so saving an
+        # existing default provider's key/model can't accidentally clear it.
+        fields = ("provider", "api_key", "model")
+        widgets = {
+            "provider": forms.HiddenInput(),
+            "model": forms.TextInput(attrs={"class": _AI_INPUT_CLASSES, "style": _AI_INPUT_STYLE}),
+        }
+
+    def __init__(self, *args, existing_key_set=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._existing_key_set = existing_key_set
+        self.fields["api_key"].required = not existing_key_set
+
+    def clean_model(self):
+        model = (self.cleaned_data.get("model") or "").strip()
+        if not model:
+            raise forms.ValidationError("A model is required.")
+        return model
+
+    def clean_api_key(self):
+        key = (self.cleaned_data.get("api_key") or "").strip()
+        if not key and not self._existing_key_set:
+            raise forms.ValidationError("An API key is required.")
+        return key
 
 # Human-readable required-key hints, shown under the credentials field in the
 # admin. Mirrors what each provider reads (see providers/*.py).

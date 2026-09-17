@@ -28,6 +28,8 @@ from apps.common.validators import (
     parse_and_truncate_youtube_tag_string,
     safe_xml_fromstring,
 )
+from apps.credentials.ai_providers import AIProviderError, generate_text
+from apps.credentials.models import AIProviderConfig
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
@@ -630,6 +632,7 @@ def compose(request, workspace_id, post_id=None):
         "failed_platform_posts": failed_platform_posts,
         "failed_first_comments": failed_first_comments,
         "unsplash_enabled": bool(settings.UNSPLASH_ACCESS_KEY),
+        "ai_enabled": AIProviderConfig.objects.filter(organization=workspace.organization).exists(),
     }
     return render(request, "composer/compose.html", context)
 
@@ -1274,6 +1277,80 @@ def preview(request, workspace_id):
             "media_items": media_items,
         },
     )
+
+
+# AI Assist (F-2.1 / F-5.3) — prompt builders per action. Each takes the
+# posted context dict and returns the text sent to the provider.
+_AI_ACTION_PROMPTS = {
+    "generate_caption": lambda ctx: (
+        "Write 3 short, distinct social media caption variations for the topic/instruction below. "
+        "Return only the 3 variations, one per line, no numbering or extra commentary.\n\n"
+        f"Topic/instruction: {ctx['prompt']}"
+    ),
+    "suggest_hashtags": lambda ctx: (
+        "Suggest 10-15 relevant, specific social media hashtags (each starting with #) for this caption. "
+        "Return them space-separated on a single line, nothing else.\n\n"
+        f"Caption: {ctx['caption']}"
+    ),
+    "rewrite_tone": lambda ctx: (
+        f"Rewrite the following social media caption in a {ctx['tone']} tone. "
+        "Return only the rewritten caption, no commentary.\n\n"
+        f"Caption: {ctx['caption']}"
+    ),
+}
+
+
+@login_required
+@require_permission("create_posts")
+@require_POST
+def ai_assist(request, workspace_id):
+    """Run one AI Assist action (generate caption / suggest hashtags / rewrite tone).
+
+    Uses the workspace's organization's default ``AIProviderConfig`` (BYOK —
+    see apps.credentials). Returns a clear ``no_provider`` error rather than a
+    broken/silent button when the org hasn't configured a key yet.
+    """
+    workspace = _get_workspace(request, workspace_id)
+    action = request.POST.get("ai_action", "")
+    if action not in _AI_ACTION_PROMPTS:
+        return JsonResponse({"error": "Unknown AI action."}, status=400)
+
+    config = (
+        AIProviderConfig.objects.filter(organization=workspace.organization, is_default=True).first()
+        or AIProviderConfig.objects.filter(organization=workspace.organization).first()
+    )
+    if config is None:
+        return JsonResponse(
+            {
+                "error": "no_provider",
+                "message": "Add your API key in Organization Settings → AI Providers to use AI Assist.",
+            },
+            status=400,
+        )
+
+    ctx = {
+        "prompt": request.POST.get("prompt", "").strip(),
+        "caption": request.POST.get("caption", "").strip(),
+        "tone": request.POST.get("tone", "professional").strip() or "professional",
+    }
+    if action == "generate_caption" and not ctx["prompt"]:
+        return JsonResponse({"error": "Enter a topic or instruction first."}, status=400)
+    if action in ("suggest_hashtags", "rewrite_tone") and not ctx["caption"]:
+        return JsonResponse({"error": "Write a caption first."}, status=400)
+
+    built_prompt = _AI_ACTION_PROMPTS[action](ctx)
+    try:
+        text = generate_text(config.provider, config.api_key, config.model, built_prompt)
+    except AIProviderError as exc:
+        return JsonResponse({"error": str(exc)}, status=502)
+
+    if action == "generate_caption":
+        variations = [line.strip("-•* \t") for line in text.splitlines() if line.strip()]
+        return JsonResponse({"variations": variations[:3] or [text]})
+    if action == "suggest_hashtags":
+        hashtags = [tag for tag in text.split() if tag.startswith("#")]
+        return JsonResponse({"hashtags": hashtags or text.split()})
+    return JsonResponse({"text": text})
 
 
 @login_required

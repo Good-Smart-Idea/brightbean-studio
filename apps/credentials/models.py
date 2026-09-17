@@ -2,7 +2,7 @@ import uuid
 
 from django.db import models
 
-from apps.common.encryption import EncryptedJSONField
+from apps.common.encryption import EncryptedJSONField, EncryptedTextField
 from apps.common.managers import OrgScopedManager
 
 # Per-platform required credential keys. Each inner tuple is an "any of these
@@ -170,3 +170,55 @@ def resolve_app_secrets(*platforms):
         if secret and secret not in secrets:
             secrets.append(secret)
     return secrets
+
+
+class AIProviderConfig(models.Model):
+    """An org's own (BYOK) LLM provider credentials for Composer AI Assist.
+
+    One row per (organization, provider); the org can configure any subset of
+    the three supported providers and mark one as the default used when AI
+    actions are triggered from the composer.
+    """
+
+    class Provider(models.TextChoices):
+        OPENAI = "openai", "OpenAI"
+        ANTHROPIC = "anthropic", "Anthropic"
+        OPENROUTER = "openrouter", "OpenRouter"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="ai_provider_configs",
+    )
+    provider = models.CharField(max_length=20, choices=Provider.choices)
+    api_key = EncryptedTextField()
+    model = models.CharField(
+        max_length=100,
+        help_text="e.g. gpt-4o-mini, claude-haiku-4-5-20251001, or an OpenRouter model id.",
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text="Used when an AI action doesn't specify a provider override.",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = OrgScopedManager()
+
+    class Meta:
+        db_table = "credentials_ai_provider_config"
+        unique_together = [("organization", "provider")]
+
+    def __str__(self):
+        return f"{self.organization.name} - {self.get_provider_display()}"
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.is_default:
+            # Only one default per org — clear it on every sibling rather than
+            # requiring callers to remember to do so themselves.
+            AIProviderConfig.objects.filter(organization_id=self.organization_id).exclude(pk=self.pk).update(
+                is_default=False
+            )
