@@ -129,3 +129,42 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
 
         response = self.client.post(self.url, {"ai_action": "generate_caption", "prompt": "new latte"})
         self.assertEqual(response.status_code, 502)
+
+    def test_undecryptable_stored_key_returns_json_error_not_500(self):
+        """A stored api_key that can no longer be decrypted (e.g. SECRET_KEY or
+        ENCRYPTION_KEY_SALT rotated since the row was saved) must surface as a
+        clear JSON error, not an unhandled 500 with an HTML body — the composer's
+        fetch().then(r => r.json()) can't parse HTML, so an uncaught 500 was
+        showing every user a generic "Something went wrong. Try again." with the
+        real cause invisible outside server logs.
+        """
+        import base64
+
+        from django.db import connection
+
+        from apps.common.encryption import encrypt_value
+
+        config = AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini", is_default=True
+        )
+        # Flip the last byte of a validly-encrypted value so it's still valid
+        # base64 of the right length (nonce + ciphertext + GCM tag) but fails
+        # AES-GCM authentication — this is what a genuinely corrupted or
+        # wrong-key-decrypted ciphertext looks like. Written via raw SQL:
+        # QuerySet.update() still routes through EncryptedTextField.get_prep_value
+        # (re-encrypting whatever string is passed), so it can't write a raw
+        # corrupted ciphertext directly — only bypassing the ORM can.
+        raw = bytearray(base64.b64decode(encrypt_value("sk-test-real-key")))
+        raw[-1] ^= 0xFF
+        corrupted = base64.b64encode(bytes(raw)).decode("ascii")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE credentials_ai_provider_config SET api_key = %s WHERE id = %s",
+                [corrupted, str(config.pk)],
+            )
+
+        response = self.client.post(self.url, {"ai_action": "generate_caption", "prompt": "new latte"})
+        self.assertEqual(response.status_code, 409)
+        data = response.json()
+        self.assertEqual(data["error"], "provider_decrypt_failed")
+        self.assertIn("Re-enter your API key", data["message"])

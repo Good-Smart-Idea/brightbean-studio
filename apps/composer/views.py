@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import json
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -52,6 +53,8 @@ from .models import (
 )
 
 MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
+
+logger = logging.getLogger(__name__)
 
 # Shown when every posting slot within the lookahead horizon is already taken.
 _QUEUE_FULL_MSG = "No open posting slot within the scheduling horizon — add posting slots or free one up."
@@ -1315,10 +1318,31 @@ def ai_assist(request, workspace_id):
     if action not in _AI_ACTION_PROMPTS:
         return JsonResponse({"error": "Unknown AI action."}, status=400)
 
-    config = (
-        AIProviderConfig.objects.filter(organization=workspace.organization, is_default=True).first()
-        or AIProviderConfig.objects.filter(organization=workspace.organization).first()
-    )
+    try:
+        config = (
+            AIProviderConfig.objects.filter(organization=workspace.organization, is_default=True).first()
+            or AIProviderConfig.objects.filter(organization=workspace.organization).first()
+        )
+    except ValueError as exc:
+        # EncryptedTextField.from_db_value raises ValueError when the stored
+        # api_key can't be decrypted — almost always SECRET_KEY/ENCRYPTION_KEY_SALT
+        # changed (e.g. a redeploy regenerated a `generateValue: true` env var)
+        # since the key was saved. Left uncaught this was an unhandled 500 with
+        # no JSON body, which the composer's fetch().then(r => r.json()) can't
+        # parse, surfacing only a generic "Something went wrong" with the real
+        # cause invisible in the UI and only in server logs.
+        logger.error("AIProviderConfig decrypt failed for org %s: %s", workspace.organization_id, exc)
+        return JsonResponse(
+            {
+                "error": "provider_decrypt_failed",
+                "message": (
+                    "Your saved AI provider key can no longer be decrypted (usually because the "
+                    "server's encryption key changed). Re-enter your API key in Organization "
+                    "Settings → AI Providers."
+                ),
+            },
+            status=409,
+        )
     if config is None:
         return JsonResponse(
             {
