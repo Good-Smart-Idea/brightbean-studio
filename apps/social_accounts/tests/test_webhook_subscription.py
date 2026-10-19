@@ -343,6 +343,7 @@ def test_connection_link_flow_passes_the_page_as_the_webhook_target(client, work
 
     provider = MagicMock()
     provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="r", expires_in=3600)
+    provider.refresh_token.return_value = OAuthTokens(access_token="long-lived-user-token", expires_in=5184000)
     provider.get_profile.return_value = AccountProfile(platform_id="ig-99", name="IG")
     provider.get_user_pages.return_value = [
         {
@@ -368,6 +369,10 @@ def test_connection_link_flow_passes_the_page_as_the_webhook_target(client, work
     assert response.status_code == 302
     account = SocialAccount.objects.get(workspace=workspace, platform="instagram")
     assert account.webhook_target_id == "page-77"
+    assert account.oauth_access_token == "page-token"
+    assert account.oauth_refresh_token == ""
+    assert account.token_expires_at is None
+    provider.get_user_pages.assert_called_once_with("long-lived-user-token")
 
 
 # ------------------------------------------- subscriptions shared across rows
@@ -727,9 +732,10 @@ def test_a_complete_grant_records_nothing(workspace):
     assert account.missing_scopes == []
 
 
-def test_an_unanswerable_platform_leaves_the_field_alone(workspace):
+def test_an_unanswerable_platform_flags_nothing_and_clears_a_stale_verdict(workspace):
     """None means unknown. Treating it as "nothing granted" would flag every
-    scope on every platform that cannot be asked."""
+    scope on every platform that cannot be asked — but the task only runs after
+    a fresh grant, so a verdict about the old one no longer applies."""
     from apps.social_accounts.webhooks import record_missing_scopes
 
     account = _account(workspace, missing_scopes=["previously_noted"])
@@ -741,7 +747,46 @@ def test_an_unanswerable_platform_leaves_the_field_alone(workspace):
         assert record_missing_scopes(account) == []
 
     account.refresh_from_db()
-    assert account.missing_scopes == ["previously_noted"]
+    assert account.missing_scopes == []
+
+
+def test_reconnecting_pinterest_clears_the_boards_write_flag(workspace):
+    """Migration 0021 flags every Pinterest account; Pinterest can't report
+    its grant, so the post-connect readback is what clears it."""
+    from apps.social_accounts.webhooks import record_missing_scopes
+    from providers.pinterest import PinterestProvider
+
+    account = _account(workspace, platform="pinterest", account_platform_id="pin-1", missing_scopes=["boards:write"])
+    provider = PinterestProvider({"client_id": "id", "client_secret": "secret"})
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        record_missing_scopes(account)
+
+    account.refresh_from_db()
+    assert account.missing_scopes == []
+
+
+def test_a_readback_failure_after_reconnect_keeps_a_real_warning(workspace):
+    """Reconnecting must not erase the warning up front: if the readback then
+    fails, the account would look healthy while still missing the scope."""
+    from apps.social_accounts.webhooks import record_missing_scopes
+
+    _account(workspace, account_platform_id="page-1", missing_scopes=["read_insights"])
+    with patch("apps.social_accounts.views.subscribe_account_webhooks_task"):
+        account = _create_or_update_account(
+            workspace_id=workspace.id,
+            platform="facebook",
+            profile=_profile(),
+            access_token="fresh-token",
+        )
+    provider = MagicMock()
+    provider.get_granted_scopes.side_effect = RuntimeError("Graph hiccup")
+
+    with patch("apps.social_accounts.webhooks._get_provider_for_platform", return_value=provider):
+        record_missing_scopes(account)
+
+    account.refresh_from_db()
+    assert account.missing_scopes == ["read_insights"]
 
 
 def test_a_readback_failure_does_not_break_the_connect_flow(workspace):

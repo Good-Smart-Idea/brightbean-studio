@@ -294,6 +294,27 @@ def test_resolve_incomplete_env_does_not_shadow_db(organization):
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("source", ["env", "organization"])
+def test_instagram_dm_scope_flag_is_deployment_controlled(organization, settings, flag, source):
+    settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = flag
+    stored = {"app_id": "ID", "app_secret": "SECRET", "dm_oauth_scopes_enabled": not flag}
+    settings.PLATFORM_CREDENTIALS_FROM_ENV = {}
+    if source == "env":
+        settings.PLATFORM_CREDENTIALS_FROM_ENV = {"instagram": stored, "facebook": stored}
+    else:
+        PlatformCredential.objects.create(organization=organization, platform="instagram", credentials=stored)
+
+    resolved = resolve_platform_credentials("instagram", organization.id)
+    assert resolved == {**stored, "dm_oauth_scopes_enabled": flag}
+    assert stored["dm_oauth_scopes_enabled"] is not flag
+    if source == "env":
+        assert resolve_platform_credentials("facebook", organization.id) == stored
+    else:
+        assert PlatformCredential.objects.get(organization=organization, platform="instagram").credentials == stored
+
+
+@pytest.mark.django_db
 @override_settings(
     PLATFORM_CREDENTIALS_FROM_ENV={
         "facebook": {"app_id": "FB_ID", "app_secret": "FB_SECRET"},
@@ -404,15 +425,18 @@ REALISTIC_ENV = {
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("platform", list(REALISTIC_ENV))
-@override_settings(PLATFORM_CREDENTIALS_FROM_ENV=REALISTIC_ENV)
+@override_settings(PLATFORM_CREDENTIALS_FROM_ENV=REALISTIC_ENV, PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED=False)
 def test_existing_env_only_deployment_resolves_every_platform(platform, organization):
     # The existing-deployment reality: env set, no DB rows. Env creds resolve as-is.
-    assert resolve_platform_credentials(platform, organization.id) == REALISTIC_ENV[platform]
+    expected = dict(REALISTIC_ENV[platform])
+    if platform == "instagram":
+        expected["dm_oauth_scopes_enabled"] = False
+    assert resolve_platform_credentials(platform, organization.id) == expected
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("platform", list(REALISTIC_ENV))
-@override_settings(PLATFORM_CREDENTIALS_FROM_ENV=REALISTIC_ENV)
+@override_settings(PLATFORM_CREDENTIALS_FROM_ENV=REALISTIC_ENV, PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED=False)
 def test_env_dominates_db_for_every_platform(platform, organization):
     # Even with a complete admin row present, a complete env config wins.
     PlatformCredential.objects.create(
@@ -420,7 +444,10 @@ def test_env_dominates_db_for_every_platform(platform, organization):
         platform=platform,
         credentials={"client_id": "DB", "client_secret": "DB", "client_key": "DB"},
     )
-    assert resolve_platform_credentials(platform, organization.id) == REALISTIC_ENV[platform]
+    expected = dict(REALISTIC_ENV[platform])
+    if platform == "instagram":
+        expected["dm_oauth_scopes_enabled"] = False
+    assert resolve_platform_credentials(platform, organization.id) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +476,11 @@ def test_only_one_default_per_org(organization):
         organization=organization, provider="openai", api_key="k1", model="gpt-4o-mini", is_default=True
     )
     second = AIProviderConfig.objects.create(
-        organization=organization, provider="anthropic", api_key="k2", model="claude-haiku-4-5-20251001", is_default=True
+        organization=organization,
+        provider="anthropic",
+        api_key="k2",
+        model="claude-haiku-4-5-20251001",
+        is_default=True,
     )
     first.refresh_from_db()
     second.refresh_from_db()

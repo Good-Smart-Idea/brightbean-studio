@@ -1,14 +1,36 @@
 import uuid
 from typing import Any
 
-from django.db import models
+from django.conf import settings
+from django.db import models, router, transaction
+from django.utils import timezone
 
 from apps.common.encryption import EncryptedTextField
 from apps.common.managers import WorkspaceScopedManager
 from apps.credentials.models import PlatformCredential
 
 
+class YouTubeRevocation(models.Model):
+    """Encrypted, short-lived grant retry, independent of a deleted account."""
+
+    token = EncryptedTextField()
+    created_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    attempts = models.PositiveIntegerField(default=0)
+
+
 class SocialAccount(models.Model):
+    _skip_analytics_backfill: bool
+
+    class AnalyticsStatus(models.TextChoices):
+        UNKNOWN = "unknown", "Not checked"
+        CHECKING = "checking", "Checking"
+        READY = "ready", "Ready"
+        RECONNECT = "reconnect_required", "Reconnect required"
+        ATTENTION = "attention_required", "Operator attention required"
+        TEMPORARY = "temporary_error", "Temporary failure"
+
     class ConnectionStatus(models.TextChoices):
         CONNECTED = "connected", "Connected"
         TOKEN_EXPIRING = "token_expiring", "Token Expiring"
@@ -38,15 +60,24 @@ class SocialAccount(models.Model):
     oauth_access_token = EncryptedTextField(blank=True, default="")
     oauth_refresh_token = EncryptedTextField(blank=True, default="")
     token_expires_at = models.DateTimeField(blank=True, null=True)
+    # Facebook-login Instagram insights need the user's credential. The
+    # primary token remains the Page credential used by publishing and inbox.
+    oauth_facebook_user_access_token = EncryptedTextField(blank=True, default="")
+    facebook_user_token_expires_at = models.DateTimeField(blank=True, null=True)
+    analytics_status = models.CharField(max_length=25, choices=AnalyticsStatus.choices, default=AnalyticsStatus.UNKNOWN)
+    analytics_error_reason = models.CharField(max_length=40, blank=True, default="")
+    analytics_checked_at = models.DateTimeField(blank=True, null=True)
+    analytics_credentials_version = models.PositiveIntegerField(default=0)
 
     # Instance URL for Mastodon and Bluesky PDS
     instance_url = models.URLField(max_length=500, blank=True, default="")
 
     # Object we subscribed for webhook delivery, when it isn't this account
-    # itself. Instagram accounts connected via Facebook Login receive their
-    # comment and message events through the linked Page, so this holds that
-    # Page ID — needed to unsubscribe cleanly on disconnect.
+    # itself. For Facebook Login Instagram this holds the linked Page ID used
+    # for DM polling, sending and message subscriptions. Comment subscriptions
+    # still address the Instagram account itself.
     webhook_target_id = models.CharField(max_length=255, blank=True, default="")
+    messaging_access = models.BooleanField(null=True, blank=True, default=None)
 
     # Whether the platform is currently pushing this account's activity to us.
     # Null means "not applicable" (the platform has no webhooks) or "not tried
@@ -88,6 +119,17 @@ class SocialAccount(models.Model):
     last_error = models.TextField(blank=True, default="")
 
     connected_at = models.DateTimeField(auto_now_add=True)
+    youtube_authorized_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="authorized_youtube_accounts",
+    )
+    youtube_authorization_checked_at = models.DateTimeField(null=True, blank=True)
+    youtube_profile_refreshed_at = models.DateTimeField(null=True, blank=True)
+    youtube_verification_started_at = models.DateTimeField(default=timezone.now)
+    youtube_data_generation = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -102,6 +144,26 @@ class SocialAccount(models.Model):
     # place of the metric region. Cleared on successful reconnect.
     analytics_needs_reconnect = models.BooleanField(default=False)
 
+    # When the inbox last polled this account, and when it last walked the
+    # account's full history. Both belong here rather than being derived from
+    # InboxMessage.received_at, which answers a different question: an account
+    # that was polled and had nothing new to say leaves no message behind, so
+    # the derived value would say "never polled" and re-poll it every cycle.
+    #
+    # The poll stamp is what lets one 5-minute cycle serve platforms with very
+    # different budgets — see settings.INBOX_PLATFORM_MIN_POLL_SECONDS. The
+    # sweep stamp paces the deep walk that catches a reply on a thread too old
+    # for the routine poll's lookback (providers.youtube.get_messages).
+    inbox_last_polled_at = models.DateTimeField(blank=True, null=True)
+    inbox_last_deep_sweep_at = models.DateTimeField(blank=True, null=True)
+    inbox_initial_backfill_cursor = models.TextField(blank=True, default="")
+    inbox_initial_backfill_started_at = models.DateTimeField(blank=True, null=True)
+    inbox_deep_sweep_cursor = models.TextField(blank=True, default="")
+    inbox_deep_sweep_started_at = models.DateTimeField(blank=True, null=True)
+    # Resume bounded Facebook Login Instagram DM walks across worker restarts.
+    # Contains only object IDs/cursors, never OAuth tokens or message bodies.
+    instagram_dm_poll_state = models.JSONField(default=dict, blank=True)
+
     objects = WorkspaceScopedManager()
 
     class Meta:
@@ -110,6 +172,86 @@ class SocialAccount(models.Model):
 
     def __str__(self):
         return f"{self.account_name} ({self.get_platform_display()})"
+
+    def save(self, *args, **kwargs):
+        """Invalidate Instagram checks atomically when either credential changes."""
+        credential_fields = {"oauth_access_token", "oauth_facebook_user_access_token", "facebook_user_token_expires_at"}
+        fields = kwargs.get("update_fields")
+        self._analytics_credentials_changed = False
+        if self.platform != "instagram" or (fields is not None and not credential_fields.intersection(fields)):
+            return super().save(*args, **kwargs)
+        using = kwargs.get("using") or self._state.db or "default"
+        with transaction.atomic(using=using):
+            previous = type(self).objects.using(using).select_for_update().filter(pk=self.pk).first()
+            changed = previous is not None and any(
+                getattr(previous, field) != getattr(self, field)
+                for field in credential_fields
+                if fields is None or field in fields
+            )
+            # OAuth may return the same token after a consent change. A fresh
+            # connection still gets a new verification generation.
+            rechecking = (
+                fields is not None
+                and {"analytics_status", "oauth_facebook_user_access_token"}.issubset(fields)
+                and self.analytics_status == self.AnalyticsStatus.CHECKING
+            )
+            if changed or rechecking or (previous is None and self.oauth_access_token):
+                self._analytics_credentials_changed = True
+                self.__dict__.pop("_instagram_analytics_grant", None)
+                self.__dict__.pop("_instagram_analytics_status_recorded", None)
+                self.analytics_credentials_version = (previous.analytics_credentials_version if previous else 0) + 1
+                self.analytics_status = self.AnalyticsStatus.CHECKING
+                self.analytics_error_reason = ""
+                self.analytics_checked_at = None
+                self.analytics_needs_reconnect = False
+                if fields is not None:
+                    kwargs["update_fields"] = set(fields) | {
+                        "analytics_credentials_version",
+                        "analytics_status",
+                        "analytics_error_reason",
+                        "analytics_checked_at",
+                        "analytics_needs_reconnect",
+                    }
+            return super().save(*args, **kwargs)
+
+    @property
+    def instagram_dm_permission_request_disabled(self):
+        return (
+            self.platform == "instagram"
+            and "instagram_manage_messages" in self.missing_scopes
+            and not settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED
+        )
+
+    @property
+    def connection_missing_scopes(self):
+        # Instagram analytics has its own grant-aware status. A Page token's
+        # scope list cannot establish whether the person declined insights.
+        return [
+            scope
+            for scope in self.missing_scopes
+            if self.platform != "instagram" or scope != "instagram_manage_insights"
+            if scope != "instagram_manage_messages" or not self.instagram_dm_permission_request_disabled
+        ]
+
+    @property
+    def webhook_warning(self):
+        """The subscription warning and action applicable to current OAuth scopes."""
+        from .error_messages import WebhookFailure, omit_disabled_instagram_dm_failure
+
+        if self.webhooks_active is not False:
+            return None
+        failure = WebhookFailure(self.webhook_error, self.webhook_needs_reconnect)
+        if self.instagram_dm_permission_request_disabled and "pages_manage_metadata" not in self.missing_scopes:
+            return omit_disabled_instagram_dm_failure(failure)
+        return failure
+
+    @property
+    def instagram_analytics_message(self):
+        if self.platform != "instagram":
+            return ""
+        from apps.analytics.instagram_access import status_message
+
+        return status_message(self)
 
     @property
     def display_label(self) -> str:
@@ -121,16 +263,31 @@ class SocialAccount(models.Model):
         """
         return self.account_name or self.account_handle
 
+    def token_expires_within(self, window) -> bool:
+        """Whether the recorded expiry falls inside ``window`` from now.
+
+        An unknown expiry (``token_expires_at is None``) answers False: we
+        cannot judge it, and the platforms where "unknown" should mean "refresh
+        anyway" are named explicitly in ``tasks.EXPIRY_BOOTSTRAP_PLATFORMS``.
+
+        The window is a caller's decision because it means different things at
+        different cadences. A user-triggered publish can afford the generous
+        7-day view. An hourly background loop cannot: a Google access token
+        lives one hour, so *any* window wider than that is permanently true and
+        would spend a refresh call every hour on every account for nothing.
+        """
+        if not self.token_expires_at:
+            return False
+        from django.utils import timezone
+
+        return self.token_expires_at < timezone.now() + window
+
     @property
     def is_token_expiring_soon(self) -> bool:
         """Token expires within 7 days."""
-        if not self.token_expires_at:
-            return False
         from datetime import timedelta
 
-        from django.utils import timezone
-
-        return self.token_expires_at < timezone.now() + timedelta(days=7)
+        return self.token_expires_within(timedelta(days=7))
 
     @property
     def needs_reconnect(self) -> bool:
@@ -139,34 +296,92 @@ class SocialAccount(models.Model):
             self.ConnectionStatus.ERROR,
         )
 
-    def refresh_oauth_token(self, provider) -> str:
+    def refresh_oauth_token(self, provider, *, enqueue_backfill: bool = True) -> str:
         """Refresh this account's OAuth access token via *provider* and persist it.
 
         Returns the new access token. Propagates whatever the provider's
         ``refresh_token`` raises so callers decide between degrading (publish
         engine keeps the old token) and aborting (composer endpoints 502).
+
+        ``enqueue_backfill=False`` is for routine token rotations (publishing,
+        analytics, inbox polls, and composer lookups). A rotation is not a new
+        connection and must not queue a full historical analytics backfill.
+
+        Serialize refreshes with a row lock on PostgreSQL or an account lock
+        within the SQLite worker. A caller that waited for another refresh uses
+        its persisted credentials rather than resubmitting the refresh token.
         """
         from datetime import timedelta
 
         from django.utils import timezone
 
-        new_tokens = provider.refresh_token(self.oauth_refresh_token)
-        self.oauth_access_token = new_tokens.access_token
-        if new_tokens.refresh_token:
-            self.oauth_refresh_token = new_tokens.refresh_token
-        if new_tokens.expires_in:
-            self.token_expires_at = timezone.now() + timedelta(seconds=new_tokens.expires_in)
-        self.connection_status = self.ConnectionStatus.CONNECTED
-        self.save(
-            update_fields=[
-                "oauth_access_token",
-                "oauth_refresh_token",
-                "token_expires_at",
-                "connection_status",
-                "updated_at",
-            ]
-        )
-        return new_tokens.access_token
+        from .token_refresh import token_refresh_lock, token_refresh_transaction
+
+        using = router.db_for_write(type(self), instance=self)
+        accounts = type(self).objects.using(using)
+        token_fields = ("oauth_access_token", "oauth_refresh_token", "token_expires_at")
+        try:
+            with token_refresh_lock(using, self.pk):
+                with token_refresh_transaction(using):
+                    current = accounts.select_for_update().get(pk=self.pk)
+                    if self.platform == "youtube" and current.youtube_data_generation != self.youtube_data_generation:
+                        from providers.exceptions import TokenExpiredError
+
+                        raise TokenExpiredError("YouTube connection changed during token refresh", platform="youtube")
+                if all(getattr(current, field) == getattr(self, field) for field in token_fields):
+                    new_tokens = provider.refresh_token(current.oauth_refresh_token)
+                    # SQLite has no row lock during HTTP. Discard a result if
+                    # another process replaced the stored credentials meanwhile.
+                    with token_refresh_transaction(using):
+                        current = accounts.select_for_update().get(pk=self.pk)
+                        if (
+                            self.platform == "youtube"
+                            and current.youtube_data_generation != self.youtube_data_generation
+                        ):
+                            from providers.exceptions import TokenExpiredError
+
+                            raise TokenExpiredError(
+                                "YouTube connection changed during token refresh", platform="youtube"
+                            )
+                        if all(getattr(current, field) == getattr(self, field) for field in token_fields):
+                            current.oauth_access_token = new_tokens.access_token
+                            if new_tokens.refresh_token:
+                                current.oauth_refresh_token = new_tokens.refresh_token
+                            if new_tokens.expires_in:
+                                current.token_expires_at = timezone.now() + timedelta(seconds=new_tokens.expires_in)
+                            current.connection_status = self.ConnectionStatus.CONNECTED
+                            current._skip_analytics_backfill = not enqueue_backfill
+                            current.save(using=using, update_fields=[*token_fields, "connection_status", "updated_at"])
+                state_fields = [*token_fields, "connection_status"]
+                if self.platform == "instagram":
+                    # save() invalidates Instagram analytics on a rotation.
+                    # Keep the caller's generation and cached verdicts in sync
+                    # even though the locked instance performed that save.
+                    if current.analytics_credentials_version != self.analytics_credentials_version:
+                        self.__dict__.pop("_instagram_analytics_grant", None)
+                        self.__dict__.pop("_instagram_analytics_status_recorded", None)
+                    state_fields.extend(
+                        [
+                            "oauth_facebook_user_access_token",
+                            "facebook_user_token_expires_at",
+                            "analytics_credentials_version",
+                            "analytics_status",
+                            "analytics_error_reason",
+                            "analytics_checked_at",
+                            "analytics_needs_reconnect",
+                        ]
+                    )
+                for field in state_fields:
+                    setattr(self, field, getattr(current, field))
+        except Exception as exc:
+            if self.platform == "youtube":
+                from .youtube_compliance import permanent_grant_rejection, purge_connection
+
+                # Purge after the failed refresh transaction has rolled back.
+                if permanent_grant_rejection(exc):
+                    purge_connection(self, check_generation=True)
+            raise
+        return self.oauth_access_token
 
     # Platform character limits
     PLATFORM_CHAR_LIMITS = {
@@ -269,6 +484,47 @@ class SocialAccount(models.Model):
             PlatformCredential.Platform.FACEBOOK,
             PlatformCredential.Platform.INSTAGRAM,
         }
+
+    @property
+    def revokes_platform_grant_on_disconnect(self) -> bool:
+        """True when disconnecting also revokes our access on the platform.
+
+        The disconnect confirmation promises exactly this, so it lists only the
+        providers whose ``revoke_token`` calls a revocation endpoint with the
+        token disconnect hands it. Left out, besides the Facebook-Page flows:
+        Pinterest, Threads and DEV.to have no revocation call, and Bluesky's
+        ``deleteSession`` wants the refresh JWT rather than the access JWT it
+        gets — and the app password outlives any session regardless.
+        """
+        return self.platform in {
+            PlatformCredential.Platform.YOUTUBE,
+            PlatformCredential.Platform.GOOGLE_BUSINESS,
+            PlatformCredential.Platform.TIKTOK,
+            PlatformCredential.Platform.LINKEDIN_PERSONAL,
+            PlatformCredential.Platform.LINKEDIN_COMPANY,
+            PlatformCredential.Platform.MASTODON,
+            PlatformCredential.Platform.INSTAGRAM_LOGIN,
+        }
+
+    @property
+    def revocation_token(self) -> str:
+        """The token disconnect should hand the provider's ``revoke_token``.
+
+        Google refuses to revoke an expired access token, and ours lives an
+        hour, so by the time someone disconnects it is usually dead and the
+        grant would survive. The refresh token revokes the same grant and
+        outlives it.
+        """
+        if (
+            self.platform
+            in {
+                PlatformCredential.Platform.YOUTUBE,
+                PlatformCredential.Platform.GOOGLE_BUSINESS,
+            }
+            and self.oauth_refresh_token
+        ):
+            return self.oauth_refresh_token
+        return self.oauth_access_token
 
     def supports_first_comment(self) -> bool:
         """Whether this account can have a first comment posted by the worker.

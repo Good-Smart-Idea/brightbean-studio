@@ -42,8 +42,10 @@ from apps.api.schemas import (
 from apps.composer.models import Post
 from apps.composer.services import (
     create_post,
+    media_change_blocker,
     sync_post_scheduled_at,
     transition_platform_post,
+    usable_media_types,
 )
 from apps.social_accounts.models import SocialAccount
 
@@ -341,6 +343,15 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
         missing = [i for i in wanted_media if i not in resolved_assets]
         if missing:
             raise HttpError(422, f"Media asset(s) not in workspace: {missing}")
+        # A scheduled post may be edited, but not into one it can't publish:
+        # swapping a TikTok post's video for an image, or emptying a pin's
+        # media, would leave it queued to fail after the schedule route had
+        # checked it.
+        reason = media_change_blocker(
+            post, media_types_after=usable_media_types(resolved_assets[mid] for mid in wanted_media)
+        )
+        if reason:
+            raise HttpError(422, reason)
 
     with transaction.atomic():
         update_fields: list[str] = []

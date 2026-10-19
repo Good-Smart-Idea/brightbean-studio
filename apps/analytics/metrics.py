@@ -135,6 +135,8 @@ def hero_card_metrics(platform: str) -> list[str]:
     Engagement components and the rate itself live in the EngagementCard, and
     account-only growth metrics live in the header — so neither shows up here.
     """
+    if platform == "youtube":
+        return [m for m in PLATFORM_METRICS[platform] if m not in ACCOUNT_ONLY]
     return [
         m
         for m in PLATFORM_METRICS.get(platform, [])
@@ -148,6 +150,8 @@ def has_engagement_card(platform: str) -> bool:
     Bluesky/Mastodon/LinkedIn-Personal have no reach denom, so we render
     only count cards for them (per the plan's "hard platform gap" handling).
     """
+    if platform == "youtube":
+        return False
     metrics = PLATFORM_METRICS.get(platform, [])
     has_parts = any(p in metrics for p in ENGAGEMENT_PARTS)
     has_denom = any(d in metrics for d in ENGAGEMENT_DENOMINATORS)

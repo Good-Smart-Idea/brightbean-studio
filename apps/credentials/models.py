@@ -131,12 +131,18 @@ def resolve_platform_credentials(platform, org_id):
     # .env wins only when it fully satisfies the platform's required keys, so a
     # partial env config can't shadow a complete admin-entered row.
     if derive_is_configured(platform, env_creds):
-        return dict(env_creds)
-    try:
-        cred = PlatformCredential.objects.for_org(org_id).get(platform=platform, is_configured=True)
-        return dict(cred.credentials)
-    except PlatformCredential.DoesNotExist:
-        return dict(env_creds)
+        credentials = dict(env_creds)
+    else:
+        try:
+            cred = PlatformCredential.objects.for_org(org_id).get(platform=platform, is_configured=True)
+            credentials = dict(cred.credentials)
+        except PlatformCredential.DoesNotExist:
+            credentials = dict(env_creds)
+    if platform == "instagram" and credentials:
+        # This deployment switch applies to every OAuth entry point, including
+        # org-owned apps. Stored credentials cannot override an operator's opt-out.
+        credentials["dm_oauth_scopes_enabled"] = settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED
+    return credentials
 
 
 def resolve_app_secret(platform, org_id):

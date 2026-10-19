@@ -15,6 +15,7 @@
 </div>
 
 <div style="flex: 1; overflow-y: auto; padding: 20px;">
+    {% if account.platform == "youtube" %}{% include "partials/_youtube_attribution.html" with youtube_account=account youtube_video_id=post.platform_post_id %}{% endif %}
     <div style="position: relative; margin-bottom: 16px;">
         {% if media_preview.kind == 'video' %}
         <video src="{{ media_preview.url }}" controls muted preload="metadata"
@@ -49,5 +50,5 @@
 </div>
 
 <div style="padding: 14px 20px; border-top: 1px solid var(--neutral-100); display: flex; gap: 10px; flex-shrink: 0;">
-    <a href="#" target="_blank" class="btn-outline" style="padding: 9px 16px; width: auto;">View on {{ account.get_platform_display }}</a>
+    <a href="{% if account.platform == 'youtube' %}https://www.youtube.com/watch?v={{ post.platform_post_id|urlencode }}{% else %}#{% endif %}" target="_blank" rel="noopener noreferrer" class="btn-outline" style="padding: 9px 16px; width: auto;">View on {{ account.get_platform_display }}</a>
 </div>

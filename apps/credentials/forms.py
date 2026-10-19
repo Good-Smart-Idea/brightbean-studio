@@ -53,12 +53,13 @@ class AIProviderConfigForm(forms.ModelForm):
             raise forms.ValidationError("An API key is required.")
         return key
 
+
 # Human-readable required-key hints, shown under the credentials field in the
 # admin. Mirrors what each provider reads (see providers/*.py).
 _KEY_HINTS = {
-    "facebook": "client_id, client_secret (app_id / app_secret also accepted)",
-    "instagram": "client_id, client_secret (app_id / app_secret also accepted)",
-    "instagram_login": "client_id, client_secret (app_id / app_secret also accepted)",
+    "facebook": "client_id, client_secret (app_id / app_secret also accepted), config_id (optional), human_agent_enabled (optional; true only after Meta approval)",
+    "instagram": "client_id, client_secret (app_id / app_secret also accepted), config_id (optional), human_agent_enabled (optional; true only after Meta approval)",
+    "instagram_login": "client_id, client_secret (app_id / app_secret also accepted), human_agent_enabled (optional; true only after Meta approval)",
     "threads": "client_id, client_secret (app_id / app_secret also accepted)",
     "pinterest": "client_id, client_secret (app_id / app_secret also accepted)",
     "tiktok": "client_key, client_secret  (note: client_key, NOT client_id)",

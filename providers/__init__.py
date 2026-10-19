@@ -6,6 +6,7 @@ Use get_provider() to instantiate a provider with app credentials.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 from .bluesky import BlueskyProvider
@@ -21,6 +22,7 @@ from .mastodon import MastodonProvider
 from .pinterest import PinterestProvider
 from .threads import ThreadsProvider
 from .tiktok import TikTokProvider
+from .types import PostType
 from .youtube import YouTubeProvider
 
 if TYPE_CHECKING:
@@ -65,6 +67,41 @@ def caption_wire_length(platform: str, text: str) -> int:
     if not escaped:
         return len(text)
     return len(text) + sum(text.count(ch) for ch in escaped)
+
+
+VIDEO_POST_TYPES = frozenset({PostType.VIDEO, PostType.SHORT})
+
+
+@functools.cache
+def is_video_only(platform: str) -> bool:
+    """Whether ``platform`` can publish nothing but video.
+
+    The publisher drops every non-video attachment for these platforms (the
+    same ``VIDEO_POST_TYPES`` test in ``PublishEngine._dispatch_to_provider``),
+    so a post without a video reaches them with nothing to upload and can only
+    fail. Cached because ``supported_post_types`` is fixed per provider class,
+    and this is asked for every account an API response or scheduling check
+    touches.
+    """
+    provider_cls = PROVIDER_REGISTRY.get(platform)
+    if provider_cls is None:
+        return False
+    return set(provider_cls().supported_post_types) <= VIDEO_POST_TYPES
+
+
+@functools.cache
+def requires_media(platform: str) -> bool:
+    """Whether ``platform`` can't publish text on its own.
+
+    True wherever the provider supports no ``TEXT`` post: Instagram and
+    Pinterest refuse a post with nothing attached, and the video-only
+    platforms are a stricter case of the same. Derived from the provider, like
+    ``is_video_only``, so a new platform is covered without a list to update.
+    """
+    provider_cls = PROVIDER_REGISTRY.get(platform)
+    if provider_cls is None:
+        return False
+    return PostType.TEXT not in provider_cls().supported_post_types
 
 
 def get_provider(platform: str, credentials: dict | None = None) -> SocialProvider:

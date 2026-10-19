@@ -7,6 +7,22 @@ from django.utils.safestring import mark_safe
 register = template.Library()
 
 
+@register.simple_tag
+def signup_mode():
+    """The configured SIGNUP_MODE, so the closed-signup notice can say why."""
+    from django.conf import settings
+
+    return settings.SIGNUP_MODE
+
+
+@register.simple_tag(takes_context=True)
+def invite_lapsed(context):
+    """Whether the visitor's invitation expired or was used since they followed it."""
+    from apps.accounts.signup_links import has_lapsed_invite
+
+    return has_lapsed_invite(context.get("request"))
+
+
 @register.filter(is_safe=True)
 def json_attr(value):
     """Serialize a Python value as a JSON literal safe to embed inside an

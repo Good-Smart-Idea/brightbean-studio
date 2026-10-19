@@ -66,7 +66,10 @@ class PinterestProvider(SocialProvider):
 
     @property
     def required_scopes(self) -> list[str]:
-        return ["user_accounts:read", "boards:read", "pins:read", "pins:write"]
+        # ``POST /pins`` needs boards:write as well as pins:write — it writes
+        # to the board. Without it every pin failed with a 401 ("Missing:
+        # ['boards:write']") on an account that otherwise looked healthy.
+        return ["user_accounts:read", "boards:read", "boards:write", "pins:read", "pins:write"]
 
     @property
     def rate_limits(self) -> RateLimitConfig:
@@ -182,6 +185,7 @@ class PinterestProvider(SocialProvider):
             raise PublishError(
                 "board_id is required in content.extra for Pinterest pins",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         payload: dict = {
@@ -216,11 +220,13 @@ class PinterestProvider(SocialProvider):
                 "Pinterest image file upload not supported via this provider; "
                 "use media_urls with a hosted image URL instead",
                 platform=self.platform_name,
+                retryable=False,
             )
         else:
             raise PublishError(
                 "No media provided for Pinterest pin",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         resp = self._request(
@@ -256,18 +262,20 @@ class PinterestProvider(SocialProvider):
         upload_url = media_body.get("upload_url")
 
         if upload_url and content.media_files:
-            # Step 2: Upload video binary
+            # Step 2: Upload video binary, streamed from disk rather than read
+            # into memory (see the same change in the TikTok/YouTube providers).
             video_path = content.media_files[0]
-            with open(video_path, "rb") as f:
-                video_data = f.read()
-
-            self._request(
-                "PUT",
-                upload_url,
-                headers={"Content-Type": "video/mp4"},
-                data=video_data,
-                timeout=120.0,
-            )
+            with open(video_path, "rb") as video:
+                self._request(
+                    "PUT",
+                    upload_url,
+                    headers={
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(os.path.getsize(video_path)),
+                    },
+                    data=video,
+                    timeout=120.0,
+                )
 
         # Step 3: Create pin referencing media_id
         payload["media_source"] = {

@@ -43,7 +43,7 @@ A free hosted version is available at [brightbean.xyz/studio](https://brightbean
 | **Media library** | Org- and workspace-scoped libraries with nested folders, auto-generated platform-optimized variants, alt text, and built-in Unsplash stock-photo search in the composer. |
 | **Client portal** | Passwordless 30-day magic-link access so clients can approve or reject posts without creating an account. |
 | **Notifications** | In-app, email, and webhook delivery with per-user preferences for every event type. |
-| **Security & ops** | Encrypted token & credential storage, Google SSO, Sentry support, and a 14-day reversible org-deletion grace period. 2FA (TOTP) is on the roadmap. |
+| **Security & ops** | Encrypted token & credential storage, Google SSO, Sentry support, and a 14-day org-deletion grace period for non-YouTube data. YouTube connections and copied API data are removed immediately when deletion is requested. 2FA (TOTP) is on the roadmap. |
 | **White-label friendly** | Per-workspace branding (logo, colors) and workspace defaults for hashtags, first comments, and posting templates. |
 
 ### A quick look
@@ -105,6 +105,8 @@ After deploying, set these environment variables in your platform's dashboard:
 | `ALLOWED_HOSTS` | Yes | Your app's domain, e.g. `your-app.herokuapp.com` |
 | `APP_URL` | Yes | Full public URL, e.g. `https://your-app.herokuapp.com` |
 | `STORAGE_BACKEND` | No | Set to `s3` for S3/R2 storage. Default: `local`. Heroku, Render, and Railway have ephemeral filesystems, so uploaded files are lost on redeploy without S3. |
+| `SERVE_MEDIA` | No | Only used with `STORAGE_BACKEND=local`. Default: `true`, so Django serves uploads at `/media/`. Those files are served **unauthenticated** — anyone with the path can fetch them. That is required in this mode: Instagram, Threads, Facebook, Pinterest, Google Business and dev.to fetch attachment URLs server-side when publishing, so `/media/` must be publicly reachable. Only the media library, avatars and workspace icons are exposed this way (`PUBLIC_MEDIA_PREFIXES` in `config/urls.py`); comment attachments go through a permission-checked view. Set to `false` only when a reverse proxy or CDN serves those prefixes on the same public path instead. |
+| `CADDY_MEDIA_ROOT` | No | docker-compose only. Where Caddy reads uploads from. Default: `/app/media`. Set to `/var/empty` when `STORAGE_BACKEND=s3` — the `media_data` volume survives the switch and Caddy cannot see `SERVE_MEDIA`, so it would otherwise keep serving whatever uploads were left behind. |
 | `S3_ENDPOINT_URL` | If using S3 | S3-compatible endpoint URL |
 | `S3_ACCESS_KEY_ID` | If using S3 | S3 access key |
 | `S3_SECRET_ACCESS_KEY` | If using S3 | S3 secret key |
@@ -115,6 +117,7 @@ After deploying, set these environment variables in your platform's dashboard:
 | `EMAIL_HOST_PASSWORD` | No | SMTP password |
 | `GOOGLE_AUTH_CLIENT_ID` | No | For Google OAuth login. Get from [Google Cloud Console](https://console.cloud.google.com/) → Credentials. |
 | `GOOGLE_AUTH_CLIENT_SECRET` | No | Google OAuth secret |
+| `CUSTOM_SIGNUP_URL` | No | Where "Sign up" links point, e.g. a waitlist or marketing page: the login page's link, the email sent when someone resets the password of an address with no account, and the redirect after an owner deletes their organization. Must be an `http(s)://` URL or a path starting with `/`. Default: the built-in `/accounts/signup/`. With `SIGNUP_MODE=open` that page stays open either way (so your page can link back to it); with `invite` or `closed`, everyone who may not sign up is redirected here instead (see [Restricting Sign-up](#restricting-sign-up)). People with a pending invite are sent to the built-in signup, since only it accepts the invite (except with `closed`, where invites cannot create accounts). |
 | `UNSPLASH_ACCESS_KEY` | No | Enables Unsplash stock-photo search in the composer. Create a free app at [unsplash.com/developers](https://unsplash.com/developers). |
 
 For social media API keys, see [Platform Credentials](#platform-credentials). Full variable reference: `.env.example`.
@@ -223,7 +226,7 @@ python manage.py runserver
 Tab 3 - Background worker:
 ```bash
 source .venv/bin/activate
-python manage.py process_tasks
+python manage.py run_studio_worker
 ```
 
 Open http://localhost:8000 and log in with the superuser you created.
@@ -234,7 +237,7 @@ Open http://localhost:8000 and log in with the superuser you created.
 source .venv/bin/activate                # activate Python env
 python manage.py runserver               # start web server
 # (open another tab)
-python manage.py process_tasks           # start worker
+python manage.py run_studio_worker           # start worker
 ```
 
 > **Note:** SQLite is fine for local development and small deployments. For production or heavy concurrent usage, switch to PostgreSQL.
@@ -288,6 +291,8 @@ docker compose exec app python manage.py createsuperuser
 
 This starts 5 containers: app (Gunicorn), worker, PostgreSQL, Caddy (auto-HTTPS), and a one-shot migrate container that runs database migrations automatically on startup. Edit the `Caddyfile` with your domain.
 
+With the default `STORAGE_BACKEND=local`, Caddy serves uploaded media directly from the `media_data` volume at `/media/`, so large images and video never occupy a Gunicorn worker thread and byte-range requests (video seeking) work. Django's own `/media/` route stays available as the fallback for deployments without this proxy.
+
 To update:
 
 ```bash
@@ -300,12 +305,69 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 | Platform | Config file | Notes |
 |----------|-------------|-------|
 | **Heroku** | `Procfile` + `app.json` | Deploy-button ready. Must use Basic+ dynos (Eco dynos break the worker). |
-| **Railway** | `railway.toml` | The [one-click template](https://railway.com/deploy/brightbean-studio) provisions three services: web (Gunicorn, runs `migrate` on startup), worker (`python manage.py process_tasks`), and managed PostgreSQL. The web service's startup `migrate` fires the `post_migrate` hooks that register the recurring tasks, so scheduling works out of the box. |
+| **Railway** | `railway.toml` | The [one-click template](https://railway.com/deploy/brightbean-studio) provisions three services: web (Gunicorn, runs `migrate` on startup), worker (`python manage.py run_studio_worker`), and managed PostgreSQL. The web service's startup `migrate` fires the `post_migrate` hooks that register the recurring tasks, so scheduling works out of the box. |
 | **Render** | `render.yaml` | Blueprint with web, worker, PostgreSQL. Must use paid tier. |
 
 All platforms with ephemeral filesystems require `STORAGE_BACKEND=s3` - see `.env.example` for S3 configuration.
 
+**Memory sizing.** Importing the app costs roughly 100 MB before it serves a request, and a warmed Gunicorn worker settles near 200 MB - so the shipped command runs a single threaded worker (`--workers 1 --threads 4`), which fits a 512 MB dyno with room for media handling. Raise `--workers` only when you raise the memory to match; a rule of thumb is 250 MB per worker. Do **not** add `--max-requests`: gthread stops heartbeating at the start of the request that trips the counter, so the arbiter kills the worker mid-request once `--timeout` (30s) passes - which drops whichever upload happened to be that request, and uploads here can be up to 1 GB. The `worker` process needs the same headroom: it downloads videos to disk and streams them to the platform, and if it is killed mid-publish (Heroku's R15, an OOM kill, a deploy) the affected post is failed by the confirmation sweep rather than left in limbo.
+
+**One worker, reserved publishing capacity.** `run_studio_worker` runs one process with two task execution threads: one for publishing and publish confirmation, and one for inbox sync, analytics, health checks, media, and maintenance. It claims jobs only when their thread is available and keeps the existing database locks, retries, and repeating schedules. Task logs include dispatch delay and execution duration. The default dispatcher poll interval is one second (`--sleep`). With the shipped publisher and web concurrency limits, peak database demand is 17 connections, below the 20-connection PostgreSQL limit.
+
+**Why Heroku uses `--duration 3600`.** Peak allocations can raise RSS permanently because CPython and glibc retain freed pages. Hourly recycling stops admitting general work first, while publishing continues until that job finishes; the publishing thread then drains and the process exits cleanly. SIGINT/SIGTERM stop admission on both threads and let in-flight work finish, subject to the platform's shutdown grace period. Unfinished jobs retain their locks for normal recovery. Don't go below ~1800s, where Heroku's crash cool-off starts to engage. Docker, Render, and Railway use the command without a duration, so they do not depend on a clean-exit restart policy. The legacy `python manage.py process_tasks` command remains available for rollback.
+
+**`MALLOC_ARENA_MAX`.** glibc gives each thread its own arena (up to 64 MB) capped at `8 x nproc`, and containers report the host's core count, so the cap is effectively unbounded. This app has real thread churn - the publisher builds a fresh pool every 15s and boto3's managed transfer adds ten threads per download - and those arenas are never returned to the OS. On Heroku this is already set to 2 by the repo's `.profile`, which applies to web, worker, the release phase and one-off `heroku run` dynos alike; it is written as a default rather than an override, so a config var still wins if you want to tune it. Deploy targets that build from the `Dockerfile` (Render, Railway, docker-compose) do not read `.profile` - set it in their own environment config if the host is memory-tight.
+
 See `architecture.md` for detailed per-platform instructions and cost breakdowns.
+
+### Restricting Sign-up
+
+A self-hosted install has to be reachable from the internet — that is where
+the platforms deliver OAuth callbacks and webhooks — so by default anyone
+who finds the domain can create an account. `SIGNUP_MODE` controls that:
+
+| Value | Who may create an account |
+|---|---|
+| `open` (default) | Anyone. |
+| `invite` | Only visitors who followed a valid invitation link. |
+| `closed` | Nobody. Create accounts in the Django admin. Invitations can only be sent to people who already have an account. |
+
+```bash
+SIGNUP_MODE=invite
+```
+
+Applies to both the email form and social logins — guarding only the form
+would leave the provider callback open, since `SOCIALACCOUNT_AUTO_SIGNUP`
+creates the account there without ever rendering the signup page.
+
+**Signing in is never affected**, including for users who authenticate
+through Google: an existing account is connected by email rather than
+signed up.
+
+In `invite` mode the invitation must be unaccepted and unexpired, so a
+single link cannot be reused indefinitely. Invitations are sent from
+**Settings → Members**.
+
+What a visitor who may not sign up sees depends on `CUSTOM_SIGNUP_URL`:
+
+- **Empty:** a "Sign-up is closed" page, and the login page hides its
+  "Sign up" link.
+- **Set** (e.g. `https://example.com/signup`): they are redirected there —
+  from `/accounts/signup/` and from the Google callback alike, before any
+  account is created — and the login page's "Sign up" link points there too.
+  In `invite` mode, visitors with a valid invitation still get the built-in
+  signup. Studio refuses to start if the URL points back at its own
+  `/accounts/signup/`, which would loop.
+
+Things to expect with a redirect: a new Google user goes through Google's
+consent screen before being redirected; someone whose Google email differs
+from the email of their existing account counts as new; and an invitee who
+opens the link in one browser and signs up in another has no invitation
+there.
+
+An unrecognised value stops the app at startup rather than falling back to
+a default — a typo that silently leaves sign-up open is the failure worth
+being loud about.
 
 ## Project Structure
 
@@ -389,7 +451,7 @@ Facebook and Instagram share the same Meta app credentials. Threads runs on the 
    - Add the optional permission: `pages_messaging`
 
    **Use case: "Manage messaging & content on Instagram"** (Instagram)
-   - Add these permissions: `instagram_basic`, `instagram_content_publish`, `instagram_manage_comments`, `instagram_manage_insights`
+   - Add these permissions: `instagram_basic`, `instagram_content_publish`, `instagram_manage_comments`, `instagram_manage_insights`, `instagram_manage_messages`, `pages_manage_metadata`
 
    **Use case: "Access the Threads API"** (Threads)
    - This use case auto-includes `threads_basic`
@@ -410,15 +472,24 @@ Facebook and Instagram share the same Meta app credentials. Threads runs on the 
 
    **If you connect Instagram through this Facebook app, also subscribe to the `Instagram` object** on the same Webhooks page:
    - **Callback URL:** `{APP_URL}/webhooks/facebook/` (the same endpoint — it handles both platforms)
-   - Subscribe to the `comments` and `mentions` fields.
+   - Subscribe to the `comments`, `mentions`, and `messages` fields.
 
    > `comments` and `mentions` belong to the **Instagram** object, not the Page — a Page accepts only its own fields (`feed`, `mention`, `messages`, …). Studio subscribes the Instagram *account* automatically on connect, but the object-level configuration here can only be done in the dashboard. Without it, Instagram comments arrive only via the 5-minute poll and mentions not at all.
 6. Set the environment variables:
    ```
    PLATFORM_FACEBOOK_APP_ID=your-app-id
    PLATFORM_FACEBOOK_APP_SECRET=your-app-secret
+   # Optional: Facebook Login for Business configuration ID for agency/multi-business onboarding
+   PLATFORM_FACEBOOK_CONFIG_ID=your-configuration-id
    FACEBOOK_WEBHOOK_VERIFY_TOKEN=your-random-verify-token
    ```
+   When `PLATFORM_FACEBOOK_CONFIG_ID` is set, Facebook and the Facebook-login
+   Instagram connector use that Login for Business configuration instead of
+   sending an ad-hoc `scope` list. Configure the required permissions and asset
+   selection in Meta's configuration, and include every business whose Pages
+   should be available to the login.
+   Include `instagram_manage_messages` and `pages_manage_metadata` in that
+   configuration too; changing the code's scope list does not change Meta's configuration.
 7. **Threads:** the "Access the Threads API" use case gets its own App ID, App Secret, and redirect URIs. Go to **Use cases → Access the Threads API → Settings** and add the Threads redirect URI:
    ```
    {APP_URL}/social-accounts/callback/threads/
@@ -429,6 +500,65 @@ Facebook and Instagram share the same Meta app credentials. Threads runs on the 
    PLATFORM_THREADS_APP_SECRET=your-threads-app-secret
    ```
    These have no fallback: until both are set, Threads shows as **Not Configured** on the connect page. Sending the Facebook App ID to Threads fails with error `4476002`.
+
+### Instagram DMs and reply windows
+
+Both Instagram connectors receive DMs and supported incoming media in the unified
+inbox and send text replies. The Facebook Login connector uses the selected
+Page's token and ID for conversations and sending, while incoming webhook entries
+identify the Instagram account. Studio adds `messages` to that Page's existing
+subscription without replacing Facebook feed/mention fields.
+
+For Facebook Login Instagram messaging, the login needs `instagram_manage_messages`
+and `pages_manage_metadata`, a linked professional account, and the Page's
+`MESSAGING` task. In Instagram, enable **Settings → Messages and story replies →
+Message controls → Connected tools → Allow access to messages**. Reconnect existing
+accounts after adding permissions, including permissions in any Login for Business
+configuration. Missing DM permissions do not disable publishing or comment polling.
+
+Self-hosted installations must configure the required permissions and access
+levels on their own Meta apps.
+
+When `PLATFORM_FACEBOOK_CONFIG_ID` is set, Facebook Login for Business gets its
+permissions from Meta's configuration rather than the OAuth scope list. Include
+`instagram_manage_messages` and `pages_manage_metadata` in that configuration;
+changing the code's scope list does not change Meta's configuration.
+
+For external customers, complete Meta App Review, the required Advanced Access,
+and business verification. Prepare a review recording showing login and account
+selection, a customer DM appearing in Studio, an incoming attachment, a text reply,
+and receipt of that reply in Instagram. Configure the Instagram object's `messages`
+field and callback in the Meta dashboard; the Page subscription alone does not
+configure the app-level callback.
+
+REST/MCP sends use the 24-hour window measured from the customer's latest verified
+message to that account. They may save drafts after that window closes. A person
+can review and send from the web inbox for up to seven days only after Meta approves
+**Human Agent** access and an administrator enables the matching app setting:
+
+- `PLATFORM_FACEBOOK_HUMAN_AGENT_ENABLED=true` for Facebook Messenger and Instagram via Facebook Login.
+- `PLATFORM_INSTAGRAM_HUMAN_AGENT_ENABLED=true` for Instagram Direct.
+- For organization credentials, set `human_agent_enabled` to `true` on the applicable platform's credential JSON.
+
+These settings default to false. Do not enable them before approval. No endpoint
+or MCP argument can declare a programmatic reply human-operated. After seven days,
+or when the message timestamp cannot be verified, wait for a new customer message.
+
+After deployment, apply migrations and check each affected connection:
+
+```sh
+python manage.py migrate
+python manage.py diagnose_instagram_messages --account-id <uuid> --refresh-scopes
+python manage.py subscribe_webhooks --platform instagram --retry-failed
+```
+
+The diagnostic command does not send DMs; `--refresh-scopes` saves the verified
+permission result. Reconnect any account with missing grants before retrying its
+subscription. Live verification should cover text and media reception, a text
+reply within 24 hours, duplicate/echo suppression, and an approved human support
+reply after 24 hours. Incoming media URLs may expire; open Instagram if an
+attachment cannot load. Outgoing media and new automated reply workflows are not
+included.
 
 ### Instagram (Direct, via Instagram Login)
 
@@ -524,9 +654,39 @@ If you set only the Path B (Company) credentials, Brightbean Studio automaticall
 
 YouTube and Google Business Profile share the same Google Cloud credentials.
 
+YouTube analytics uses native channel reports: views, total watch time, average
+percentage viewed, likes, comments, shares and subscribers gained. The 7/30/90-day
+windows follow Pacific calendar dates and end yesterday. Missing reports remain
+unavailable; daily chart gaps are not reconstructed from lifetime totals. YouTube
+engagement rates are not calculated. Headline averages come from the whole-period
+report rather than averages of daily percentages.
+
+Existing YouTube connections keep their grants and do not require a migration
+reconnect. New connections and voluntary renewals record the user who authorized
+them. Disconnecting YouTube, deleting that recorded authorizing user, or requesting
+organization deletion immediately removes YouTube connections and copied API data,
+including comment and publish-error notification copies. Original authored posts
+and uploaded media remain; other organization data keeps its 14-day deletion grace
+period. Cancelling organization deletion requires reconnecting YouTube.
+
+The daily YouTube compliance worker checks authorization and retained video
+existence in every connection status, including videos older than 90 days. Copied
+profiles/comments are refreshed by day 25 and removed by day 29 if retrieval still
+fails. Authorized statistical history is retained for 180 days; current lifetime
+statistics also require verified authorization and video existence. Revocation is
+attempted after local cleanup commits; transient failures use an encrypted outbox
+that expires after seven days.
+
+Automatic age-based enforcement defaults to off until staging counts and worker
+execution have been reviewed (`YOUTUBE_COMPLIANCE_ENFORCEMENT=false`). Explicit
+deletion requests and confirmed permanent grant rejection still trigger immediate
+cleanup. See [the YouTube audit implementation and rollout notes](development_specs/youtube-audit-remediation.md)
+before enabling enforcement. Intelligence is outside this remediation.
+
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a new project (or select an existing one)
 2. Enable the following APIs under **APIs & Services → Library**:
    - **YouTube Data API v3** (for YouTube)
+   - **YouTube Analytics API** (for native YouTube channel reports)
    - **My Business Account Management API**, **My Business Business Information API**, and **Google My Business API** (for Google Business Profile)
 3. Go to **APIs & Services → Credentials** and create an **OAuth 2.0 Client ID** (type: Web application)
 4. Add the following redirect URIs under **Authorized redirect URIs**:
@@ -552,7 +712,7 @@ YouTube and Google Business Profile share the same Google Cloud credentials.
    {APP_URL}/social-accounts/callback/pinterest/
    ```
 3. Copy the **App ID** and **App Secret**
-4. Required scopes: `user_accounts:read`, `boards:read`, `pins:read`, `pins:write`
+4. Required scopes: `user_accounts:read`, `boards:read`, `boards:write`, `pins:read`, `pins:write`
 5. Set the environment variables:
    ```
    PLATFORM_PINTEREST_APP_ID=your-app-id
@@ -626,7 +786,9 @@ Issue an API key from **Organization → API Keys**. Keys are workspace-scoped, 
 Authorization: Bearer bb_studio_...
 ```
 
-Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analytics`. Each endpoint requires the relevant permission; missing permissions return `403`.
+Also send a `User-Agent` header naming your client (e.g. `User-Agent: my-agent/1.0`). Cloudflare's Browser Integrity Check, which is on by default and fronts the hosted `studio.brightbean.xyz`, rejects Python's standard-library default (`Python-urllib/3.x`) with `403` and a plain-text `error code: 1010` body before the request reaches Studio. Any value of your own gets through; `requests`, `httpx`, curl, and Node clients already send one that does.
+
+Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analytics`, `use_inbox`, `reply_from_inbox`. Each endpoint requires the relevant permission; missing permissions return `403`.
 
 ### Rate Limits
 
@@ -635,8 +797,12 @@ Permission keys: `create_posts`, `publish_directly`, `upload_media`, `view_analy
 | Per-key writes | 120 / min |
 | Per-key reads | 300 / min |
 | Per-workspace aggregate | 1000 / min |
+| Per-key calls, all kinds | 1,000 / hour |
+| Per-key calls, all kinds | 20,000 / day |
 
-Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers.
+The hourly and daily caps count REST and MCP calls together (every JSON-RPC message, including `ping` and `tools/list`), over fixed UTC hours and UTC days. Calls refused with `429` don't count against them. Rate-limit responses (`429`) include a `tier` (`per_key_hourly`, `per_key_daily`, …) and `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers; for the hourly and daily caps `Retry-After` is the time until the window resets.
+
+Don't poll faster than the data changes. Studio syncs the inbox every 5 minutes and analytics every hour, so `GET /inbox/` more often than every 5 minutes, or analytics more often than hourly, returns the same data and spends your budget.
 
 ### REST Endpoints
 
@@ -654,9 +820,17 @@ Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-
 | `POST` | `/media` | Upload a media file (multipart) | `upload_media` |
 | `GET` | `/media/{media_id}` | Retrieve a media asset | — |
 | `GET` | `/media` | List media assets (filter, paginate) | — |
+| `GET` | `/inbox` | List inbox messages (filter by status/type/account, paginate) | `use_inbox` |
+| `GET` | `/inbox/{message_id}` | Read one inbox message with its reply thread | `use_inbox` |
+| `POST` | `/inbox/{message_id}/replies` | Draft a reply (set `send: true` to deliver it now) | `use_inbox` (+ `reply_from_inbox` to send) |
+| `PATCH` | `/inbox/replies/{reply_id}` | Edit a draft reply | `use_inbox` |
+| `POST` | `/inbox/replies/{reply_id}/send` | Deliver a draft reply to the platform | `reply_from_inbox` |
+| `DELETE` | `/inbox/replies/{reply_id}` | Discard a draft reply | `use_inbox` |
 | `POST` | `/mcp` | JSON-RPC 2.0 endpoint for MCP clients | — |
 
-All write endpoints accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+Post creation, media uploads, and inbox reply creation accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
+
+For inbox reply creation, reuse the same key and request to replay the original response without creating or sending another reply. A failed create-and-send response is replayed too; retrieve the retained failed reply from the message thread and retry delivery via `/inbox/replies/{reply_id}/send`.
 
 ### MCP Tools
 
@@ -676,6 +850,12 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | `upload_media` | Upload a small base64-encoded file (≤ 1 MB raw). For larger files, use REST `POST /media`. | `upload_media` |
 | `get_account_analytics` | Channel analytics over a rolling 7–90 day window | `view_analytics` |
 | `get_post_analytics` | Per-platform metrics for a single post (safe for polling drafts) | `view_analytics` |
+| `list_inbox_messages` | List inbox items (comments, mentions, DMs, reviews) with their reply threads | `use_inbox` |
+| `get_inbox_message` | Retrieve one inbox message and its reply thread | `use_inbox` |
+| `create_reply_draft` | Draft a reply to an inbox message (saved, not sent) | `use_inbox` |
+| `update_reply_draft` | Replace the body of a draft (or failed) reply | `use_inbox` |
+| `discard_reply_draft` | Delete a draft (or failed) reply | `use_inbox` |
+| `send_reply` | Deliver a reply (`reply_id`, or `message_id` + `body` to draft-and-send) | `reply_from_inbox` |
 
 ### Connecting an MCP client
 
@@ -729,7 +909,13 @@ The redirect URI registered on the platform must exactly match `{APP_URL}/social
 Threads uses its own App ID, not the Facebook one. Set `PLATFORM_THREADS_APP_ID` / `PLATFORM_THREADS_APP_SECRET` from **Use cases → Access the Threads API → Settings**, and register `{APP_URL}/social-accounts/callback/threads/` in that same panel — the Facebook Login redirect URI list does not cover Threads. See the [Meta](#meta-facebook-instagram-threads) section.
 
 **Background tasks not running (posts not publishing)**
-Make sure the worker is running: `python manage.py process_tasks`. In Docker: check `docker compose logs worker`.
+Make sure the worker is running: `python manage.py run_studio_worker`. In Docker: check `docker compose logs worker`.
+
+**A post is stuck on "Publishing"**
+It shouldn't stay there. `confirm_pending_publishes` runs every 60s and settles anything in that status: asynchronous publishes (TikTok accepts the upload, then transcodes) are confirmed against the platform and marked published or failed with the platform's own reason, and a post whose worker died mid-publish is failed after `PUBLISHER_STALE_PUBLISHING_TIMEOUT` so it becomes editable and retryable again. It is never re-published automatically - we can't tell "the platform never saw it" from "the platform took it and we crashed before recording that", and a duplicate video on a live account can't be undone. A third case is kept distinct on purpose: when the platform accepted the upload but we can't reach it to ask what happened, the sweep keeps reconciling for `PUBLISHER_UNCONFIRMED_TIMEOUT` (6h by default) and, if it never learns the answer, fails the post with copy that tells the user to **check the account before republishing** rather than to try again - the post may already be live. If posts sit on "Publishing" for longer than that, the worker isn't running (see above) or is being killed repeatedly - check its memory.
+
+**Uploaded images 404 in production (and Instagram/Facebook/Pinterest posts fail)**
+With `STORAGE_BACKEND=local`, `/media/` must be publicly reachable. Check that `SERVE_MEDIA` is not set to `false` unless your reverse proxy serves `MEDIA_ROOT` at that same path, and that `MEDIA_ROOT` is on a persistent volume. Those platforms fetch attachment URLs server-side, so a 404 there fails the publish, not just the thumbnail.
 
 ## Contributing
 

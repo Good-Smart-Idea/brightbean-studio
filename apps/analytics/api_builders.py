@@ -65,12 +65,11 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
             next_sync_eta=None,
         )
 
-    # Single-pass snapshot fetch — feed the same series_map to
+    # Single-pass snapshot fetch — feed the same bundle to
     # hero_cards / engagement_card / follower_growth so they don't each
     # re-issue the per-metric SELECTs. Also recovers ``captured_at`` from
     # the same scan, so ``account_freshness`` skips its ``Max`` aggregate.
     bundle = account_analytics_bundle(account, days)
-    series_map = bundle["series_map"]
     captured_at, next_sync_eta = account_freshness(
         account,
         last_captured_at=bundle["max_captured_at"],
@@ -78,20 +77,22 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
     )
     hero = [
         DerivedMetricResponse.from_derived(card["metric"], card["label"], card["derived"])
-        for card in hero_cards(account, days, series_map=series_map)
+        for card in hero_cards(account, days, bundle=bundle)
+        if card["derived"].available
     ]
-    engagement_card_payload = engagement_card(account, days, series_map=series_map)
+    engagement_card_payload = engagement_card(account, days, bundle=bundle)
     engagement = None
     if engagement_card_payload is not None:
         rate = engagement_card_payload["rate"]
         engagement = EngagementCardResponse(
-            rate=DerivedMetricResponse.from_derived("engagement", _label("engagement"), rate),
+            rate=DerivedMetricResponse.from_derived("engagement", _label("engagement"), rate, calculated=True),
             parts=[
                 DerivedMetricResponse.from_derived(part["metric"], part["label"], part["derived"])
                 for part in engagement_card_payload["parts"]
             ],
+            formula=engagement_card_payload["formula"],
         )
-    growth_pair = follower_growth_metric(account, days, series_map=series_map)
+    growth_pair = follower_growth_metric(account, days, bundle=bundle)
     growth_response = None
     if growth_pair is not None:
         growth_key, growth = growth_pair
@@ -110,6 +111,7 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
         follower_growth=growth_response,
         captured_at=captured_at,
         next_sync_eta=next_sync_eta,
+        reporting_period=bundle.get("reporting_period"),
     )
 
 
@@ -187,6 +189,7 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
             is_primary=tile["is_primary"],
         )
         for tile in detail["metric_tiles"]
+        if tile["value"] is not None
     ]
     return PlatformPostAnalyticsResponse(
         platform_post_id=platform_post.id,

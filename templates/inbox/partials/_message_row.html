@@ -14,9 +14,11 @@
     </div>
 
     <!-- Platform icon -->
+    {% if message.social_account.platform != "youtube" %}
     <div class="flex-shrink-0 pt-0.5">
         {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
     </div>
+    {% endif %}
 
     <!-- Avatar -->
     <div class="flex-shrink-0">
@@ -60,5 +62,6 @@
                   x-text="formatSla('{{ message.received_at|date:'c' }}')"></span>
             {% endif %}
         </div>
+        {% if message.social_account.platform == "youtube" %}{% include "partials/_youtube_attribution.html" with youtube_account=message.social_account youtube_video_id=message.extra.video_id youtube_compact=True %}{% endif %}
     </div>
 </div>

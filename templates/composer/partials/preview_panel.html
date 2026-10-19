@@ -9,8 +9,8 @@ Context: previews (list of dicts with account, title, caption, first_comment, ch
 
         <!-- Platform label + char badge -->
         <div class="px-3.5 py-2 border-b flex items-center gap-2" style="border-color: #E7E5E4;">
-            {% include "partials/_platform_icon.html" with platform=p.account.platform size="sm" %}
-            <span class="text-[11px] font-semibold text-stone-500 flex-1">{{ p.account.platform|title }} Preview</span>
+            {% if p.account.platform != "youtube" %}{% include "partials/_platform_icon.html" with platform=p.account.platform size="sm" %}{% endif %}
+            <span class="text-[11px] font-semibold text-stone-500 flex-1">{% if p.account.platform == "youtube" %}YouTube{% else %}{{ p.account.platform|title }}{% endif %} Preview</span>
             <span class="text-[10px] font-semibold tabular-nums px-2 py-0.5 rounded-full
                          {% if p.is_over_limit %}bg-red-50 text-red-600{% else %}bg-stone-100 text-stone-500{% endif %}">
                 {{ p.char_count }}/{{ p.char_limit }}
@@ -18,7 +18,6 @@ Context: previews (list of dicts with account, title, caption, first_comment, ch
         </div>
 
         {% if p.account.platform == "youtube" %}
-        {# ─── YouTube ─── video-first layout like a YouTube upload preview #}
         <div class="bg-white">
             {% if media_items %}
             {% with m=media_items.0 %}
@@ -49,11 +48,11 @@ Context: previews (list of dicts with account, title, caption, first_comment, ch
                     {% if p.account.avatar_url %}
                     <img src="{{ p.account.avatar_url }}" class="w-6 h-6 rounded-full object-cover">
                     {% else %}
-                    <div class="w-6 h-6 rounded-full bg-red-600 flex items-center justify-center text-[9px] font-bold text-white">{{ p.account.account_name|default:p.account.account_handle|make_list|first|upper }}</div>
+                    <div class="w-6 h-6 rounded-full bg-stone-100 flex items-center justify-center text-[9px] font-bold text-stone-500">{{ p.account.account_name|default:p.account.account_handle|make_list|first|upper }}</div>
                     {% endif %}
                     <div>
                         <div class="text-[11px] font-medium text-stone-600">{{ p.account.account_name|default:p.account.account_handle }}</div>
-                        <div class="text-[10px] text-stone-400">0 views · Just now</div>
+                        <div class="text-[10px] text-stone-400">Publishing preview</div>
                     </div>
                 </div>
                 {% if p.caption %}<div class="text-[11px] text-stone-500 leading-relaxed line-clamp-3 whitespace-pre-wrap break-words">{{ p.truncated_caption|truncatechars:200 }}</div>{% endif %}

@@ -15,6 +15,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.views.decorators.http import require_GET
 
 from apps.composer.models import PlatformPost
 from apps.members.models import WorkspaceMembership
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 
 RANGE_CHOICES = (7, 30, 90)
 DEFAULT_RANGE = 30
+
+
+@login_required
+@require_GET
+def analytics_status(request, workspace_id, account_id):
+    workspace = _get_workspace(request, workspace_id)
+    account = get_object_or_404(SocialAccount, pk=account_id, workspace=workspace, platform="instagram")
+    return render(request, "analytics/_instagram_status.html", {"account": account, "workspace_id": workspace.id})
 
 
 def _get_workspace(request, workspace_id):
@@ -152,6 +161,9 @@ def analytics_account(request: HttpRequest, workspace_id, account_id) -> HttpRes
     from .models import AccountInsightsSnapshot
 
     has_snapshots = AccountInsightsSnapshot.objects.filter(social_account=account).exists()
+    youtube_bundle = services.account_analytics_bundle(account, days) if account.platform == "youtube" else None
+    if youtube_bundle is not None:
+        has_snapshots = has_snapshots or bool(youtube_bundle["native_current"])
     is_fresh = not has_any_post and not has_snapshots
     # Every gate comes from the one shared predicate, which also reports which
     # of them fired — only the admin-disabled one has a fix to offer (enable,
@@ -167,7 +179,11 @@ def analytics_account(request: HttpRequest, workspace_id, account_id) -> HttpRes
         "range_choices": RANGE_CHOICES,
         "primary_color": primary_color,
         "platform_color": PLATFORM_COLOR.get(account.platform, "var(--primary)"),
+        # Copy for the "calculated by BrightBean" labels on derived metrics.
+        "platform_name": services.platform_name(account),
+        "content_noun": services.content_noun(account),
         "is_fresh": is_fresh,
+        "reporting_period": youtube_bundle["reporting_period"] if youtube_bundle is not None else None,
         # An unavailable platform gets its own reconnect instructions inside
         # the empty state, so suppressing the scope banner here keeps one set
         # of instructions on screen instead of two competing ones.
@@ -197,22 +213,22 @@ def analytics_account(request: HttpRequest, workspace_id, account_id) -> HttpRes
         return render(request, "analytics/index.html", context)
 
     if is_fresh:
+        if request.headers.get("HX-Request") and request.GET.get("partial") == "page":
+            return render(request, "analytics/_page.html", context)
         return render(request, "analytics/index.html", context)
 
-    # Compute the bundle once and thread series_map into every consumer —
-    # the post-level fallback inside the bundle is the dominant cost, and
-    # calling these helpers without ``series_map`` re-runs it 3-4 times per
-    # render.
-    bundle = services.account_analytics_bundle(account, days)
-    series_map = bundle["series_map"]
-    follower_g = services.follower_growth(account, days, series_map=series_map)
-    hero_cards = services.hero_cards(account, days, series_map=series_map)
-    engagement = services.engagement_card(account, days, series_map=series_map)
+    # Compute the bundle once and thread it into every consumer — the
+    # post-level fallback inside the bundle is the dominant cost, and calling
+    # these helpers without ``bundle`` re-runs it 3-4 times per render.
+    bundle = youtube_bundle if youtube_bundle is not None else services.account_analytics_bundle(account, days)
+    follower_g = services.follower_growth(account, days, bundle=bundle)
+    hero_cards = services.hero_cards(account, days, bundle=bundle)
+    engagement = services.engagement_card(account, days, bundle=bundle)
     chart = services.hero_chart_data(
         account,
         days,
         metric=request.GET.get("chart_metric"),
-        series_map=series_map,
+        bundle=bundle,
     )
     table = services.all_posts_for(
         account,
@@ -228,8 +244,13 @@ def analytics_account(request: HttpRequest, workspace_id, account_id) -> HttpRes
             "follower_growth": follower_g,
             "hero_cards": hero_cards,
             "engagement": engagement,
+            "calculated_note": services.calculated_metrics_note(
+                account, cards=hero_cards, engagement=engagement, chart=chart, growth=follower_g
+            ),
             "chart": chart,
-            "chart_series_json": json.dumps([round(v, 4) for v in chart["derived"].series]),
+            "reporting_period": bundle.get("reporting_period"),
+            # ``null`` for days not reported yet: Chart.js draws those as a gap.
+            "chart_series_json": json.dumps([None if v is None else round(v, 4) for v in chart["derived"].series]),
             "chart_labels_json": json.dumps(chart["labels"]),
             "table": table,
         }

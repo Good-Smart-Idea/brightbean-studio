@@ -16,8 +16,14 @@
     <div class="overflow-y-auto pr-1">
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {% for value, label in platform_choices %}
-        <div class="relative bg-white rounded-xl border border-stone-200 p-5 transition-all duration-200 {% if value in configured_platforms %}{% else %}opacity-60{% endif %}">
+        <div class="relative bg-white rounded-xl border border-stone-200 p-5 transition-all duration-200 {% if value in configured_platforms or value == 'youtube' %}{% else %}opacity-60{% endif %}">
             <div class="flex items-start gap-4">
+                {% if value == "youtube" %}
+                {# Generic video glyph in neutral colours: no YouTube logo, red, or play-button shape. #}
+                <div class="flex-shrink-0 w-10 h-10 rounded-lg flex items-center justify-center bg-stone-100 text-stone-700">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.75" d="M15.75 10.5l4.72-4.72a.75.75 0 011.28.53v11.38a.75.75 0 01-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 002.25-2.25v-9a2.25 2.25 0 00-2.25-2.25h-9A2.25 2.25 0 002.25 7.5v9a2.25 2.25 0 002.25 2.25z"/></svg>
+                </div>
+                {% else %}
                 <!-- Platform icon -->
                 <div class="flex-shrink-0 w-10 h-10 rounded-lg flex items-center justify-center
                     {% if value == 'facebook' %}bg-blue-50 text-blue-600
@@ -37,6 +43,7 @@
                     {% include "social_accounts/partials/_platform_icon.html" with platform=value size="5" %}
                 </div>
 
+                {% endif %}
                 <div class="flex-1 min-w-0">
                     <h3 class="text-sm font-semibold text-stone-900">{{ label }}</h3>
                     <p class="text-xs text-stone-400 mt-0.5">
@@ -75,7 +82,7 @@
             </div>
             {% endif %}
 
-            {% if value not in configured_platforms %}
+            {% if value not in configured_platforms and value != 'youtube' %}
             <div class="absolute inset-0 rounded-xl bg-white/40 cursor-not-allowed" title="Platform credentials not configured. Contact your administrator."></div>
             {% endif %}
         </div>

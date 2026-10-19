@@ -19,7 +19,7 @@ class SocialAccountAdmin(admin.ModelAdmin):
     list_filter = ("platform", "connection_status")
     search_fields = ("account_name", "account_handle")
     readonly_fields = ("id", "created_at", "updated_at")
-    exclude = ("oauth_access_token", "oauth_refresh_token")
+    exclude = ("oauth_access_token", "oauth_refresh_token", "oauth_facebook_user_access_token")
 
 
 @admin.register(MastodonAppRegistration)

@@ -24,7 +24,7 @@
             hx-include="[name='q'],[name='type'],[name='status'],[name='sentiment']">
         <option value="">All platforms</option>
         {% for account in social_accounts %}
-        <option value="{{ account.platform }}" {% if account.platform in active_filters.platform %}selected{% endif %}>{{ account.get_platform_display|default:account.platform|title }}</option>
+        <option value="{{ account.platform }}" {% if account.platform in active_filters.platform %}selected{% endif %}>{% if account.platform == "youtube" %}YouTube{% else %}{{ account.get_platform_display|default:account.platform|title }}{% endif %}</option>
         {% endfor %}
     </select>
 

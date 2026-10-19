@@ -41,6 +41,11 @@ class GoogleBusinessProvider(SocialProvider):
     - ``location_id`` – Google Business location ID
     """
 
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
@@ -244,6 +249,7 @@ class GoogleBusinessProvider(SocialProvider):
             raise PublishError(
                 f"Post text exceeds {self.max_caption_length} characters (got {len(content.text)})",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         account_id = self._get_account_id(access_token)

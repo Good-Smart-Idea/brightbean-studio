@@ -68,12 +68,16 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
         self.assertIn("Organization Settings", data["message"])
 
     def test_unknown_action_returns_400(self):
-        AIProviderConfig.objects.create(organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini")
+        AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini"
+        )
         response = self.client.post(self.url, {"ai_action": "translate"})
         self.assertEqual(response.status_code, 400)
 
     def test_generate_caption_missing_prompt_returns_400(self):
-        AIProviderConfig.objects.create(organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini")
+        AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini"
+        )
         response = self.client.post(self.url, {"ai_action": "generate_caption", "prompt": ""})
         self.assertEqual(response.status_code, 400)
 
@@ -84,9 +88,7 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
         )
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
-        resp.json.return_value = {
-            "choices": [{"message": {"content": "Caption one\nCaption two\nCaption three"}}]
-        }
+        resp.json.return_value = {"choices": [{"message": {"content": "Caption one\nCaption two\nCaption three"}}]}
         mock_post.return_value = resp
 
         response = self.client.post(self.url, {"ai_action": "generate_caption", "prompt": "new latte"})
@@ -102,7 +104,11 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
     def test_suggest_hashtags_uses_default_provider(self, mock_post):
         AIProviderConfig.objects.create(organization=self.org, provider="openai", api_key="sk-1", model="gpt-4o-mini")
         AIProviderConfig.objects.create(
-            organization=self.org, provider="anthropic", api_key="sk-2", model="claude-haiku-4-5-20251001", is_default=True
+            organization=self.org,
+            provider="anthropic",
+            api_key="sk-2",
+            model="claude-haiku-4-5-20251001",
+            is_default=True,
         )
         resp = MagicMock()
         resp.raise_for_status = MagicMock()
@@ -116,7 +122,9 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
         self.assertEqual(mock_post.call_args.args[0], "https://api.anthropic.com/v1/messages")
 
     def test_rewrite_tone_missing_caption_returns_400(self):
-        AIProviderConfig.objects.create(organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini")
+        AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini"
+        )
         response = self.client.post(self.url, {"ai_action": "rewrite_tone", "caption": "", "tone": "casual"})
         self.assertEqual(response.status_code, 400)
 
@@ -124,7 +132,9 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
     def test_provider_error_maps_to_502(self, mock_post):
         import httpx
 
-        AIProviderConfig.objects.create(organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini")
+        AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini"
+        )
         mock_post.side_effect = httpx.ConnectTimeout("timed out")
 
         response = self.client.post(self.url, {"ai_action": "generate_caption", "prompt": "new latte"})

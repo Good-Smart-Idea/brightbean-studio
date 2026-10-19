@@ -1,14 +1,26 @@
 """Tests for social_accounts views."""
 
+import re
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from django.core import signing
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from apps.social_accounts.models import SocialAccount
-from apps.social_accounts.views import OAUTH_SESSION_KEY, _sign_state, _unsign_state
+from apps.social_accounts.views import (
+    OAUTH_SESSION_KEY,
+    _sign_state,
+    _unsign_state,
+    promote_meta_user_token,
+)
+from providers.exceptions import OAuthError
 from providers.types import AccountProfile, OAuthTokens
 
 
@@ -59,6 +71,120 @@ class TestOAuthState:
 
 @pytest.mark.django_db
 class TestAccountListView:
+    @pytest.mark.parametrize("flag", [False, True])
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "DM notifications require messaging permissions and Page messaging access. Reconnect Instagram.",
+            "DM notifications failed. Check messaging permissions and reconnect Instagram.",
+            "Comment notifications are connected. Reconnect Instagram to enable DM notifications on its linked Page.",
+        ],
+    )
+    def test_saved_dm_warning_tracks_current_scope_flag(self, authenticated_client, workspace, settings, flag, error):
+        settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = flag
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            missing_scopes=["instagram_manage_messages"],
+            messaging_access=False,
+            webhooks_active=False,
+            webhook_error=error,
+            webhook_needs_reconnect=True,
+        )
+        response = authenticated_client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
+        body = response.content.decode()
+        assert ("Contact your administrator to enable it." in body) is not flag
+        assert ("Some real-time inbox updates are unavailable" in body) is flag
+        assert ("Reconnect" in body) is flag
+        # Rendering applies the current policy without modifying retained state.
+        account.refresh_from_db()
+        assert account.webhook_error == error
+        assert account.webhook_needs_reconnect is True
+
+    @pytest.mark.parametrize(
+        ("remaining_error", "missing_scopes", "needs_reconnect"),
+        [
+            (
+                "Comment/mention notifications failed. Reconnect Instagram to restore comment permissions.",
+                ["instagram_manage_messages"],
+                True,
+            ),
+            ("Comment/mention notifications failed. Try again.", ["instagram_manage_messages"], False),
+            (
+                "DM notifications require Page metadata permissions. Reconnect Instagram.",
+                ["instagram_manage_messages", "pages_manage_metadata"],
+                True,
+            ),
+            ("An unrecognised subscription failure.", ["instagram_manage_messages"], True),
+        ],
+    )
+    def test_disabling_dm_scopes_preserves_other_webhook_warnings(
+        self, authenticated_client, workspace, settings, remaining_error, missing_scopes, needs_reconnect
+    ):
+        settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = False
+        dm_error = "DM notifications require messaging permissions and Page messaging access. Reconnect Instagram."
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            missing_scopes=missing_scopes,
+            webhooks_active=False,
+            webhook_error=f"{remaining_error} {dm_error}",
+            webhook_needs_reconnect=True,
+        )
+        response = authenticated_client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
+        body = response.content.decode()
+        assert remaining_error in body
+        assert "Some real-time inbox updates are unavailable" in body
+        assert ("Reconnect" in body) is needs_reconnect
+        assert ("Try again" in body) is not needs_reconnect
+        if "pages_manage_metadata" not in missing_scopes:
+            assert dm_error not in body
+        assert account.webhook_warning.needs_reconnect is needs_reconnect
+
+    def test_saved_dm_warning_does_not_hide_missing_metadata(self, authenticated_client, workspace, settings):
+        settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = False
+        SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            missing_scopes=["instagram_manage_messages", "pages_manage_metadata"],
+            webhooks_active=False,
+            webhook_error="DM notifications require messaging permissions and Page messaging access. Reconnect Instagram.",
+            webhook_needs_reconnect=True,
+        )
+        response = authenticated_client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
+        body = response.content.decode()
+        assert "pages_manage_metadata" in body
+        assert "Some real-time inbox updates are unavailable" in body
+        assert "Reconnect" in body
+
+    @pytest.mark.parametrize("flag", [False, True])
+    def test_intentionally_omitted_dm_permission_does_not_prompt_reconnect(
+        self, authenticated_client, workspace, settings, flag
+    ):
+        settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = flag
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="instagram",
+            account_platform_id="ig-1",
+            account_name="Instagram",
+            missing_scopes=["instagram_manage_messages", "pages_manage_metadata"],
+            messaging_access=False,
+        )
+        response = authenticated_client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
+        assert response.status_code == 200
+        assert account.missing_scopes == ["instagram_manage_messages", "pages_manage_metadata"]
+        assert "pages_manage_metadata" in account.connection_missing_scopes
+        assert ("instagram_manage_messages" in account.connection_missing_scopes) is flag
+        body = response.content.decode()
+        assert ("Contact your administrator to enable it." in body) is not flag
+        assert ("grant messaging access on the linked Facebook Page, then reconnect" in body) is flag
+
     def test_requires_authentication(self, client, workspace):
         url = reverse("social_accounts:list", kwargs={"workspace_id": workspace.id})
         response = client.get(url)
@@ -89,6 +215,37 @@ class TestAccountListView:
 
 @pytest.mark.django_db
 class TestConnectPlatformView:
+    @pytest.mark.parametrize("flag", [False, True])
+    @pytest.mark.parametrize("business_login", [False, True])
+    @pytest.mark.parametrize("entrypoint", ["connect", "reconnect"])
+    def test_instagram_scope_flag_in_each_connection_flow(
+        self, authenticated_client, workspace, settings, flag, business_login, entrypoint
+    ):
+        settings.PLATFORM_INSTAGRAM_FACEBOOK_DM_SCOPES_ENABLED = flag
+        credentials = {"app_id": "ID", "app_secret": "SECRET"}
+        if business_login:
+            credentials["config_id"] = "config-1"
+        settings.PLATFORM_CREDENTIALS_FROM_ENV = {"instagram": credentials}
+        if entrypoint == "connect":
+            url = reverse("social_accounts:connect", kwargs={"workspace_id": workspace.id})
+        else:
+            account = SocialAccount.objects.create(
+                workspace=workspace, platform="instagram", account_platform_id="ig-1", account_name="Instagram"
+            )
+            url = reverse("social_accounts:reconnect", kwargs={"workspace_id": workspace.id, "account_id": account.id})
+        response = authenticated_client.post(url, {"platform": "instagram"})
+        assert response.status_code == 302
+        query = parse_qs(urlparse(response.url).query)
+        assert query["client_id"] == ["ID"]
+        assert query["response_type"] == ["code"]
+        if business_login:
+            assert query["config_id"] == ["config-1"]
+            assert "scope" not in query
+        else:
+            scopes = query["scope"][0].split(",")
+            assert ("instagram_manage_messages" in scopes) is flag
+            assert {"pages_manage_metadata", "instagram_content_publish", "instagram_manage_comments"} <= set(scopes)
+
     def test_get_shows_platform_grid(self, authenticated_client, workspace):
         url = reverse("social_accounts:connect", kwargs={"workspace_id": workspace.id})
         response = authenticated_client.get(url)
@@ -262,6 +419,46 @@ class TestOAuthCallbackView:
         response = authenticated_client.get(url, {"code": "abc123", "state": "invalid_state"})
         assert response.status_code == 302
 
+    def test_a_spent_quota_names_the_hour_instead_of_saying_try_again(self, authenticated_client, workspace, user):
+        """The reported symptom: "Failed connect..." at 03:00, working at 08:00.
+
+        A YouTube connect calls channels.list, which costs a Data API unit. With
+        the day's budget spent, that 403s until midnight US/Pacific — so the
+        blanket "Please try again" the callback used to show was advice that
+        could not work, and the user kept retrying into a wall for hours.
+        """
+        from django.contrib.messages import get_messages
+
+        from providers.exceptions import QuotaExceededError
+
+        resets_at = datetime.now(UTC).replace(microsecond=0) + timedelta(hours=5)
+        nonce = "nonce-quota"
+        state = _sign_state(workspace.id, "youtube", user.id, nonce)
+        session = authenticated_client.session
+        session[OAUTH_SESSION_KEY] = {"nonce": nonce}
+        session.save()
+
+        provider = MagicMock()
+        provider.exchange_code.return_value = OAuthTokens(access_token="tok", refresh_token="r", expires_in=3600)
+        provider.get_profile.side_effect = QuotaExceededError(
+            "YouTube daily quota exhausted (data API)",
+            status_code=403,
+            resets_at=resets_at,
+            quota_scope="data",
+            platform="YouTube",
+        )
+
+        url = reverse("social_accounts:oauth_callback", kwargs={"platform": "youtube"})
+        with patch("apps.social_accounts.views._get_provider_for_platform", return_value=provider):
+            response = authenticated_client.get(url, {"code": "abc123", "state": state})
+
+        assert response.status_code == 302
+        shown = [str(m) for m in get_messages(response.wsgi_request)]
+        assert any(f"Try again after {resets_at:%H:%M} UTC" in m for m in shown), shown
+        assert not any("Please try again." in m for m in shown), shown
+        # Nothing was connected, so the card must not appear half-made.
+        assert not SocialAccount.objects.filter(workspace=workspace, platform="youtube").exists()
+
     def test_threads_callback_persists_a_refresh_credential(self, authenticated_client, workspace, user):
         """A Threads connect must leave the account refreshable.
 
@@ -308,6 +505,7 @@ class TestOAuthCallbackView:
         assert account.token_expires_at is not None
 
     def test_instagram_redirects_to_account_selection(self, authenticated_client, workspace, user):
+        started = timezone.now()
         nonce = "nonce-123"
         state = _sign_state(workspace.id, "instagram", user.id, nonce)
         session = authenticated_client.session
@@ -316,6 +514,7 @@ class TestOAuthCallbackView:
 
         mock_provider = MagicMock()
         mock_provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="refresh")
+        mock_provider.refresh_token.return_value = OAuthTokens(access_token="long-lived-user-token", expires_in=5184000)
         mock_provider.get_user_pages.return_value = [
             {
                 "id": "17841400000000000",
@@ -335,6 +534,49 @@ class TestOAuthCallbackView:
         page_data = authenticated_client.session["oauth_page_select"]
         assert page_data["platform"] == "instagram"
         assert page_data["pages"][0]["id"] == "17841400000000000"
+        assert page_data["user_tokens"]["access_token"] == "long-lived-user-token"
+        # A Page token from a long-lived user token does not expire.
+        assert page_data["user_tokens"]["expires_in"] is None
+        expiry = parse_datetime(page_data["user_tokens"]["user_expires_at"])
+        assert started + timedelta(seconds=5184000) <= expiry <= timezone.now() + timedelta(seconds=5184000)
+        mock_provider.refresh_token.assert_called_once_with("user-token")
+        mock_provider.get_user_pages.assert_called_once_with("long-lived-user-token")
+
+    def test_instagram_batch_selection_preserves_user_expiry_and_existing_ids(self, authenticated_client, workspace):
+        expiry = timezone.now() + timedelta(days=60)
+        accounts = [
+            SocialAccount.objects.create(
+                workspace=workspace,
+                platform="instagram",
+                account_platform_id=f"ig-{i}",
+                oauth_access_token=f"page-{i}",
+                account_name=f"Channel {i}",
+            )
+            for i in range(5)
+        ]
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "instagram",
+            "user_tokens": {"access_token": "user", "expires_in": None, "user_expires_at": expiry.isoformat()},
+            "pages": [{"id": f"ig-{i}", "name": f"Channel {i}", "access_token": f"page-{i}"} for i in range(5)],
+        }
+        session.save()
+        response = authenticated_client.post(
+            reverse("social_accounts:select_account"),
+            {
+                "selected_pages": [f"ig-{i}" for i in range(5)],
+            },
+        )
+        assert response.status_code == 302
+        assert SocialAccount.objects.filter(workspace=workspace).count() == 5
+        for i, account in enumerate(accounts):
+            account.refresh_from_db()
+            assert account.oauth_access_token == f"page-{i}"
+            assert account.oauth_facebook_user_access_token == "user"
+            assert account.facebook_user_token_expires_at == expiry
+            assert account.token_expires_at is None
+            assert account.analytics_status == "checking"
 
     def test_tiktok_callback_replays_pkce_verifier(self, authenticated_client, workspace, user):
         """The verifier stashed at connect is read from the session and replayed
@@ -360,8 +602,147 @@ class TestOAuthCallbackView:
         assert kwargs["code_verifier"] == verifier
 
 
+class TestPromoteMetaUserToken:
+    """The short-lived -> long-lived exchange that makes Page tokens durable."""
+
+    def test_returns_the_long_lived_token(self):
+        provider = MagicMock()
+        provider.refresh_token.return_value = OAuthTokens(access_token="long-lived", expires_in=5184000)
+
+        result, promoted = promote_meta_user_token(provider, "facebook", OAuthTokens(access_token="short"))
+
+        assert result.access_token == "long-lived"
+        assert promoted is True
+        provider.refresh_token.assert_called_once_with("short")
+
+    def test_leaves_non_meta_platforms_alone(self):
+        provider = MagicMock()
+        tokens = OAuthTokens(access_token="linkedin-token")
+
+        assert promote_meta_user_token(provider, "linkedin_company", tokens) == (tokens, False)
+        provider.refresh_token.assert_not_called()
+
+    def test_falls_back_to_the_short_lived_token_when_the_exchange_fails(self):
+        """A failed exchange must cost the token's lifetime, not the connection.
+
+        The callback wraps everything in a broad except that turns any raise
+        into "Failed to connect account", so letting this propagate would break
+        connects that used to work — over a durability upgrade, and for reasons
+        (a transient Graph 5xx, a rotated app secret) that say nothing about
+        whether the grant itself is usable.
+        """
+        provider = MagicMock()
+        provider.refresh_token.side_effect = OAuthError("exchange failed", platform="facebook")
+        tokens = OAuthTokens(access_token="short-lived")
+
+        # promoted=False is what tells the caller to keep the short expiry.
+        assert promote_meta_user_token(provider, "facebook", tokens) == (tokens, False)
+
+    def test_falls_back_when_the_exchange_fails_at_the_transport(self):
+        """A timeout is the likeliest transient, and is not a ProviderError.
+
+        SocialProvider._request only turns HTTP status codes into ProviderError;
+        httpx transport failures propagate unwrapped, so catching the narrower
+        type would let exactly this case fail the connect.
+        """
+        provider = MagicMock()
+        provider.refresh_token.side_effect = httpx.ReadTimeout("graph timed out")
+        tokens = OAuthTokens(access_token="short-lived")
+
+        assert promote_meta_user_token(provider, "facebook", tokens) == (tokens, False)
+
+
 @pytest.mark.django_db
 class TestSelectAccountView:
+    def test_bulk_selection_marks_accounts_without_publish_access(self, authenticated_client, workspace):
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-publishable",
+                    "name": "Publishable Page",
+                    "access_token": "page-token-1",
+                    "can_publish": True,
+                },
+                {
+                    "id": "page-read-only",
+                    "name": "Read-only Page",
+                    "access_token": "page-token-2",
+                    "can_publish": False,
+                },
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.get(reverse("social_accounts:select_account"))
+
+        assert response.status_code == 200
+        body = response.content.decode()
+        assert "Select all publishable" in body
+        assert "Missing Facebook content publishing access" in body
+
+    def test_an_already_connected_page_is_never_rendered_pre_checked(self, authenticated_client, workspace):
+        """Ticking a row re-runs the whole connect, so it must be deliberate.
+
+        Submitting re-runs _create_or_update_account for every ticked row, which
+        resets that account's webhook state and queues a fresh subscription. It
+        also keeps the checkbox meaning "connect or refresh this" rather than
+        "this is connected" — a reading unticking could not act on anyway.
+        """
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-demoted",
+                    "name": "Demoted Page",
+                    "access_token": "page-token",
+                    "can_publish": True,
+                    "already_connected": True,
+                },
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.get(reverse("social_accounts:select_account"))
+
+        assert response.status_code == 200
+        match = re.search(r"<input[^>]*value=\"page-demoted\"[^>]*>", response.content.decode())
+        assert match is not None, "no checkbox rendered for page-demoted"
+        checkbox = match.group(0)
+        assert "checked" not in checkbox
+        assert "disabled" not in checkbox
+
+    def test_a_fallback_expiry_is_stored_so_the_account_is_seen_as_expiring(self, authenticated_client, workspace):
+        """When promotion failed we hold a short-lived token, and the Page token dies with it.
+
+        Storing no expiry would leave is_token_expiring_soon permanently False,
+        so nothing would flag the account until a publish simply failed.
+        """
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {
+                "access_token": "short-lived-user-token",
+                "refresh_token": None,
+                "expires_in": 3600,
+            },
+            "pages": [{"id": "page-1", "name": "Page One", "access_token": "page-token"}],
+        }
+        session.save()
+
+        response = authenticated_client.post(reverse("social_accounts:select_account"), {"selected_pages": ["page-1"]})
+
+        assert response.status_code == 302
+        account = SocialAccount.objects.get(workspace=workspace, account_platform_id="page-1")
+        assert account.token_expires_at is not None
+
     def test_blank_page_access_token_falls_back_to_user_token(self, authenticated_client, workspace):
         session = authenticated_client.session
         session["oauth_page_select"] = {
@@ -421,6 +802,36 @@ class TestSelectAccountView:
             workspace=workspace,
             platform="facebook",
             account_platform_id="page-1",
+        ).exists()
+
+    def test_page_without_create_content_task_is_not_connected(self, authenticated_client, workspace):
+        session = authenticated_client.session
+        session["oauth_page_select"] = {
+            "workspace_id": str(workspace.id),
+            "platform": "facebook",
+            "user_tokens": {"access_token": "long-lived-user-token", "refresh_token": None},
+            "pages": [
+                {
+                    "id": "page-read-only",
+                    "name": "Read-only Page",
+                    "access_token": "page-token",
+                    "tasks": ["ANALYZE"],
+                    "can_publish": False,
+                }
+            ],
+        }
+        session.save()
+
+        response = authenticated_client.post(
+            reverse("social_accounts:select_account"),
+            {"selected_pages": ["page-read-only"]},
+        )
+
+        assert response.status_code == 302
+        assert not SocialAccount.objects.filter(
+            workspace=workspace,
+            platform="facebook",
+            account_platform_id="page-read-only",
         ).exists()
 
 
@@ -501,7 +912,7 @@ class TestRetryWebhooksView:
 
         assert response.status_code == 200
         body = response.content.decode()
-        assert "Real-time comments are off" in body
+        assert "Some real-time inbox updates are unavailable" in body
         # Still retryable, so the card keeps offering the retry rather than
         # sending the user to OAuth for a transient failure.
         assert "Try again" in body
@@ -635,7 +1046,7 @@ class TestDisconnectView:
             "social_accounts:disconnect",
             kwargs={"workspace_id": workspace.id, "account_id": account.id},
         )
-        with patch("apps.social_accounts.views._get_provider_for_platform") as mock:
+        with patch("providers.get_provider") as mock:
             mock_provider = MagicMock()
             mock_provider.revoke_token.return_value = True
             mock.return_value = mock_provider
@@ -643,6 +1054,76 @@ class TestDisconnectView:
 
         assert response.status_code == 302
         assert SocialAccount.objects.filter(pk=account.pk).count() == 0
+
+    def test_youtube_revokes_the_grant_with_the_refresh_token(
+        self, authenticated_client, workspace, django_capture_on_commit_callbacks
+    ):
+        """Google refuses an expired access token, and ours lives an hour, so
+        revoking with it would usually leave the grant live."""
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="youtube",
+            account_platform_id="UC123",
+            account_name="Test Channel",
+            oauth_access_token="stale-access-token",
+            oauth_refresh_token="refresh-token",
+        )
+        url = reverse(
+            "social_accounts:disconnect",
+            kwargs={"workspace_id": workspace.id, "account_id": account.id},
+        )
+        with (
+            patch("apps.social_accounts.views.unsubscribe_account_webhooks"),
+            patch("providers.get_provider") as mock,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            response = authenticated_client.post(url)
+
+        assert response.status_code == 302
+        mock.return_value.revoke_token.assert_called_once_with("refresh-token")
+        assert not SocialAccount.objects.filter(pk=account.pk).exists()
+
+    def test_mastodon_revokes_on_the_accounts_own_instance(self, authenticated_client, workspace):
+        """A Mastodon grant lives on the account's instance, under that
+        instance's app registration; the org's credentials carry neither."""
+        from apps.social_accounts.models import MastodonAppRegistration
+
+        MastodonAppRegistration.objects.create(
+            instance_url="https://mastodon.example",
+            client_id="masto-client-id",
+            client_secret="masto-client-secret",
+        )
+        account = SocialAccount.objects.create(
+            workspace=workspace,
+            platform="mastodon",
+            account_platform_id="42",
+            account_name="Test Masto",
+            instance_url="https://mastodon.example",
+            oauth_access_token="masto-token",
+        )
+        url = reverse(
+            "social_accounts:disconnect",
+            kwargs={"workspace_id": workspace.id, "account_id": account.id},
+        )
+        # is_safe_url is patched to keep the resolver's SSRF check off the network.
+        with (
+            patch("apps.common.validators.is_safe_url", return_value=True),
+            patch("apps.social_accounts.views.unsubscribe_account_webhooks"),
+            patch("providers.mastodon.MastodonProvider._request") as request,
+        ):
+            response = authenticated_client.post(url)
+
+        assert response.status_code == 302
+        request.assert_called_once_with(
+            "POST",
+            "https://mastodon.example/oauth/revoke",
+            data={
+                "client_id": "masto-client-id",
+                "client_secret": "masto-client-secret",
+                "token": "masto-token",
+            },
+        )
+        assert not SocialAccount.objects.filter(pk=account.pk).exists()
 
     def test_disconnect_requires_post(self, authenticated_client, workspace):
         account = SocialAccount.objects.create(
@@ -657,6 +1138,48 @@ class TestDisconnectView:
         )
         response = authenticated_client.get(url)
         assert response.status_code == 405
+
+
+@pytest.mark.django_db
+class TestDisconnectConfirmation:
+    """The confirmation has to say what disconnect does: the privacy policy
+    promises it, and platform reviewers read one against the other."""
+
+    def _card_text(self, client, workspace, platform):
+        SocialAccount.objects.create(
+            workspace=workspace,
+            platform=platform,
+            account_platform_id="1",
+            account_name="Test Channel",
+        )
+        response = client.get(reverse("social_accounts:list", kwargs={"workspace_id": workspace.id}))
+        assert response.status_code == 200
+        return " ".join(response.content.decode().split())
+
+    def test_youtube_says_access_is_revoked_and_data_deleted(self, authenticated_client, workspace):
+        text = self._card_text(authenticated_client, workspace, "youtube")
+
+        assert "Disconnect <strong>Test Channel</strong>?" in text
+        assert "This revokes BrightBean's access to the account." in text
+        assert "YouTube data, analytics and copied comments are deleted immediately" in text
+        assert "original uploads and posts shared with other channels stay" in text
+        assert "Historical data will be preserved" not in text
+        assert "removes the account from BrightBean only" not in text
+
+    def test_facebook_says_the_grant_is_kept(self, authenticated_client, workspace):
+        text = self._card_text(authenticated_client, workspace, "facebook")
+
+        assert "This removes the account from BrightBean only." in text
+        assert "Facebook &rsaquo; Settings &rsaquo; Apps and Websites" in text
+        assert "deleted from BrightBean" in text
+        assert "revokes BrightBean's access" not in text
+
+    def test_a_platform_without_revocation_does_not_claim_it(self, authenticated_client, workspace):
+        text = self._card_text(authenticated_client, workspace, "pinterest")
+
+        assert "remove BrightBean in your Pinterest settings" in text
+        assert "deleted from BrightBean" in text
+        assert "revokes BrightBean's access" not in text
 
 
 @pytest.mark.django_db

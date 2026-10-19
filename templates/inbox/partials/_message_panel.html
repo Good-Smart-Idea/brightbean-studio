@@ -2,7 +2,7 @@
 <div class="flex flex-col h-full">
     <!-- Message header -->
     <div class="px-5 py-4 border-b border-stone-100 flex-shrink-0">
-        <div class="flex items-start justify-between gap-4">
+        <div class="flex {% if message.social_account.platform == 'youtube' %}flex-col sm:flex-row{% endif %} items-start justify-between gap-4">
             <div class="flex items-center gap-3 min-w-0">
                 {% if message.sender_avatar_url %}
                 <img src="{{ message.sender_avatar_url }}" alt="" class="w-10 h-10 rounded-full object-cover flex-shrink-0">
@@ -12,15 +12,17 @@
                 </div>
                 {% endif %}
                 <div class="min-w-0">
-                    <div class="flex items-center gap-2">
+                    <div class="flex {% if message.social_account.platform == 'youtube' %}flex-wrap{% endif %} items-center gap-2">
                         <span class="text-sm font-semibold text-stone-900">{{ message.sender_name }}</span>
                         {% if message.sender_handle %}
                         <span class="text-[12px] text-stone-400">@{{ message.sender_handle }}</span>
                         {% endif %}
                     </div>
-                    <div class="flex items-center gap-2 mt-0.5">
+                    <div class="flex {% if message.social_account.platform == 'youtube' %}flex-wrap{% endif %} items-center gap-2 mt-0.5">
                         <div class="flex items-center gap-1">
-                            {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
+                            {% if message.social_account.platform == "youtube" %}
+                            <a href="{% if message.extra.video_id %}https://www.youtube.com/watch?v={{ message.extra.video_id|urlencode }}{% else %}https://www.youtube.com/channel/{{ message.social_account.account_platform_id|urlencode }}{% endif %}" target="_blank" rel="noopener noreferrer" class="text-[11px] font-semibold text-stone-500 underline underline-offset-2">YouTube</a>
+                            {% else %}{% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}{% endif %}
                             <span class="text-[11px] text-stone-500">{{ message.social_account.account_name|default:message.social_account.account_handle }}</span>
                         </div>
                         <span class="text-[11px] text-stone-400">{{ message.received_at|date:"N j, Y g:i A" }}</span>
@@ -58,7 +60,7 @@
     </div>
 
     <!-- Message body + thread -->
-    <div class="flex-1 overflow-y-auto px-5 py-4">
+    <div class="flex-1 {% if message.social_account.platform == 'youtube' %}min-h-0{% endif %} overflow-y-auto px-5 py-4">
         <!-- Original message -->
         <div class="bg-stone-50 rounded-xl p-4 mb-4 border border-stone-100">
             <div class="flex items-center gap-2 mb-2">
@@ -69,6 +71,27 @@
                 {% endif %}
             </div>
             <p class="text-[14px] text-stone-800 leading-relaxed whitespace-pre-wrap">{{ message.body }}</p>
+            {% if message.extra.is_deleted %}
+            <p class="text-sm text-stone-500">This message was deleted by its sender.</p>
+            {% elif message.extra.is_unsupported %}
+            <p class="text-sm text-stone-500">This message contains media Instagram cannot provide.</p>
+            {% endif %}
+            {% for attachment in attachments %}
+            <div class="mt-3">
+                {% if not attachment.url %}
+                <p class="text-sm text-stone-500">{{ attachment.type|title }} attachment unavailable.</p>
+                {% elif attachment.type == 'image' %}
+                <a href="{{ attachment.url }}" target="_blank" rel="noopener noreferrer"><img src="{{ attachment.url }}" loading="lazy" referrerpolicy="no-referrer" alt="Incoming image attachment" class="max-h-64 rounded-lg"></a>
+                {% elif attachment.type == 'video' %}
+                <video controls preload="none" class="max-h-64 rounded-lg" src="{{ attachment.url }}">Video attachment unavailable.</video>
+                {% elif attachment.type == 'audio' %}
+                <audio controls preload="none" src="{{ attachment.url }}">Audio attachment unavailable.</audio>
+                {% else %}
+                <a href="{{ attachment.url }}" target="_blank" rel="noopener noreferrer" class="text-sm underline">Open {{ attachment.type }} attachment</a>
+                {% endif %}
+                {% if attachment.url %}<p class="text-xs text-stone-500 mt-1">If the attachment is unavailable, open the conversation in Instagram.</p>{% endif %}
+            </div>
+            {% endfor %}
         </div>
 
         <!-- Thread: replies + notes merged chronologically -->

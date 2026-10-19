@@ -67,6 +67,11 @@
             {% if not forloop.last %}border-bottom: 1px solid var(--surface-2);{% endif %}
             display: flex; align-items: center; gap: 14px;
         ">
+            {% if value == 'youtube' %}
+            <div class="flex items-center justify-center flex-shrink-0 w-10 h-10">
+                {% include "partials/_youtube_icon.html" %}
+            </div>
+            {% else %}
             <!-- Platform icon -->
             <div style="
                 width: 40px; height: 40px; flex-shrink: 0;
@@ -89,6 +94,7 @@
                 {% include "social_accounts/partials/_platform_icon.html" with platform=value size="5" %}
             </div>
 
+            {% endif %}
             <!-- Platform info -->
             <div style="flex: 1; min-width: 0;">
                 <div style="font-size: 0.875rem; font-weight: 600; color: var(--text-primary);">{{ label }}</div>
