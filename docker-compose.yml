@@ -23,7 +23,7 @@ services:
 
   worker:
     build: .
-    command: python manage.py process_tasks
+    command: python manage.py run_studio_worker
     volumes:
       - media_data:/app/media
     env_file:

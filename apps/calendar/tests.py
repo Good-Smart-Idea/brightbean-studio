@@ -830,6 +830,78 @@ class RecurringPostPlatformExtraTests(TestCase):
             self.assertEqual(clone_pp.platform_extra, tiktok_extra)
 
 
+class RecurringPostPublishabilityTests(TestCase):
+    """A recurrence that can only fail at publish is created as a draft at its
+    date — visible on the calendar to fix, never handed to the publisher."""
+
+    def _generate(self, *, with_video, source_status="scheduled"):
+        org = Organization.objects.create(name="Recur Org")
+        ws = Workspace.objects.create(organization=org, name="Recur WS")
+        utc = zoneinfo.ZoneInfo("UTC")
+        account = SocialAccount.objects.create(
+            workspace=ws,
+            platform="tiktok",
+            account_platform_id="tt-recur",
+            account_name="TikTok",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        source = Post.objects.create(workspace=ws, caption="recur", scheduled_at=datetime(2026, 3, 2, 9, 0, tzinfo=utc))
+        PlatformPost.objects.create(
+            post=source, social_account=account, scheduled_at=source.scheduled_at, status=source_status
+        )
+        if with_video:
+            from apps.composer.models import PostMedia
+            from apps.media_library.models import MediaAsset
+
+            video = MediaAsset.objects.create(
+                organization=org,
+                workspace=ws,
+                file="test/clip.mp4",
+                filename="clip.mp4",
+                media_type=MediaAsset.MediaType.VIDEO,
+                mime_type="video/mp4",
+            )
+            PostMedia.objects.create(post=source, media_asset=video)
+        RecurrenceRule.objects.create(
+            post=source, frequency=RecurrenceRule.Frequency.WEEKLY, interval=1, end_date=date(2026, 3, 31)
+        )
+
+        with patch("apps.calendar.tasks.timezone.now", return_value=datetime(2026, 3, 1, 12, 0, tzinfo=utc)):
+            self.assertGreater(generate_recurring_posts(), 0)
+        return PlatformPost.objects.filter(post__workspace=ws).exclude(post=source)
+
+    def test_a_clone_with_no_video_is_left_as_a_draft_at_its_date(self):
+        clones = self._generate(with_video=False)
+
+        self.assertTrue(clones.exists())
+        for clone in clones:
+            self.assertEqual(clone.status, "draft")
+            self.assertIsNotNone(clone.scheduled_at)
+
+    def test_a_clone_with_a_video_is_scheduled(self):
+        clones = self._generate(with_video=True)
+
+        self.assertTrue(clones.exists())
+        self.assertEqual(set(clones.values_list("status", flat=True)), {"scheduled"})
+
+    def test_a_source_row_that_already_published_keeps_its_series_scheduled(self):
+        clones = self._generate(with_video=True, source_status="published")
+
+        self.assertEqual(set(clones.values_list("status", flat=True)), {"scheduled"})
+
+    def test_a_source_row_pulled_back_from_publishing_clones_as_drafts(self):
+        """A hold, an unschedule or a rejection must not be outrun by its own
+        recurrences publishing on their dates."""
+        for status in ("on_hold", "draft", "rejected", "pending_review"):
+            with self.subTest(status=status):
+                PlatformPost.objects.all().delete()
+                Post.objects.all().delete()
+                clones = self._generate(with_video=True, source_status=status)
+
+                self.assertTrue(clones.exists())
+                self.assertEqual(set(clones.values_list("status", flat=True)), {"draft"})
+
+
 class PublishTabTimezoneTests(TestCase):
     """The publish tabs must render times in a user-supplied ?tz= without 500ing."""
 

@@ -14,6 +14,18 @@ class SocialAccountsConfig(AppConfig):
         from django.db.models.signals import post_migrate
 
         post_migrate.connect(self._register_health_check_task, sender=self)
+        import apps.social_accounts.youtube_signals  # noqa: F401
+
+        post_migrate.connect(self._register_youtube_tasks, sender=self)
+
+    @staticmethod
+    def _register_youtube_tasks(sender, **kwargs):
+        from apps.common.background import register_recurring_task
+
+        from .youtube_compliance import enforce_youtube_retention, retry_youtube_revocations
+
+        register_recurring_task(enforce_youtube_retention, repeat=86400, verbose_name="enforce_youtube_retention")
+        register_recurring_task(retry_youtube_revocations, repeat=3600, verbose_name="retry_youtube_revocations")
 
     @staticmethod
     def _register_health_check_task(sender, **kwargs):

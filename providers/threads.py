@@ -31,7 +31,7 @@ API_BASE = "https://graph.threads.net/v1.0"
 # status FINISHED before it can be published, otherwise threads_publish fails
 # with "The requested resource does not exist" (code 24 / media not found).
 CONTAINER_POLL_INTERVAL = 3  # seconds
-CONTAINER_POLL_MAX_ATTEMPTS = 40  # up to ~2 min for video processing
+CONTAINER_POLL_TIMEOUT = 120  # seconds of video processing
 
 # Meta issues long-lived Threads tokens with a 60-day TTL. Used as the fallback
 # when a token response omits ``expires_in`` — see ``_tokens_from``.
@@ -40,6 +40,11 @@ LONG_LIVED_TOKEN_TTL = 60 * 24 * 60 * 60
 
 class ThreadsProvider(SocialProvider):
     """Threads API provider using OAuth 2.0."""
+
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -316,7 +321,8 @@ class ThreadsProvider(SocialProvider):
         containers stay IN_PROGRESS while Meta transcodes the upload; calling
         threads_publish before FINISHED returns "media not found".
         """
-        for _ in range(CONTAINER_POLL_MAX_ATTEMPTS):
+
+        def finished() -> bool:
             resp = self._request(
                 "GET",
                 f"{API_BASE}/{creation_id}",
@@ -325,21 +331,19 @@ class ThreadsProvider(SocialProvider):
             )
             data = resp.json()
             status = data.get("status", "")
-
-            if status in ("FINISHED", "PUBLISHED"):
-                return
             if status in ("ERROR", "EXPIRED"):
                 raise PublishError(
                     f"Threads container failed: {data.get('error_message', status)}",
                     platform=self.platform_name,
                     raw_response=data,
                 )
+            return status in ("FINISHED", "PUBLISHED")
 
-            time.sleep(CONTAINER_POLL_INTERVAL)
-
-        raise PublishError(
-            "Threads container processing timed out",
-            platform=self.platform_name,
+        self._poll_until(
+            finished,
+            deadline=time.monotonic() + CONTAINER_POLL_TIMEOUT,
+            interval=CONTAINER_POLL_INTERVAL,
+            on_timeout=lambda: PublishError("Threads container processing timed out", platform=self.platform_name),
         )
 
     def _publish_carousel(
@@ -352,10 +356,8 @@ class ThreadsProvider(SocialProvider):
         # Step 1: Create individual item containers
         children_ids: list[str] = []
 
-        for url in content.media_urls:
-            # Determine media type by extension heuristic
-            lower_url = url.lower()
-            if any(lower_url.endswith(ext) for ext in (".mp4", ".mov")):
+        for index, url in enumerate(content.media_urls):
+            if content.is_video(index):
                 media_type = "VIDEO"
                 key = "video_url"
             else:

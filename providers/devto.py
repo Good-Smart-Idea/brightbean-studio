@@ -38,6 +38,11 @@ MAX_TITLE_LENGTH = 128
 class DevtoProvider(SocialProvider):
     """DEV.to / Forem provider using a personal API key (no OAuth)."""
 
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
@@ -116,6 +121,7 @@ class DevtoProvider(SocialProvider):
             raise PublishError(
                 "DEV.to requires a title. Set the post title before publishing.",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         body = content.description or content.text or ""

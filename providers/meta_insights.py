@@ -77,10 +77,13 @@ def fetch_insights_safe(
     base_params: dict[str, Any] | None = None,
     metric_params: dict[str, dict[str, Any]] | None = None,
     endpoint_type: str = "insights",
+    require_success: bool = False,
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Fetch Meta insights one metric at a time so one invalid metric cannot fail all metrics."""
+    """Isolate invalid metrics, optionally requiring a successful insights response."""
     values: dict[str, Any] = {}
     errors: dict[str, str] = {}
+    first_error: APIError | None = None
+    successful_response = False
     for metric in metrics:
         params = {**(base_params or {}), **(metric_params or {}).get(metric, {}), "metric": metric}
         try:
@@ -88,6 +91,7 @@ def fetch_insights_safe(
         except APIError as exc:
             if is_meta_permission_error(exc):
                 raise
+            first_error = first_error or exc
             errors[metric] = str(exc)
             logger.warning(
                 "Skipping unsupported %s %s metric %s at %s: %s",
@@ -98,5 +102,8 @@ def fetch_insights_safe(
                 exc,
             )
             continue
+        successful_response = True
         values.update(parse_insights_response(resp.json()))
+    if require_success and not successful_response and first_error is not None:
+        raise first_error
     return values, errors

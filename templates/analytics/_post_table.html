@@ -89,7 +89,7 @@
                     </td>
                     <td style="font-size: 0.75rem; color: var(--text-tertiary);">{{ r.date }}</td>
                     {% for ml in table.metric_labels %}
-                    <td class="{% if ml.key == table.sort_key %}sort-col{% endif %}">{{ r.stats|get_stat:ml.key|fmt_metric:ml.kind }}</td>
+                    <td class="{% if ml.key == table.sort_key %}sort-col{% endif %}">{% if active_account.platform == "youtube" %}{{ r.stats|get_item:ml.key|fmt_metric:ml.kind }}{% else %}{{ r.stats|get_stat:ml.key|fmt_metric:ml.kind }}{% endif %}</td>
                     {% endfor %}
                 </tr>
                 {% empty %}

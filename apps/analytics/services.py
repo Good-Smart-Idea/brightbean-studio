@@ -14,7 +14,9 @@ from datetime import date as dt_date
 from datetime import timedelta
 from typing import Any, NamedTuple
 
+from django.db import connections
 from django.utils import timezone
+from django.utils.text import get_text_list
 
 from apps.composer.models import PlatformPost
 from apps.social_accounts.models import SocialAccount
@@ -113,34 +115,6 @@ def unavailable_reason(platform: str, enabled_platforms: list[str] | None = None
     return verdict.message if verdict else None
 
 
-def _series_for(
-    account: SocialAccount,
-    metric_key: str,
-    end: dt_date,
-    days: int,
-) -> list[float]:
-    """Return ``2 * days`` values ending at ``end`` (older first).
-
-    Missing days fill as 0.0 so the derive math has a contiguous series.
-    """
-    start = end - timedelta(days=2 * days - 1)
-    rows = AccountInsightsSnapshot.objects.filter(
-        social_account=account,
-        metric_key=metric_key,
-        date__gte=start,
-        date__lte=end,
-    ).order_by("date")
-    by_day: dict[dt_date, float] = {r.date: r.value for r in rows}
-    if not by_day and _supports_post_fallback(metric_key):
-        fallback, _ = _post_summed_series_for_metric(account, metric_key, start, end)
-        by_day.update(fallback)
-    out: list[float] = []
-    for i in range(2 * days):
-        d = start + timedelta(days=i)
-        out.append(by_day.get(d, 0.0))
-    return out
-
-
 def _supports_post_fallback(metric_key: str) -> bool:
     """Which metric keys can be derived by summing per-post deltas.
 
@@ -163,7 +137,7 @@ def _post_summed_series_for_metric(
     metric_key: str,
     start: dt_date,
     end: dt_date,
-) -> tuple[dict[dt_date, float], Any]:
+) -> tuple[dict[dt_date, float], Any, set[dt_date]]:
     """Per-day deltas of cumulative post snapshots, summed across all posts.
 
     ``PostInsightsSnapshot.value`` stores the cumulative-lifetime count for
@@ -174,9 +148,13 @@ def _post_summed_series_for_metric(
     page consistent with the per-post drawer for platforms that ship without
     an account-level analytics API.
 
-    Returns ``(daily_totals, max_captured_at)``. The caller folds
-    ``max_captured_at`` into the bundle's freshness signal so a fallback-only
-    YouTube/TikTok response doesn't report "no data yet".
+    Returns ``(daily_totals, max_captured_at, observed_days)``. The caller
+    folds ``max_captured_at`` into the bundle's freshness signal so a
+    fallback-only TikTok response doesn't report "no data yet".
+    ``observed_days`` are the days we actually measured, including days
+    whose delta was zero (which ``daily_totals`` leaves out): a quiet day is
+    a real 0, while a day with no snapshot yet is missing, and the averages
+    and sparklines treat the two differently.
 
     Three correctness rules in the iteration:
       * The query is bounded to ``[start, end]`` for performance. The first
@@ -201,6 +179,8 @@ def _post_summed_series_for_metric(
         recovery is measured against the pre-reset high-water mark instead
         of being over-credited.
     """
+    if account.platform == "youtube":
+        return {}, None, set()
     rows = (
         PostInsightsSnapshot.objects.filter(
             platform_post__social_account=account,
@@ -218,6 +198,7 @@ def _post_summed_series_for_metric(
         )
     )
     out: dict[dt_date, float] = defaultdict(float)
+    observed: set[dt_date] = set()
     max_captured: Any = None
     current_post_id: Any = None
     prev_value = 0.0
@@ -255,33 +236,26 @@ def _post_summed_series_for_metric(
                     d += timedelta(days=1)
             prev_value = v
             continue
+        observed.add(day)
         delta = v - prev_value
         if delta <= 0:
             continue
         prev_value = v
         out[day] += delta
-    return dict(out), max_captured
-
-
-def account_series_map(
-    account: SocialAccount,
-    days: int,
-) -> dict[str, list[float]]:
-    """Return ``{metric_key: 2*days-long series}`` for every platform metric.
-
-    Kept as a thin wrapper around :func:`account_analytics_bundle` for
-    callers that don't need the freshness side-channel (the web view's
-    chart-only HTMX partial). Most callers should use the bundle so they
-    can also recover the latest ``captured_at`` without an extra query.
-    """
-    return account_analytics_bundle(account, days)["series_map"]
+    observed.update(out)
+    return dict(out), max_captured, observed
 
 
 def account_analytics_bundle(account: SocialAccount, days: int) -> dict[str, Any]:
     """Single-pass snapshot fetch for one account over a ``2 * days`` window.
 
     Returns a dict with:
-      - ``series_map``: ``{metric_key: 2*days-long series}``
+      - ``series_map``: ``{metric_key: 2*days-long series}``, zero-filled.
+      - ``present_map``: ``{metric_key: 2*days-long [bool]}`` — which days
+        actually have a value, so averages can skip days with no data yet.
+      - ``estimated_metrics``: metric keys whose series includes days we
+        built from per-post deltas (the fallback below) rather than read from
+        the platform's account-level analytics. Cards label these as ours.
       - ``max_captured_at``: latest ``captured_at`` across the fetched rows,
         or ``None`` if no snapshots exist in the window.
 
@@ -289,44 +263,55 @@ def account_analytics_bundle(account: SocialAccount, days: int) -> dict[str, Any
     with a single bulk SELECT, and exposes the freshness max so callers
     don't need a separate ``Max("captured_at")`` aggregate.
     """
+    if account.platform == "youtube":
+        from .youtube_reports import account_bundle
+
+        return account_bundle(account, days)
     end = timezone.now().date()
     start = end - timedelta(days=2 * days - 1)
     platform_metrics = PLATFORM_METRICS.get(account.platform, [])
 
-    rows = list(
-        AccountInsightsSnapshot.objects.filter(
-            social_account=account,
-            metric_key__in=platform_metrics,
-            date__gte=start,
-            date__lte=end,
-        )
-    )
+    # Four columns, not model instances: AccountInsightsSnapshot carries ``raw``
+    # and ``errors`` JSONFields that Django decodes on hydration and that
+    # nothing below reads. See ``_latest_post_stats`` for the same reasoning at
+    # the scale where it actually hurt.
+    rows = AccountInsightsSnapshot.objects.filter(
+        social_account=account,
+        metric_key__in=platform_metrics,
+        date__gte=start,
+        date__lte=end,
+    ).values_list("metric_key", "date", "value", "captured_at")
     by_metric: dict[str, dict[dt_date, float]] = defaultdict(dict)
+    # Days with a real value, including a fallback day whose delta was zero.
+    present_days: dict[str, set[dt_date]] = defaultdict(set)
     captured_by_metric: dict[str, Any] = {}
     max_captured: Any = None
     metrics_with_account_data: set[str] = set()
-    for r in rows:
-        by_metric[r.metric_key][r.date] = r.value
-        metrics_with_account_data.add(r.metric_key)
-        if r.metric_key not in captured_by_metric or r.captured_at > captured_by_metric[r.metric_key]:
-            captured_by_metric[r.metric_key] = r.captured_at
-        if max_captured is None or r.captured_at > max_captured:
-            max_captured = r.captured_at
+    for metric_key, day, value, captured_at in rows:
+        by_metric[metric_key][day] = value
+        present_days[metric_key].add(day)
+        metrics_with_account_data.add(metric_key)
+        if metric_key not in captured_by_metric or captured_at > captured_by_metric[metric_key]:
+            captured_by_metric[metric_key] = captured_at
+        if max_captured is None or captured_at > max_captured:
+            max_captured = captured_at
 
     # Hybrid fallback: for content-attribution metrics, derive a daily series
     # by summing per-post deltas so platforms without ``get_account_metrics``
-    # (YouTube, TikTok, etc.) still get populated hero cards and charts.
+    # (TikTok, etc.) still get populated hero cards and charts. YouTube returns
+    # above, so neither reconstruction nor the freshness fallback applies.
     #
     # Also prefer the per-post series when it is fresher than account-level
     # rows. Facebook account insights are synced at most daily, while per-post
     # metrics can refresh hourly; without this freshness check the main graph
     # can lag behind the post drawer/table even though newer post snapshots are
     # already stored.
+    estimated_metrics: set[str] = set()
     for m in platform_metrics:
         if not _supports_post_fallback(m):
             continue
-        daily, fallback_captured = _post_summed_series_for_metric(account, m, start, end)
-        if not daily:
+        daily, fallback_captured, observed = _post_summed_series_for_metric(account, m, start, end)
+        if not observed:
             continue
         account_captured = captured_by_metric.get(m)
         should_use_fallback = m not in metrics_with_account_data or (
@@ -334,36 +319,63 @@ def account_analytics_bundle(account: SocialAccount, days: int) -> dict[str, Any
         )
         if should_use_fallback:
             by_metric[m].update(daily)
+            present_days[m].update(observed)
+            estimated_metrics.add(m)
             if fallback_captured is not None and (max_captured is None or fallback_captured > max_captured):
                 max_captured = fallback_captured
 
-    series_map = {
-        m: [by_metric[m].get(start + timedelta(days=i), 0.0) for i in range(2 * days)] for m in platform_metrics
+    window = [start + timedelta(days=i) for i in range(2 * days)]
+    series_map = {m: [by_metric[m].get(day, 0.0) for day in window] for m in platform_metrics}
+    present_map = {m: [day in present_days[m] for day in window] for m in platform_metrics}
+    return {
+        "series_map": series_map,
+        "present_map": present_map,
+        "estimated_metrics": estimated_metrics,
+        "max_captured_at": max_captured,
     }
-    return {"series_map": series_map, "max_captured_at": max_captured}
+
+
+def _derive_metric(bundle: dict[str, Any], metric: str, days: int) -> DerivedMetric:
+    """:func:`derive` one metric from the bundle, carrying the presence mask
+    and the per-post-estimate flag the cards label."""
+    if "native_current" in bundle:
+        from .youtube_reports import native_metric
+
+        return native_metric(bundle, metric, days)
+    return derive(
+        bundle["series_map"].get(metric, []),
+        days,
+        kind_of(metric),
+        present=bundle["present_map"].get(metric),
+        estimated=metric in bundle["estimated_metrics"],
+    )
+
+
+def platform_name(account: SocialAccount) -> str:
+    """The platform's brand name for copy: "Instagram", not "Instagram (Direct)"."""
+    return account.get_platform_display().split(" (")[0]
+
+
+def content_noun(account: SocialAccount) -> str:
+    """What a single post is called on the platform, for "per-video counts"."""
+    return "video" if account.platform in ("youtube", "tiktok") else "post"
 
 
 def hero_cards(
     account: SocialAccount,
     days: int,
     *,
-    series_map: dict[str, list[float]] | None = None,
+    bundle: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """List of {metric, label, derived} for the hero KPI cards.
 
-    Pass ``series_map`` to reuse an already-fetched
-    :func:`account_analytics_bundle` result. Without it, the helper
-    falls back to its own per-metric queries (kept for the views that
-    iterate the trio individually).
+    Pass ``bundle`` to reuse an already-fetched
+    :func:`account_analytics_bundle` result.
     """
-    if series_map is None:
-        series_map = account_series_map(account, days)
+    if bundle is None:
+        bundle = account_analytics_bundle(account, days)
     return [
-        {
-            "metric": m,
-            "label": _label(m),
-            "derived": derive(series_map.get(m, []), days, kind_of(m)),
-        }
+        {"metric": m, "label": _label(m), "derived": _derive_metric(bundle, m, days)}
         for m in hero_card_metrics(account.platform)
     ]
 
@@ -372,34 +384,82 @@ def engagement_card(
     account: SocialAccount,
     days: int,
     *,
-    series_map: dict[str, list[float]] | None = None,
+    bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Engagement-rate card payload, or ``None`` if the platform lacks a denom.
 
     Returns a dict with:
       - ``rate``: DerivedMetric for the rate headline + sparkline
       - ``parts``: list of {metric, label, derived} for the 2x2 sub-grid
+      - ``formula``: how we calculated the rate, e.g. "(Likes + Comments) ÷ Views",
+        naming the denominator the rate actually used; ``None`` when there was
+        nothing to divide by yet. The rate is our metric, not the platform's,
+        and the card says so.
 
-    Pass ``series_map`` to reuse an already-fetched
+    Pass ``bundle`` to reuse an already-fetched
     :func:`account_analytics_bundle` result.
     """
     from .metrics import ENGAGEMENT_PARTS, has_engagement_card
 
     if not has_engagement_card(account.platform):
         return None
-    if series_map is None:
-        series_map = account_series_map(account, days)
-    rate = engagement_rate(series_map, days, fallback_followers=account.follower_count)
-    parts = [
-        {
-            "metric": m,
-            "label": _label(m),
-            "derived": derive(series_map.get(m, []), days, kind_of(m)),
-        }
+    if bundle is None:
+        bundle = account_analytics_bundle(account, days)
+    rate = engagement_rate(
+        bundle["series_map"],
+        days,
+        fallback_followers=account.follower_count,
+        present_by_metric=bundle["present_map"],
+    )
+    parts: list[dict[str, Any]] = [
+        {"metric": m, "label": _label(m), "derived": _derive_metric(bundle, m, days)}
         for m in PLATFORM_METRICS.get(account.platform, [])
         if m in ENGAGEMENT_PARTS
     ]
-    return {"rate": rate, "parts": parts}
+    rate.estimated = any(p["derived"].estimated for p in parts) or rate.denominator in bundle["estimated_metrics"]
+    formula = None
+    if rate.denominator is not None:
+        denominator_label = "Followers" if rate.denominator == "followers" else _label(rate.denominator)
+        numerator = " + ".join(p["label"] for p in parts)
+        formula = f"({numerator}) ÷ {denominator_label}" if len(parts) > 1 else f"{numerator} ÷ {denominator_label}"
+    return {"rate": rate, "parts": parts, "formula": formula}
+
+
+def calculated_metrics_note(
+    account: SocialAccount,
+    *,
+    cards: list[dict[str, Any]],
+    engagement: dict[str, Any] | None,
+    chart: dict[str, Any] | None = None,
+    growth: DerivedMetric | None = None,
+) -> str:
+    """One line under the KPI row naming what on the page we calculated.
+
+    Describe native reports and any permitted calculations accurately.
+    A disclosure label does not authorize a derived metric.
+    """
+    if account.platform == "youtube":
+        return "Metrics reported by YouTube. Data may be delayed. Percentage comparisons, when available, are calculated from reported totals."
+    shown = [card["derived"] for card in cards]
+    if engagement:
+        shown += [part["derived"] for part in engagement["parts"]]
+    if chart:
+        shown.append(chart["derived"])
+    platform = platform_name(account)
+    calculated = []
+    if engagement:
+        calculated.append("engagement rate")
+    if any(d.averaged for d in shown):
+        calculated.append("daily averages")
+    if any(d.estimated for d in shown):
+        calculated.append(f"estimates built from per-{content_noun(account)} counts")
+    if growth is not None and growth.estimated:
+        calculated.append("follower growth")
+    calculated.append("% changes vs. the previous period")
+    listed = get_text_list(calculated, "and")
+    return (
+        f"Underlying data comes from {platform}. The {listed} are calculated by BrightBean, not reported by {platform}."
+    )
 
 
 def hero_chart_metrics(account: SocialAccount) -> list[str]:
@@ -412,23 +472,24 @@ def hero_chart_data(
     days: int,
     metric: str | None = None,
     *,
-    series_map: dict[str, list[float]] | None = None,
+    bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Payload for the hero area chart: selected metric, date labels, values.
 
-    Pass ``series_map`` to reuse an already-fetched
-    :func:`account_analytics_bundle` result and skip the per-metric query
-    inside :func:`_series_for` — the bundle already computed every metric's
-    2*days-long series, including the post-fallback path.
+    Pass ``bundle`` to reuse an already-fetched
+    :func:`account_analytics_bundle` result — it already holds every
+    metric's 2*days-long series, including the post-fallback path.
     """
     chips = hero_chart_metrics(account)
     selected = metric if metric in chips else (PLATFORM_PRIMARY.get(account.platform) or (chips[0] if chips else ""))
     end = timezone.now().date()
-    if series_map is not None and selected in series_map:
-        series = series_map[selected]
-    else:
-        series = _series_for(account, selected, end, days)
-    derived = derive(series, days, kind_of(selected))
+    if account.platform == "youtube":
+        from .youtube_reports import reporting_window
+
+        _, end = reporting_window(days)
+    if bundle is None:
+        bundle = account_analytics_bundle(account, days)
+    derived = _derive_metric(bundle, selected, days)
     # Date labels for the X axis (current window only).
     labels = [(end - timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
     return {
@@ -444,7 +505,7 @@ def follower_growth(
     account: SocialAccount,
     days: int,
     *,
-    series_map: dict[str, list[float]] | None = None,
+    bundle: dict[str, Any] | None = None,
 ) -> DerivedMetric | None:
     """Account-level follower growth (new followers/subscribers) for the header.
 
@@ -453,7 +514,7 @@ def follower_growth(
     schema) should use :func:`follower_growth_metric` instead so they
     don't have to re-derive the key from ``PLATFORM_METRICS``.
     """
-    pair = follower_growth_metric(account, days, series_map=series_map)
+    pair = follower_growth_metric(account, days, bundle=bundle)
     return pair[1] if pair else None
 
 
@@ -461,7 +522,7 @@ def follower_growth_metric(
     account: SocialAccount,
     days: int,
     *,
-    series_map: dict[str, list[float]] | None = None,
+    bundle: dict[str, Any] | None = None,
 ) -> tuple[str, DerivedMetric] | None:
     """Same as :func:`follower_growth` but also returns the metric key.
 
@@ -471,9 +532,11 @@ def follower_growth_metric(
     API only exposes a cumulative lifetime total (TikTok), and ``None``
     on platforms without an account-level growth metric.
 
-    Pass ``series_map`` to reuse an already-fetched
-    :func:`account_analytics_bundle` result instead of issuing another
-    per-metric query.
+    Pass ``bundle`` to reuse an already-fetched
+    :func:`account_analytics_bundle` result.
+
+    For ``"followers"`` the growth is ours — the difference between follower
+    totals — so the result is marked ``estimated`` for the labels.
     """
     # Mutually exclusive per platform — first-match-wins. ``derive`` handles
     # both delta-style (``follows``/``subscribers``) and total-style
@@ -484,10 +547,6 @@ def follower_growth_metric(
     )
     if not growth_metric:
         return None
-    if series_map is not None and growth_metric in series_map:
-        series = series_map[growth_metric]
-    else:
-        series = _series_for(account, growth_metric, timezone.now().date(), days)
     if growth_metric == "followers":
         end = timezone.now().date()
         current_start = end - timedelta(days=days - 1)
@@ -517,7 +576,7 @@ def follower_growth_metric(
             (float(value) for day, value in reversed(rows) if day < current_start),
             None,
         )
-        daily_series: list[float] = []
+        daily_series: list[float | None] = []
         for i in range(days):
             day = current_start + timedelta(days=i)
             value = by_day.get(day)
@@ -531,8 +590,12 @@ def follower_growth_metric(
             delta=round(delta, 1),
             series=daily_series,
             kind=kind_of(growth_metric),
+            estimated=True,
         )
-    return growth_metric, derive(series, days, kind_of(growth_metric))
+    if bundle is None:
+        bundle = account_analytics_bundle(account, days)
+    metric = _derive_metric(bundle, growth_metric, days)
+    return (growth_metric, metric) if metric.available else None
 
 
 def all_posts_for(
@@ -566,7 +629,7 @@ def all_posts_for(
 
     posts: list[PlatformPost] = list(qs)
     metrics = post_metrics_for(account.platform)
-    stats_by_post = _latest_post_stats(posts, metrics)
+    stats_by_post = _latest_post_stats([p.id for p in posts], metrics)
 
     rows: list[dict[str, Any]] = []
     for p in posts:
@@ -633,7 +696,7 @@ def post_detail(post: PlatformPost) -> dict[str, Any]:
     """
     account = post.social_account
     metrics = post_metrics_for(account.platform)
-    stats = _latest_post_stats([post], metrics).get(post.id, {})
+    stats = _latest_post_stats([post.id], metrics).get(post.id, {})
     sparklines_by_metric, max_captured = _post_sparklines_with_freshness(post, metrics)
     return {
         "post": post,
@@ -648,7 +711,7 @@ def post_detail(post: PlatformPost) -> dict[str, Any]:
             {
                 "key": m,
                 "label": _label(m),
-                "value": stats.get(m, 0),
+                "value": stats.get(m) if account.platform == "youtube" else stats.get(m, 0),
                 "kind": kind_of(m),
                 "sparkline": sparklines_by_metric.get(m, []),
                 "is_primary": m == PLATFORM_PRIMARY.get(account.platform),
@@ -667,46 +730,75 @@ def _label(metric_key: str) -> str:
     return METRICS.get(metric_key, {}).get("label", metric_key.replace("_", " ").title())
 
 
-def _latest_post_stats(posts: Iterable[PlatformPost], metrics: list[str]) -> dict[Any, dict[str, float]]:
-    """For each post, return ``{metric_key: latest value}``."""
-    post_ids = [p.id for p in posts]
+def _latest_post_stats(post_ids: Iterable[Any], metrics: list[str]) -> dict[Any, dict[str, float]]:
+    """For each post id, return ``{metric_key: latest value}``.
+
+    Three columns, never model instances. ``PostInsightsSnapshot`` is one row
+    per (post, metric, day) and carries two JSONFields — ``raw`` is the entire
+    provider response — and Django decodes both eagerly while hydrating a row.
+    Pulling these as models therefore ran a ``json.loads`` over every payload
+    in the table for the account, twice per row, to read three numbers none of
+    which are in the JSON. On an account with 300 posts and 90 days of history
+    that is 216k instances and 432k needless decodes, in a web process with
+    ~60 MB of headroom.
+
+    Where the backend supports it, ``DISTINCT ON`` also does the dedup in
+    Postgres rather than in Python, so the query returns one row per
+    (post, metric) instead of one per day. The ``order_by`` prefix it requires
+    is the ordering this needs anyway.
+
+    That is an optimization, not a requirement: README documents SQLite for
+    local development and small deployments, and SQLite inherits Django's base
+    ``distinct_sql``, which raises ``NotSupportedError`` the moment any field is
+    passed. So the clause is applied only when the backend advertises it, and
+    everything else dedups the same rows in Python. The ``values_list`` above
+    is where nearly all of the saving comes from and it works everywhere.
+    """
+    post_ids = list(post_ids)
     if not post_ids:
         return {}
-    rows = PostInsightsSnapshot.objects.filter(platform_post_id__in=post_ids, metric_key__in=metrics).order_by(
-        "platform_post_id", "metric_key", "-date"
+    rows = (
+        PostInsightsSnapshot.objects.filter(platform_post_id__in=post_ids, metric_key__in=metrics)
+        .order_by("platform_post_id", "metric_key", "-date")
+        .values_list("platform_post_id", "metric_key", "value")
     )
+
     out: dict[Any, dict[str, float]] = defaultdict(dict)
+    if connections[rows.db].features.can_distinct_on_fields:
+        for post_id, metric_key, value in rows.distinct("platform_post_id", "metric_key"):
+            out[post_id][metric_key] = value
+        return out
+
+    # Same ordering, so the first row for each (post, metric) is still the
+    # newest; ``iterator`` keeps the untrimmed result set from being cached.
     seen: set[tuple[Any, str]] = set()
-    for r in rows:
-        key = (r.platform_post_id, r.metric_key)
+    for post_id, metric_key, value in rows.iterator(chunk_size=2000):
+        key = (post_id, metric_key)
         if key in seen:
             continue
         seen.add(key)
-        out[r.platform_post_id][r.metric_key] = r.value
+        out[post_id][metric_key] = value
     return out
 
 
-def _post_sparklines(post: PlatformPost, metrics: list[str]) -> dict[str, list[float]]:
-    """Daily history per metric since publish — for the detail-drawer sparkline."""
-    return _post_sparklines_with_freshness(post, metrics)[0]
-
-
 def _post_sparklines_with_freshness(post: PlatformPost, metrics: list[str]) -> tuple[dict[str, list[float]], Any]:
-    """Same as :func:`_post_sparklines` but also returns the max ``captured_at``.
+    """Daily history per metric since publish, plus the max ``captured_at``.
 
-    Used by :func:`post_detail` so the freshness side-channel
-    (:func:`apps.analytics.freshness.post_freshness`) doesn't need its own
-    ``Max("captured_at")`` aggregate against the same rows.
+    Feeds the detail-drawer sparkline. The freshness value rides along so the
+    side-channel (:func:`apps.analytics.freshness.post_freshness`) doesn't need
+    its own ``Max("captured_at")`` aggregate against the same rows.
     """
-    rows = PostInsightsSnapshot.objects.filter(platform_post=post, metric_key__in=metrics).order_by(
-        "metric_key", "date"
+    rows = (
+        PostInsightsSnapshot.objects.filter(platform_post=post, metric_key__in=metrics)
+        .order_by("metric_key", "date")
+        .values_list("metric_key", "value", "captured_at")
     )
     out: dict[str, list[float]] = defaultdict(list)
     max_captured: Any = None
-    for r in rows:
-        out[r.metric_key].append(r.value)
-        if max_captured is None or r.captured_at > max_captured:
-            max_captured = r.captured_at
+    for metric_key, value, captured_at in rows:
+        out[metric_key].append(value)
+        if max_captured is None or captured_at > max_captured:
+            max_captured = captured_at
     return dict(out), max_captured
 
 

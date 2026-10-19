@@ -25,7 +25,7 @@ services:
     name: brightbean-worker
     runtime: docker
     dockerfilePath: ./Dockerfile
-    dockerCommand: python manage.py process_tasks
+    dockerCommand: python manage.py run_studio_worker
     envVars:
       - key: DJANGO_SETTINGS_MODULE
         value: config.settings.production

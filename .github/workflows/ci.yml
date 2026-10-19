@@ -19,7 +19,7 @@ concurrency:
 jobs:
   lint:
     name: Lint (ruff)
-    runs-on: [self-hosted, Linux, X64, gsi-ada]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -44,7 +44,7 @@ jobs:
 
   typecheck:
     name: Type check (mypy)
-    runs-on: [self-hosted, Linux, X64, gsi-ada]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       # mypy loads Django settings during type inference; it never hits a DB.
@@ -69,14 +69,13 @@ jobs:
 
   test:
     name: Test (pytest)
-    runs-on: [self-hosted, Linux, X64, gsi-ada]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
       postgres:
-        # Pulled via AWS's public mirror of Docker Hub official images —
-        # avoids anonymous Docker Hub pulls, whose timeouts/rate limits
-        # broke main CI on 2026-06-10 (run 27262568530).
-        image: public.ecr.aws/docker/library/postgres:16-alpine
+        # Public-repository jobs use GitHub-hosted runners. Pull the official
+        # image directly: the ECR mirror rejected these runners with a data limit.
+        image: postgres:16-alpine
         env:
           POSTGRES_DB: brightbean_test
           POSTGRES_USER: postgres
@@ -110,12 +109,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Catches a model change whose migration was never generated. The
+      # companion hazard — a migration that is fine against an empty table but
+      # fails on one with rows — is covered by tests that apply migrations over
+      # seeded data (see apps/inbox/tests/test_reply_lifecycle_migrations.py).
+      - name: makemigrations --check
+        run: python manage.py makemigrations --check --dry-run
+
       - name: pytest
         run: pytest --cov=apps --cov-report=term-missing
 
   build:
     name: Docker build
-    runs-on: [self-hosted, Linux, X64, gsi-ada]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [lint, typecheck, test]
     steps:
@@ -138,7 +144,7 @@ jobs:
 
   secrets-scan:
     name: Secret scan (gitleaks)
-    runs-on: [self-hosted, Linux, X64, gsi-ada]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     # We invoke the gitleaks binary directly rather than using
     # gitleaks/gitleaks-action, because that action now requires a paid

@@ -7,10 +7,13 @@ from django.contrib import messages
 from django.contrib.auth import logout
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.shortcuts import redirect, render
 from django.utils import timezone as django_tz
 from django.views.decorators.http import require_http_methods
 
+from apps.accounts.signup_links import custom_signup_url, signup_allowed
+from apps.common.validators import clean_display_name
 from apps.composer.models import PlatformPost, Post, Tag
 from apps.members.decorators import require_org_role
 from apps.members.models import OrgMembership, WorkspaceMembership
@@ -114,8 +117,14 @@ def workspaces_view(request):
 
 
 def _handle_name_update(request, org):
-    """Handle organization name change."""
-    name = request.POST.get("name", "").strip()
+    """Handle organization name change.
+
+    The name is interpolated into the Subject of every invitation this org
+    sends ("You've been invited to join <name> on Brightbean"), so it is
+    cleaned here rather than trusted: control characters out, whitespace
+    collapsed, length bounded.
+    """
+    name = clean_display_name(request.POST.get("name", ""))
     if not name:
         messages.error(request, "Organization name cannot be empty.")
         return
@@ -137,17 +146,22 @@ def _handle_tz_update(request, org):
     messages.success(request, "Default timezone updated.")
 
 
+@transaction.atomic
 def _handle_org_deletion(request, org):
     """Schedule organization deletion for 14 days from now (owner only)."""
     if request.org_membership.org_role != OrgMembership.OrgRole.OWNER:
         raise PermissionDenied
 
     from apps.organizations.tasks import execute_scheduled_org_deletion
+    from apps.social_accounts.youtube_compliance import purge_organization
+
+    org = type(org).objects.select_for_update().get(pk=org.pk)
 
     grace = timedelta(days=14)
     org.deletion_requested_at = django_tz.now()
     org.deletion_scheduled_for = django_tz.now() + grace
     org.save(update_fields=["deletion_requested_at", "deletion_scheduled_for"])
+    purge_organization(org)
 
     execute_scheduled_org_deletion(str(org.id), schedule=grace)
 
@@ -174,7 +188,9 @@ def _handle_immediate_org_deletion(request, org):
 
     org.hard_delete(requesting_user=request.user)
     logout(request)
-    return redirect("account_signup")
+    # With SIGNUP_MODE invite/closed and no custom URL, the signup page would only
+    # say sign-up is closed, so send them to log in instead.
+    return redirect(custom_signup_url(request) or ("account_signup" if signup_allowed(request) else "account_login"))
 
 
 def _handle_cancel_deletion(request, org):
@@ -196,7 +212,9 @@ def _handle_cancel_deletion(request, org):
     org.deletion_requested_at = None
     org.deletion_scheduled_for = None
     org.save(update_fields=["deletion_requested_at", "deletion_scheduled_for"])
-    messages.success(request, "Organization deletion cancelled.")
+    messages.success(
+        request, "Organization deletion cancelled. Reconnect any YouTube channels removed when deletion was requested."
+    )
 
 
 @login_required

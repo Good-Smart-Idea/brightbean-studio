@@ -148,9 +148,12 @@ class DispatchExtraInjectionTest(SimpleTestCase):
         _access_token, content = mock_provider.publish_post.call_args.args
         self.assertEqual(content.extra.get("author"), "urn:li:organization:98765")
 
+    # The mocked post has no attachments, which the pre-flight would refuse
+    # for Instagram; that check has its own tests, this one pins the injection.
+    @patch("apps.publisher.engine.publish_blocker", return_value="")
     @patch("apps.publisher.engine.get_provider")
     @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
-    def test_injects_ig_user_id_for_instagram(self, _mock_creds, mock_get_provider):
+    def test_injects_ig_user_id_for_instagram(self, _mock_creds, mock_get_provider, _mock_blocker):
         engine, platform_post, mock_provider = _build_dispatch_mocks(
             platform="instagram",
             account_platform_id="17841400000000000",
@@ -162,6 +165,31 @@ class DispatchExtraInjectionTest(SimpleTestCase):
         mock_provider.publish_post.assert_called_once()
         _access_token, content = mock_provider.publish_post.call_args.args
         self.assertEqual(content.extra.get("ig_user_id"), "17841400000000000")
+
+    @patch("apps.publisher.engine.get_provider")
+    @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
+    def test_passes_a_stable_idempotency_key_and_publish_runtime(self, _mock_creds, mock_get_provider):
+        from apps.common.worker import SHUTDOWN_REQUESTED
+        from apps.publisher.engine import _provider_upload_cache
+
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            platform="mastodon",
+            account_platform_id="109",
+        )
+        platform_post.id = "4f1c"
+        mock_get_provider.return_value = mock_provider
+
+        engine._dispatch_to_provider(platform_post)
+        engine._dispatch_to_provider(platform_post)
+
+        contents = [call.args[1] for call in mock_provider.publish_post.call_args_list]
+        # Every retry of the row must send the same key, or the platform cannot
+        # recognise a repeat of a post it already created.
+        self.assertEqual([c.idempotency_key for c in contents], ["brightbean-4f1c", "brightbean-4f1c"])
+        # A typed field, not a key smuggled into the authored extras.
+        self.assertNotIn("idempotency_key", contents[0].extra)
+        self.assertIs(contents[0].upload_cache, _provider_upload_cache)
+        self.assertEqual(contents[0].should_stop, SHUTDOWN_REQUESTED.is_set)
 
     @patch("apps.publisher.engine.get_provider")
     @patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
@@ -194,6 +222,86 @@ class DispatchExtraInjectionTest(SimpleTestCase):
 
         _access_token, content = mock_provider.publish_post.call_args.args
         self.assertNotIn("author", content.extra)
+
+
+class ResolvePostTypeFacebookReelTest(SimpleTestCase):
+    """The hop that turns a composer choice into a typed PostType.
+
+    Both ends of the Facebook Reel path are covered elsewhere — the composer
+    writing ``platform_extra["post_type"]``, and the provider turning
+    ``PostType.REEL`` into Graph calls. This is the bridge between them.
+    """
+
+    def _resolve(self, **kwargs):
+        kwargs.setdefault("platform", "facebook")
+        kwargs.setdefault("platform_extra", {})
+        kwargs.setdefault("media_count", 1)
+        kwargs.setdefault("first_media_type", "video")
+        return PublishEngine._resolve_post_type(**kwargs)
+
+    def test_reel_hint_wins_over_the_media_type_fallback(self):
+        self.assertEqual(self._resolve(platform_extra={"post_type": "reel"}), PostType.REEL)
+
+    def test_explicit_video_hint_keeps_the_regular_page_upload(self):
+        self.assertEqual(self._resolve(platform_extra={"post_type": "video"}), PostType.VIDEO)
+
+    def test_a_lone_video_without_a_hint_is_a_regular_video(self):
+        self.assertEqual(self._resolve(), PostType.VIDEO)
+
+    def test_a_reel_hint_is_dropped_when_the_video_is_gone(self):
+        """The hint is written on form submit; media changes persist on their own.
+
+        Removing the video via the composer's htmx endpoint never revisits
+        platform_extra, so a post could reach the publisher claiming REEL with
+        nothing to upload — failing a post that would have published as text.
+        """
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "reel"}, media_count=0, first_media_type=None),
+            PostType.TEXT,
+        )
+
+    def test_a_reel_hint_is_dropped_when_the_video_became_an_image(self):
+        # One attachment still, so a count check alone would let this through
+        # and send a JPEG to a Reels endpoint.
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "reel"}, media_count=1, first_media_type="image"),
+            PostType.IMAGE,
+        )
+
+    def test_a_reel_hint_is_dropped_when_a_second_attachment_arrived(self):
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "reel"}, media_count=2, first_media_type="video"),
+            PostType.VIDEO,
+        )
+
+    def test_a_video_hint_is_dropped_when_the_video_became_an_image(self):
+        """_publish_video posts media_urls[0] to the video endpoint unchecked.
+
+        A hint left over from a video that has since been replaced would send
+        the image there, so the media has to be able to veto it.
+        """
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "video"}, media_count=1, first_media_type="image"),
+            PostType.IMAGE,
+        )
+
+    def test_a_video_hint_is_dropped_when_the_media_is_gone(self):
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "video"}, media_count=0, first_media_type=None),
+            PostType.TEXT,
+        )
+
+    def test_a_hint_that_names_no_media_shape_is_left_alone(self):
+        # TEXT/LINK/PIN say nothing about attachments, so the media must not veto them.
+        self.assertEqual(
+            self._resolve(platform_extra={"post_type": "link"}, media_count=0, first_media_type=None),
+            PostType.LINK,
+        )
+
+    def test_an_unknown_hint_is_ignored_rather_than_raising(self):
+        # PostType(hint) would raise ValueError inside the publish loop and
+        # fail the post over a typo in stored JSON.
+        self.assertEqual(self._resolve(platform_extra={"post_type": "shorts"}), PostType.VIDEO)
 
 
 class ResolvePublishCredentialsTest(SimpleTestCase):
@@ -303,6 +411,152 @@ class NonRetryableFailureTest(TestCase):
         self.assertEqual(self.platform_post.retry_count, 1)
         self.assertIsNotNone(self.platform_post.next_retry_at)
         self.assertEqual(PublishLog.objects.filter(platform_post=self.platform_post).count(), 1)
+
+    def test_quota_retry_waits_until_the_provider_reset(self):
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import QuotaExceededError
+
+        reset_at = timezone.now() + timedelta(hours=8)
+        error = QuotaExceededError("daily quota spent", resets_at=reset_at, status_code=403)
+        engine = PublishEngine()
+        with patch.object(PublishEngine, "_dispatch_to_provider", side_effect=error):
+            result = engine._publish_platform_post(self.platform_post)
+
+        self.assertFalse(result["success"])
+        self.platform_post.refresh_from_db()
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.next_retry_at, reset_at)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def _fail_with(self, error):
+        with patch.object(PublishEngine, "_dispatch_to_provider", side_effect=error):
+            PublishEngine()._publish_platform_post(self.platform_post)
+        self.platform_post.refresh_from_db()
+
+    def _set_token_expiry(self, expires_at):
+        self.account.token_expires_at = expires_at
+        self.account.save(update_fields=["token_expires_at"])
+        # The engine reads the account through the platform post, so the
+        # cached relation has to see the new expiry too.
+        self.platform_post.social_account = self.account
+
+    def test_a_401_on_a_live_token_fails_immediately_with_reconnect_advice(self):
+        """Pinterest's missing boards:write was retried for an hour and a half,
+        then reported as "kept failing". No retry changes a refused grant."""
+        from apps.composer.models import PlatformPost
+        from apps.social_accounts.error_messages import PUBLISH_RECONNECT_MESSAGE
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        self._fail_with(APIError("Pinterest API error 401: Missing: ['boards:write']", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.retry_count, 0)
+        self.assertEqual(self.platform_post.publish_error, PUBLISH_RECONNECT_MESSAGE)
+
+    def test_a_401_on_an_expired_token_keeps_its_retries(self):
+        """The refresh before the next attempt may yet go through."""
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() - timedelta(minutes=5))
+        self._fail_with(APIError("expired", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def test_a_401_after_the_token_was_rotated_elsewhere_keeps_its_retries(self):
+        """The refusal was for the copy this attempt loaded; another process has
+        since stored a new token, and the retry reloads the account to use it."""
+        from apps.composer.models import PlatformPost
+        from apps.social_accounts.models import SocialAccount
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        SocialAccount.objects.filter(pk=self.account.pk).update(oauth_access_token="rotated-by-refresh-task")
+        self._fail_with(APIError("expired", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def test_a_token_re_read_that_fails_keeps_the_retry(self):
+        """The re-read runs inside the publish path's except block; if it
+        raised, the row would be stranded in ``publishing``."""
+        from django.db import DatabaseError
+
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        with patch(
+            "apps.social_accounts.models.SocialAccount.objects.filter",
+            side_effect=DatabaseError("connection lost"),
+        ):
+            self._fail_with(APIError("refused", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+        self.assertEqual(self.platform_post.retry_count, 1)
+
+    def test_a_403_that_runs_out_of_retries_does_not_end_on_reconnect_advice(self):
+        """A bare 403 can be a throttle; "reconnect" would send a healthy
+        account to reconnect."""
+        from apps.composer.models import PlatformPost
+        from apps.social_accounts.error_messages import PUBLISH_EXHAUSTED_MESSAGE
+        from providers.exceptions import APIError
+
+        self.platform_post.retry_count = MAX_RETRIES
+        self.platform_post.save(update_fields=["retry_count"])
+        self._fail_with(APIError("forbidden", status_code=403))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.publish_error, PUBLISH_EXHAUSTED_MESSAGE)
+
+    def test_a_post_the_platform_can_only_refuse_fails_before_any_platform_call(self):
+        """The pre-flight every scheduled row passes, however it was scheduled."""
+        from apps.composer.models import PlatformPost
+
+        with patch("apps.publisher.engine._provider_and_access_token") as token:
+            PublishEngine()._publish_platform_post(self.platform_post)
+
+        token.assert_not_called()
+        self.platform_post.refresh_from_db()
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.retry_count, 0)
+        self.assertTrue(self.platform_post.publish_error.startswith("TikTok can only publish videos"))
+        self.assertIn(
+            "TikTok can only publish videos",
+            PublishLog.objects.get(platform_post=self.platform_post).error_message,
+        )
+
+    def test_a_401_with_an_unknown_expiry_keeps_its_retries(self):
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(None)
+        self._fail_with(APIError("refused", status_code=401))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+
+    def test_a_403_keeps_its_retries(self):
+        """Some platforms throttle with 403; stopping on it would drop a retry that works."""
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import APIError
+
+        self._set_token_expiry(timezone.now() + timedelta(days=20))
+        self._fail_with(APIError("forbidden", status_code=403))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.SCHEDULED)
+
+    def test_running_out_of_retries_keeps_a_specific_message(self):
+        from apps.composer.models import PlatformPost
+        from providers.exceptions import PublishError
+
+        self.platform_post.retry_count = MAX_RETRIES
+        self.platform_post.save(update_fields=["retry_count"])
+        self._fail_with(PublishError("Instagram container processing timed out", platform="Instagram"))
+
+        self.assertEqual(self.platform_post.status, PlatformPost.Status.FAILED)
+        self.assertEqual(self.platform_post.publish_error, "Instagram container processing timed out")
 
 
 class PublishedPostLeavesQueueTest(TestCase):
@@ -466,8 +720,16 @@ class PublishErrorIsNeverRawTest(TestCase):
         )
         from providers.exceptions import APIError
 
+        # Claimed into ``publishing`` first, because that is the only state
+        # _publish_platform_post is ever entered in: both callers
+        # (poll_and_publish's group fan-out and _process_retries) transition the
+        # row before handing it over. _fail_permanently now refuses to settle a
+        # row that is not mid-attempt — a ``scheduled`` row belongs to a pending
+        # retry, and overwriting it would discard that retry and report a
+        # failure that had not happened.
         self.platform_post.retry_count = MAX_RETRIES
-        self.platform_post.save(update_fields=["retry_count"])
+        self.platform_post.status = PlatformPost.Status.PUBLISHING
+        self.platform_post.save(update_fields=["retry_count", "status"])
 
         with patch.object(
             PublishEngine,
@@ -481,3 +743,131 @@ class PublishErrorIsNeverRawTest(TestCase):
         self.assertEqual(self.platform_post.publish_error, PUBLISH_EXHAUSTED_MESSAGE)
         self.assertNotEqual(self.platform_post.publish_error, PUBLISH_TEMPORARY_MESSAGE)
         self.assertNotIn("retry shortly", self.platform_post.publish_error)
+
+
+class ResolvePostTypeFromMediaTypeTest(SimpleTestCase):
+    """Post-type resolution driven by the *media* type rather than a hint.
+
+    Distinct from ``ResolvePostTypeTest`` above, which covers the hint-driven
+    Facebook Reel path. This one covers the rule that a lone Instagram video
+    is a Reel even with no hint at all. Both classes were briefly named
+    ``ResolvePostTypeTest``, which silently shadowed the ten tests above.
+    """
+
+    def _resolve(self, platform, first_media_type="video", media_count=1, extra=None):
+        return PublishEngine._resolve_post_type(
+            platform=platform,
+            platform_extra=extra or {},
+            media_count=media_count,
+            first_media_type=first_media_type,
+        )
+
+    def test_a_lone_video_on_instagram_is_a_reel(self):
+        """Instagram has no standalone feed video. Resolving one to VIDEO left
+        each Instagram provider to translate it, and instagram_login did not —
+        it published the .mp4 as image_url.
+        """
+        self.assertEqual(self._resolve("instagram"), PostType.REEL)
+        self.assertEqual(self._resolve("instagram_login"), PostType.REEL)
+
+    def test_a_lone_video_elsewhere_is_still_a_video(self):
+        for platform in ("facebook", "threads", "tiktok", "youtube"):
+            with self.subTest(platform=platform):
+                self.assertEqual(self._resolve(platform), PostType.VIDEO)
+
+    def test_a_lone_image_on_instagram_is_still_an_image(self):
+        self.assertEqual(self._resolve("instagram_login", first_media_type="image"), PostType.IMAGE)
+
+    def test_multi_media_still_wins_over_the_reel_rule(self):
+        self.assertEqual(self._resolve("instagram_login", media_count=2), PostType.CAROUSEL)
+
+    def test_an_explicit_hint_still_wins(self):
+        self.assertEqual(
+            self._resolve("instagram_login", extra={"post_type": "story"}),
+            PostType.STORY,
+        )
+
+
+def _attachment(media_type: str, url: str, *, has_file: bool = True):
+    """A stand-in media attachment for the dispatch loop.
+
+    ``read`` returns b"" so the engine's temp-file download terminates at once.
+    """
+    pm = MagicMock()
+    asset = pm.media_asset
+    asset.media_type = media_type
+    asset.filename = "asset.bin"
+    asset.duration = 0
+    asset.file = MagicMock() if has_file else None
+    if has_file:
+        asset.file.url = url
+        asset.file.open.return_value.__enter__.return_value.read.return_value = b""
+    return pm
+
+
+class MediaTypePropagationTest(SimpleTestCase):
+    """The engine holds the only trustworthy media type — the magic-byte sniff
+    stored on the asset at upload. If it stops reaching PublishContent, every
+    provider silently falls back to guessing from the URL suffix, which comes
+    from the client-declared filename."""
+
+    def _dispatch(self, attachments):
+        engine, platform_post, mock_provider = _build_dispatch_mocks(
+            platform="instagram_login",
+            account_platform_id="ig-1",
+        )
+        platform_post.post.media_attachments.select_related.return_value.order_by.return_value = attachments
+        with (
+            patch("apps.publisher.engine.get_provider", return_value=mock_provider),
+            patch("apps.publisher.engine._resolve_publish_credentials", return_value={}),
+        ):
+            engine._dispatch_to_provider(platform_post)
+        _access_token, content = mock_provider.publish_post.call_args.args
+        return content
+
+    def test_the_assets_sniffed_type_reaches_the_provider(self):
+        content = self._dispatch(
+            [
+                _attachment("image", "https://cdn.example/a.mp4?sig=x"),
+                _attachment("video", "https://cdn.example/b.jpg?sig=x"),
+            ]
+        )
+
+        self.assertEqual(content.media_types, ["image", "video"])
+        # And the provider-facing question resolves against it, not the suffix.
+        self.assertFalse(content.is_video(0))
+        self.assertTrue(content.is_video(1))
+
+    def test_a_skipped_asset_does_not_shift_the_types(self):
+        """media_types is positional, so an asset dropped from media_urls has to
+        be dropped from media_types too or every later item reads the wrong
+        type."""
+        content = self._dispatch(
+            [
+                _attachment("image", "", has_file=False),
+                _attachment("video", "https://cdn.example/b.mp4?sig=x"),
+            ]
+        )
+
+        self.assertEqual(len(content.media_types), len(content.media_urls))
+        self.assertEqual(content.media_types, ["video"])
+        self.assertTrue(content.is_video(0))
+
+
+class ProviderUploadCacheTest(SimpleTestCase):
+    def test_round_trips_through_the_default_cache(self):
+        from apps.publisher.engine import _provider_upload_cache
+
+        _provider_upload_cache.set("mastodon-media:a:b", "m1", 60)
+
+        self.assertEqual(_provider_upload_cache.get("mastodon-media:a:b"), "m1")
+
+    @patch("apps.publisher.engine.cache")
+    def test_cache_outage_costs_a_reupload_not_a_publish(self, mock_cache):
+        from apps.publisher.engine import _provider_upload_cache
+
+        mock_cache.get.side_effect = ConnectionError("redis down")
+        mock_cache.set.side_effect = ConnectionError("redis down")
+
+        self.assertIsNone(_provider_upload_cache.get("k"))
+        _provider_upload_cache.set("k", "v", 60)

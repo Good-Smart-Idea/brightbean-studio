@@ -62,6 +62,47 @@ def test_fetch_insights_safe_reraises_permission_errors():
     assert excinfo.value is permission_error
 
 
+@pytest.mark.parametrize("require_success", [False, True])
+def test_all_failed_insights_propagate_only_when_success_is_required(require_success):
+    error = APIError("Upstream unavailable", status_code=503)
+    request = MagicMock(side_effect=error)
+    kwargs = {
+        "platform": "Instagram",
+        "endpoint": "https://graph.facebook.com/ig-1/insights",
+        "access_token": "user",
+        "metrics": ["reach", "views"],
+        "require_success": require_success,
+    }
+    if require_success:
+        with pytest.raises(APIError) as excinfo:
+            fetch_insights_safe(request, **kwargs)
+        assert excinfo.value is error
+    else:
+        values, errors = fetch_insights_safe(request, **kwargs)
+        assert values == {}
+        assert set(errors) == {"reach", "views"}
+
+
+@pytest.mark.parametrize("data", [[], [{"name": "reach", "values": [{"value": 0}]}]])
+def test_required_success_keeps_invalid_metric_fallback_and_empty_responses(data):
+    request = MagicMock(
+        side_effect=[
+            APIError("Invalid metric", status_code=400, raw_response={"error": {"code": 100}}),
+            _resp({"data": data}),
+        ]
+    )
+    values, errors = fetch_insights_safe(
+        request,
+        platform="Instagram",
+        endpoint="https://graph.facebook.com/ig-1/insights",
+        access_token="user",
+        metrics=["unsupported", "reach"],
+        require_success=True,
+    )
+    assert values == ({"reach": 0} if data else {})
+    assert set(errors) == {"unsupported"}
+
+
 def test_parse_insights_response_prefers_lifetime_when_metric_name_repeats():
     values = parse_insights_response(
         {

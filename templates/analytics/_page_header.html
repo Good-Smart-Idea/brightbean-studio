@@ -20,12 +20,12 @@
                         {% else %}
                             <div style="width: 32px; height: 32px; border-radius: 50%; background: var(--neutral-200); display: flex; align-items: center; justify-content: center; font-weight: 700; color: var(--text-secondary);">{{ active_account.account_name|make_list|first|upper }}</div>
                         {% endif %}
-                        <div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
+                        {% if active_account.platform != "youtube" %}<div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
                             {% include "partials/_platform_icon.html" with platform=active_account.platform size="sm" %}
-                        </div>
+                        </div>{% endif %}
                     </div>
                     <span style="text-align: left;">
-                        <span style="display: block; font-size: 0.875rem; font-weight: 600; color: var(--neutral-900); line-height: 1.1;">{{ active_account.account_name }}</span>
+                        <span style="display: block; font-size: 0.875rem; font-weight: 600; color: var(--neutral-900); line-height: 1.1;">{{ active_account.account_name }}{% if active_account.platform == "youtube" %} <small>YouTube</small>{% endif %}</span>
                         <span style="display: block; font-size: 0.6875rem; color: var(--text-tertiary);">@{{ active_account.account_handle|strip_leading_at }}</span>
                     </span>
                     <svg width="16" height="16" fill="none" stroke="var(--neutral-400)" viewBox="0 0 24 24" stroke-width="2" style="margin-left: 2px;"><path d="M19 9l-7 7-7-7"/></svg>
@@ -42,13 +42,13 @@
                                 {% else %}
                                     <div style="width: 30px; height: 30px; border-radius: 50%; background: var(--neutral-200); display: flex; align-items: center; justify-content: center; font-weight: 700; color: var(--text-secondary);">{{ acc.account_name|make_list|first|upper }}</div>
                                 {% endif %}
-                                <div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
+                                {% if acc.platform != "youtube" %}<div class="absolute -bottom-0.5 -right-0.5 w-4 h-4 bg-white rounded-full flex items-center justify-center">
                                     {% include "partials/_platform_icon.html" with platform=acc.platform size="sm" %}
-                                </div>
+                                </div>{% endif %}
                             </div>
                             <span style="flex: 1; min-width: 0;">
-                                <span style="display: block; font-size: 0.8125rem; font-weight: 600; color: var(--neutral-900); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ acc.account_name }}</span>
-                                <span style="display: block; font-size: 0.6875rem; color: var(--text-tertiary);">{{ acc.follower_count|intcomma }} followers</span>
+                                <span style="display: block; font-size: 0.8125rem; font-weight: 600; color: var(--neutral-900); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ acc.account_name }}{% if acc.platform == "youtube" %} <small>YouTube</small>{% endif %}</span>
+                                <span style="display: block; font-size: 0.6875rem; color: var(--text-tertiary);">{{ acc.follower_count|intcomma }} {% if acc.platform == "youtube" %}subscribers{% else %}followers{% endif %}</span>
                             </span>
                             {% if acc.analytics_unavailable_reason %}
                                 {% comment %}
@@ -69,19 +69,21 @@
 
             {% if not is_fresh %}
             <div style="display: flex; align-items: center; gap: 18px;">
+                {% if active_account.platform != "youtube" %}
                 <div>
                     <div style="font-size: 0.6875rem; color: var(--text-ghost); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">Followers</div>
                     <div class="a-mono" style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary);">{{ active_account.follower_count|intcomma }}</div>
                 </div>
+                {% endif %}
                 {% if follower_growth %}
-                <div style="width: 1px; height: 28px; background: var(--neutral-200);"></div>
+                {% if active_account.platform != "youtube" %}<div style="width: 1px; height: 28px; background: var(--neutral-200);"></div>{% endif %}
                 <div>
                     <div style="font-size: 0.6875rem; color: var(--text-ghost); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">
                         {% if active_account.platform == "youtube" %}New subscribers{% else %}New followers{% endif %}
                     </div>
                     <div style="display: flex; align-items: center; gap: 7px;">
-                        <span class="a-mono" style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary);">+{{ follower_growth.value|floatformat:0 }}</span>
-                        <span class="a-delta {{ follower_growth.delta|delta_color }}">{{ follower_growth.delta|fmt_signed }}</span>
+                        <span class="a-mono" style="font-size: 0.9375rem; font-weight: 700; color: var(--text-primary);"{% if follower_growth.estimated %} title="Calculated by BrightBean from the change in follower totals"{% endif %}>+{{ follower_growth.value|floatformat:0 }}</span>
+                        {% if follower_growth.comparison_available %}{% include "analytics/_delta_chip.html" with delta=follower_growth.delta %}{% endif %}
                     </div>
                 </div>
                 {% endif %}
@@ -89,7 +91,7 @@
             {% endif %}
         </div>
 
-        {% if not is_fresh %}
+        {% if not is_fresh or active_account.platform == "youtube" %}
         {# Range toggle #}
         <div class="a-pill-group">
             {% for n in range_choices %}

@@ -69,6 +69,7 @@
                 <p class="text-sm" style="color: var(--text-secondary);">
                     This organization is scheduled for deletion on <strong>{{ organization.deletion_scheduled_for|date:"F j, Y" }}</strong>.
                     All workspaces, posts, social accounts, media, and team data will be permanently removed after this date.
+                    YouTube connections and API data have already been deleted. Cancelling will require reconnecting YouTube.
                 </p>
             </div>
             <div class="flex flex-col gap-3 shrink-0">
@@ -150,11 +151,11 @@
     {% else %}
     <!-- Normal state -->
     <div x-data="{ showDeleteModal: false }">
-        <div class="flex items-start justify-between gap-4">
+        <div class="flex flex-col sm:flex-row items-start justify-between gap-4">
             <div>
                 <h3 class="text-base font-semibold mb-1" style="color: var(--text-primary);">Delete this organization</h3>
                 <p class="text-sm" style="color: var(--text-secondary); max-width: 480px;">
-                    Permanently delete this organization and all of its data. This includes all workspaces, scheduled posts, social accounts, media assets, and team memberships.
+                    Request deletion of this organization and its workspaces, posts, media and team memberships. YouTube connections and API data are removed immediately. Other data has a 14-day grace period. Cancelling requires reconnecting YouTube.
                 </p>
             </div>
 
@@ -188,7 +189,7 @@
                     <!-- Body -->
                     <div class="px-6 py-5">
                         <p class="text-sm mb-3" style="color: var(--text-secondary);">
-                            Are you sure you want to delete <strong>{{ organization.name }}</strong>? This will schedule the organization for permanent deletion in 14 days.
+                            Are you sure you want to delete <strong>{{ organization.name }}</strong>? This will schedule the organization for permanent deletion in 14 days. YouTube connections, API data and notification copies are deleted immediately. Cancelling deletion will require reconnecting YouTube.
                         </p>
                         <p class="text-sm" style="color: var(--text-secondary);">
                             All of the following will be permanently removed:

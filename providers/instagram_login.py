@@ -26,7 +26,13 @@ from .meta_comments import (
     resolve_comment_reply_target,
 )
 from .meta_insights import fetch_insights_safe
-from .meta_messaging import build_send_payload, resolve_recipient_id
+from .meta_messaging import (
+    build_send_payload,
+    dm_extra,
+    require_message_id,
+    resolve_recipient_id,
+    validate_instagram_text,
+)
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -81,7 +87,7 @@ INSTAGRAM_MEDIA_FIELDS = [
 
 # Container polling
 CONTAINER_POLL_INTERVAL = 2  # seconds
-CONTAINER_POLL_MAX_ATTEMPTS = 60  # ~2 minutes max
+CONTAINER_POLL_TIMEOUT = 120  # seconds
 
 
 class InstagramLoginProvider(SocialProvider):
@@ -90,6 +96,11 @@ class InstagramLoginProvider(SocialProvider):
     Authenticates Professional (Business or Creator) Instagram accounts
     directly through Instagram, without requiring a linked Facebook Page.
     """
+
+    # Publishes from hosted URLs only — the platform fetches the media
+    # itself, so ``PublishContent.media_files`` is never read and the engine
+    # can skip downloading the asset to local disk entirely.
+    needs_local_media = False
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -118,7 +129,10 @@ class InstagramLoginProvider(SocialProvider):
 
     @property
     def supported_post_types(self) -> list[PostType]:
-        return [PostType.IMAGE, PostType.CAROUSEL, PostType.REEL, PostType.STORY]
+        # VIDEO is accepted (and published as a Reel) even though Instagram has
+        # no standalone feed video, because an explicit post_type hint can still
+        # deliver it.
+        return [PostType.IMAGE, PostType.VIDEO, PostType.CAROUSEL, PostType.REEL, PostType.STORY]
 
     @property
     def supported_media_types(self) -> list[MediaType]:
@@ -298,6 +312,7 @@ class InstagramLoginProvider(SocialProvider):
             raise PublishError(
                 "Instagram requires at least one media item",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         if content.post_type == PostType.CAROUSEL and len(content.media_urls) > 1:
@@ -309,19 +324,26 @@ class InstagramLoginProvider(SocialProvider):
         if content.text:
             payload["caption"] = content.text
 
-        if content.post_type == PostType.REEL:
-            payload["media_type"] = "REELS"
-            payload["video_url"] = content.media_urls[0]
-        elif content.post_type == PostType.STORY:
-            url = content.media_urls[0]
+        # Route on what the asset *is*, not only on which post types name a
+        # video: any post type carrying a video has to reach a video field, or
+        # the .mp4 goes out as image_url and Instagram rejects it with "The
+        # image format is not supported" (36001).
+        url = content.media_urls[0]
+        is_video = content.is_video(0)
+
+        if content.post_type == PostType.STORY:
             payload["media_type"] = "STORIES"
-            if url.lower().endswith((".mp4", ".mov")):
-                payload["video_url"] = url
-            else:
-                payload["image_url"] = url
+            payload["video_url" if is_video else "image_url"] = url
+        elif is_video or content.post_type in (PostType.REEL, PostType.VIDEO):
+            # Instagram has no standalone feed video: a single video is
+            # published as a Reel. This also catches a lone video that arrived
+            # under some other post type — PostType.VIDEO (the engine's
+            # fallback for one video asset) or a CAROUSEL that ended up with a
+            # single item.
+            payload["media_type"] = "REELS"
+            payload["video_url"] = url
         else:
-            # Default IMAGE
-            payload["image_url"] = content.media_urls[0]
+            payload["image_url"] = url
 
         container_id = self._create_container(access_token, payload)
         self._wait_for_container(access_token, container_id)
@@ -330,10 +352,9 @@ class InstagramLoginProvider(SocialProvider):
     def _publish_carousel(self, access_token: str, content: PublishContent) -> PublishResult:
         child_ids: list[str] = []
 
-        for url in content.media_urls:
-            is_video = url.lower().endswith((".mp4", ".mov"))
+        for index, url in enumerate(content.media_urls):
             child_payload: dict = {"is_carousel_item": True}
-            if is_video:
+            if content.is_video(index):
                 child_payload["media_type"] = "VIDEO"
                 child_payload["video_url"] = url
             else:
@@ -373,7 +394,8 @@ class InstagramLoginProvider(SocialProvider):
 
     def _wait_for_container(self, access_token: str, container_id: str) -> None:
         """Poll container status until FINISHED or error."""
-        for _ in range(CONTAINER_POLL_MAX_ATTEMPTS):
+
+        def finished() -> bool:
             resp = self._request(
                 "GET",
                 f"{API_BASE}/{container_id}",
@@ -382,21 +404,19 @@ class InstagramLoginProvider(SocialProvider):
             )
             data = resp.json()
             status = data.get("status_code", "")
-
-            if status == "FINISHED":
-                return
             if status == "ERROR":
                 raise PublishError(
                     f"Instagram container failed: {data.get('status', 'unknown error')}",
                     platform=self.platform_name,
                     raw_response=data,
                 )
+            return status == "FINISHED"
 
-            time.sleep(CONTAINER_POLL_INTERVAL)
-
-        raise PublishError(
-            "Instagram container processing timed out",
-            platform=self.platform_name,
+        self._poll_until(
+            finished,
+            deadline=time.monotonic() + CONTAINER_POLL_TIMEOUT,
+            interval=CONTAINER_POLL_INTERVAL,
+            on_timeout=lambda: PublishError("Instagram container processing timed out", platform=self.platform_name),
         )
 
     def _publish_container(self, access_token: str, container_id: str) -> PublishResult:
@@ -538,7 +558,7 @@ class InstagramLoginProvider(SocialProvider):
                 messages.extend(fetch(access_token, since))
             except Exception as exc:
                 failures.append(exc)
-                logger.warning("Instagram Login %s poll failed: %s", label, exc)
+                logger.warning("Instagram Login %s poll failed: error_type=%s", label, type(exc).__name__)
 
         if failures and not messages:
             raise failures[0]
@@ -563,7 +583,7 @@ class InstagramLoginProvider(SocialProvider):
         )
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        params: dict = {"fields": "id,participants,messages{id,message,from,created_time}"}
+        params: dict = {"fields": "id,participants,messages{id,message,from,created_time,attachments}"}
         if since:
             params["since"] = int(since.timestamp())
 
@@ -596,7 +616,7 @@ class InstagramLoginProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the IGSID the messaging endpoint replies to.
-                        extra={"conversation_id": convo["id"], "sender_id": sender_id},
+                        extra=dm_extra(msg, sender_id=sender_id, conversation_id=convo["id"]),
                     )
                 )
         return messages
@@ -619,6 +639,7 @@ class InstagramLoginProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
+        validate_instagram_text(text, platform=self.platform_name)
         payload = build_send_payload(igsid, text, human_agent=human_agent)
 
         resp = self._request(
@@ -628,7 +649,7 @@ class InstagramLoginProvider(SocialProvider):
             json=payload,
         )
         data = resp.json()
-        return ReplyResult(platform_message_id=data.get("message_id", ""), extra=data)
+        return ReplyResult(platform_message_id=require_message_id(data, platform=self.platform_name), extra=data)
 
     def reply_to_comment(self, access_token: str, comment_id: str, text: str, extra: dict | None = None) -> ReplyResult:
         """Reply to a comment, or comment on a media item.

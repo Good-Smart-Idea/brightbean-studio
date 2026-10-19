@@ -30,6 +30,47 @@ logger = logging.getLogger(__name__)
 MAX_AUTOMATIC_RETRIES = 5
 
 
+def _account_provider(account, **overrides):
+    extra = {}
+    if account.platform == "instagram":
+        extra = {
+            "page_id": account.webhook_target_id,
+            "ig_user_id": account.account_platform_id,
+            "missing_scopes": account.missing_scopes,
+            "messaging_access": account.messaging_access,
+        }
+    return _get_provider_for_platform(account.platform, account.workspace.organization_id, **(extra | overrides))
+
+
+def _same_app(left, right):
+    from apps.credentials.models import resolve_platform_credentials
+
+    left_creds = resolve_platform_credentials(left.platform, left.workspace.organization_id)
+    right_creds = resolve_platform_credentials(right.platform, right.workspace.organization_id)
+    left_id = left_creds.get("client_id") or left_creds.get("app_id")
+    right_id = right_creds.get("client_id") or right_creds.get("app_id")
+    if left_id and right_id:
+        return str(left_id) == str(right_id)
+    return left.workspace.organization_id == right.workspace.organization_id
+
+
+def _page_subscription_is_shared(account):
+    from django.db.models import Q
+
+    page_id = account.account_platform_id if account.platform == "facebook" else account.webhook_target_id
+    if not page_id:
+        return False
+    candidates = (
+        SocialAccount.objects.filter(
+            Q(platform="facebook", account_platform_id=page_id) | Q(platform="instagram", webhook_target_id=page_id),
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        .exclude(pk=account.pk)
+        .select_related("workspace")
+    )
+    return any(_same_app(account, other) for other in candidates)
+
+
 def webhook_target(account):
     """The object whose webhooks we subscribe for this account: the account itself.
 
@@ -69,7 +110,7 @@ def subscribe_account_webhooks(account) -> bool:
     nothing happened.
     """
     try:
-        provider = _get_provider_for_platform(account.platform, account.workspace.organization_id)
+        provider = _account_provider(account)
     except Exception:
         logger.exception("Could not build provider to subscribe webhooks for %s", account.id)
         # Almost always missing or misconfigured app credentials. Recorded
@@ -87,7 +128,13 @@ def subscribe_account_webhooks(account) -> bool:
     try:
         subscribed = provider.subscribe_webhooks(account.oauth_access_token, webhook_target(account))
     except Exception as exc:
-        logger.exception("Webhook subscription failed for %s (%s)", account.id, account.platform)
+        from providers.exceptions import WebhookChannelError
+
+        if isinstance(exc, WebhookChannelError):
+            logger.warning("Webhook channel subscription failed for %s (%s)", account.id, account.platform)
+            record_subscription_result(account, False, str(exc), needs_reconnect=exc.needs_reconnect, detail=str(exc))
+            return False
+        logger.warning("Webhook subscription failed for %s (%s): %s", account.id, account.platform, type(exc).__name__)
         failure = classify_webhook_failure(exc)
         record_subscription_result(
             account,
@@ -98,6 +145,19 @@ def subscribe_account_webhooks(account) -> bool:
         )
         return False
 
+    if (
+        subscribed
+        and account.platform == "instagram"
+        and not account.webhook_target_id
+        and not account.instagram_dm_permission_request_disabled
+    ):
+        record_subscription_result(
+            account,
+            False,
+            "Comment notifications are connected. Reconnect Instagram to enable DM notifications on its linked Page.",
+            needs_reconnect=True,
+        )
+        return False
     if not subscribed:
         logger.warning(
             "%s declined the webhook subscription for account %s; its comments will only arrive by polling.",
@@ -174,9 +234,13 @@ def retry_failed_subscription(account) -> bool:
         return False
     if account.webhooks_active is not False:
         return False
-    if account.webhook_needs_reconnect:
+    warning = account.webhook_warning
+    if warning is not None and warning.needs_reconnect:
         return False
-    if (account.webhook_retry_count or 0) >= MAX_AUTOMATIC_RETRIES:
+    # A DM-only verdict no longer applies after its consent scope is disabled.
+    # Recheck comments once even if that obsolete failure exhausted the budget;
+    # success resets it, and any new failure resumes the normal retry limits.
+    if warning is not None and (account.webhook_retry_count or 0) >= MAX_AUTOMATIC_RETRIES:
         logger.info(
             "Not retrying webhooks for %s: %d automatic attempts already spent.",
             account.id,
@@ -204,6 +268,7 @@ def subscribe_account_webhooks_task(account_id):
         logger.info("Account %s gone before webhooks could be subscribed.", account_id)
         return
     record_missing_scopes(account)
+    account.refresh_from_db(fields=["missing_scopes"])
     subscribe_account_webhooks(account)
 
 
@@ -215,15 +280,18 @@ def _webhook_target_is_shared(account) -> bool:
     would silence the others' inboxes too, so we leave it in place and let the
     revoked token end our access.
     """
-    return (
+    if account.platform == "facebook" and _page_subscription_is_shared(account):
+        return True
+    candidates = (
         SocialAccount.objects.filter(
             platform=account.platform,
             connection_status=SocialAccount.ConnectionStatus.CONNECTED,
             account_platform_id=webhook_target(account),
         )
         .exclude(pk=account.pk)
-        .exists()
+        .select_related("workspace")
     )
+    return any(_same_app(account, other) for other in candidates)
 
 
 def unsubscribe_account_webhooks(account) -> bool:
@@ -236,7 +304,7 @@ def unsubscribe_account_webhooks(account) -> bool:
         return False
 
     try:
-        provider = _get_provider_for_platform(account.platform, account.workspace.organization_id)
+        provider = _account_provider(account, preserve_page_subscription=_page_subscription_is_shared(account))
         return provider.unsubscribe_webhooks(account.oauth_access_token, webhook_target(account))
     except Exception:
         logger.warning(
@@ -251,9 +319,12 @@ def record_missing_scopes(account) -> list[str]:
     """Note which requested scopes the grant came back without.
 
     Runs on the same post-connect task as the webhook subscription so the
-    OAuth redirect stays free of blocking round trips. Best-effort: a platform
-    that cannot answer leaves the field untouched rather than claiming nothing
-    was granted.
+    OAuth redirect stays free of blocking round trips, which means it always
+    follows a fresh grant. Best-effort: a readback that fails leaves the field
+    untouched, so a transient error can't erase a real warning. A platform
+    that has no way to answer (``None``) is different — nothing can be known
+    missing from the new grant, so any earlier verdict about the old one, such
+    as the flag migration 0021 put on every Pinterest account, is cleared.
     """
     try:
         provider = _get_provider_for_platform(account.platform, account.workspace.organization_id)
@@ -267,11 +338,26 @@ def record_missing_scopes(account) -> list[str]:
         logger.exception("Could not read granted scopes for %s (%s)", account.id, account.platform)
         return []
 
+    filters = {"pk": account.pk}
+    if account.platform == "instagram":
+        filters["analytics_credentials_version"] = account.analytics_credentials_version
     if granted is None:
+        SocialAccount.objects.filter(**filters).update(missing_scopes=[])
         return []
 
     missing = sorted(set(provider.required_scopes) - granted)
-    SocialAccount.objects.filter(pk=account.pk).update(missing_scopes=missing)
+    if account.platform == "instagram":
+        from apps.analytics.instagram_access import INSIGHTS_SCOPE, grant_details
+
+        missing = [scope for scope in missing if scope != INSIGHTS_SCOPE]
+        try:
+            _, user_scopes = grant_details(account, provider)
+        except Exception:
+            user_scopes = None
+            logger.warning("Could not inspect Instagram analytics consent for account %s", account.pk)
+        if INSIGHTS_SCOPE in provider.required_scopes and user_scopes is not None and INSIGHTS_SCOPE not in user_scopes:
+            missing.append(INSIGHTS_SCOPE)
+    SocialAccount.objects.filter(**filters).update(missing_scopes=sorted(missing))
     if missing:
         logger.warning(
             "Account %s (%s) connected without %s; those features will fail.",

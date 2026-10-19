@@ -1,10 +1,12 @@
 """Background tasks for social account health checks."""
 
 import logging
-from datetime import timedelta
 
 from background_task import background
 from django.utils import timezone
+
+from apps.common import quota
+from providers.exceptions import QuotaExceededError
 
 from .webhooks import retry_failed_subscription
 
@@ -18,6 +20,16 @@ EXPIRY_BOOTSTRAP_PLATFORMS = ("bluesky", "threads")
 
 @background(schedule=0)
 def check_social_account_health(account_id: str):
+    """Maintain account health without scheduling historical analytics work."""
+    from apps.analytics.signals import suppress_analytics_backfills
+
+    # Some platform-specific checks reload the account before saving tokens.
+    # An instance flag alone does not cover those saves; a scoped guard does.
+    with suppress_analytics_backfills():
+        _check_social_account_health(account_id)
+
+
+def _check_social_account_health(account_id: str):
     """Check health of a single social account.
 
     Validates the OAuth token by calling get_profile(). If the token
@@ -25,13 +37,21 @@ def check_social_account_health(account_id: str):
     """
     from providers import get_provider
 
-    from .error_messages import friendly_health_check_error
+    from .error_messages import friendly_health_check_error, quota_blocked_message
     from .models import SocialAccount
 
     try:
         account = SocialAccount.objects.get(id=account_id)
     except SocialAccount.DoesNotExist:
         logger.warning("Health check: account %s not found, skipping", account_id)
+        return
+
+    if account.platform == "youtube":
+        from django.conf import settings
+
+        from .youtube_compliance import check_connection
+
+        check_connection(account, enforce=settings.YOUTUBE_COMPLIANCE_ENFORCEMENT)
         return
 
     # Resolve per-account credentials via the shared resolver: org/.env app creds
@@ -59,13 +79,7 @@ def check_social_account_health(account_id: str):
     needs_expiry_bootstrap = account.platform in EXPIRY_BOOTSTRAP_PLATFORMS and account.token_expires_at is None
     if (account.is_token_expiring_soon or needs_expiry_bootstrap) and account.oauth_refresh_token:
         try:
-            new_tokens = provider.refresh_token(account.oauth_refresh_token)
-            account.oauth_access_token = new_tokens.access_token
-            if new_tokens.refresh_token:
-                account.oauth_refresh_token = new_tokens.refresh_token
-            if new_tokens.expires_in:
-                account.token_expires_at = timezone.now() + timedelta(seconds=new_tokens.expires_in)
-            account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
+            account.refresh_oauth_token(provider, enqueue_backfill=False)
             account.last_error = ""
             logger.info("Health check: refreshed token for %s", account)
         except Exception as e:
@@ -73,44 +87,94 @@ def check_social_account_health(account_id: str):
             account.connection_status = SocialAccount.ConnectionStatus.TOKEN_EXPIRING
             account.last_error = friendly_health_check_error(e)
 
-    # Validate token by fetching profile
-    try:
-        profile = provider.get_profile(account.oauth_access_token)
-        account.follower_count = profile.follower_count
-        # Provider CDNs (TikTok, Meta) return signed avatar URLs that
-        # expire; display names and handles can also change on-platform.
-        # Guard each write so a transient empty response doesn't wipe
-        # previously-good values.
-        if profile.avatar_url:
-            account.avatar_url = profile.avatar_url
-        if profile.name:
-            account.account_name = profile.name
-        if profile.handle:
-            account.account_handle = profile.handle
-        if account.connection_status != SocialAccount.ConnectionStatus.TOKEN_EXPIRING:
-            account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
-        account.last_error = ""
-    except Exception as e:
-        logger.warning("Health check: profile fetch failed for %s: %s", account, e)
-        account.connection_status = SocialAccount.ConnectionStatus.ERROR
-        account.last_error = friendly_health_check_error(e)
+    # A block already recorded means the platform has told us it will refuse
+    # until the window rolls over. Probing anyway spends a unit from the very
+    # budget that is exhausted — and on YouTube that budget is also what
+    # reconnecting draws on, so the probe competes with the recovery it is
+    # trying to detect.
+    #
+    # Skipped rather than returned early so the card records the quota block.
+    # Any refreshed token is already saved. The refresh itself is unaffected —
+    # Google meters the token endpoint separately from the Data API.
+    #
+    # ``read_scope`` rather than a literal, so this, the inbox poll and the
+    # analytics sync resolve one breaker row instead of three that never meet.
+    credential = quota.credential_key(credentials)
+    scope = quota.read_scope(account.platform)
+    blocked_until = quota.quota_blocked_until(account.platform, credential, scope)
+
+    if blocked_until:
+        # Deliberately no status change: a spent budget says nothing about the
+        # grant, and the last check's verdict is still the best one we have.
+        logger.info(
+            "Health check probe deferred for %s: %s quota blocked until %s",
+            account,
+            account.platform,
+            blocked_until.isoformat(),
+        )
+        # Say so on the card. Leaving ``last_error`` untouched showed a healthy
+        # CONNECTED account for the whole outage while its inbox, analytics and
+        # publishing all silently did nothing — the opposite of what recording
+        # the block was for.
+        account.last_error = quota_blocked_message(account.platform, blocked_until)
+    else:
+        # Validate token by fetching profile
+        try:
+            profile = provider.get_profile(account.oauth_access_token)
+            account.follower_count = profile.follower_count
+            # Provider CDNs (TikTok, Meta) return signed avatar URLs that
+            # expire; display names and handles can also change on-platform.
+            # Guard each write so a transient empty response doesn't wipe
+            # previously-good values.
+            if profile.avatar_url:
+                account.avatar_url = profile.avatar_url
+            if profile.name:
+                account.account_name = profile.name
+            if profile.handle:
+                account.account_handle = profile.handle
+            if account.connection_status != SocialAccount.ConnectionStatus.TOKEN_EXPIRING:
+                account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
+            account.last_error = ""
+        except QuotaExceededError as e:
+            # YouTube reports a spent daily quota as a 403. It says nothing about
+            # the OAuth grant, so do not turn a recoverable platform budget window
+            # into ERROR — that would remove the account from this scheduler's
+            # CONNECTED/TOKEN_EXPIRING selection until someone reconnects it.
+            logger.warning("Health check: quota exhausted for %s: %s", account, e)
+            # Arm the breaker. This check runs on its own schedule and can be
+            # the first to learn the budget is spent; recording nothing left the
+            # inbox and the analytics sync to each rediscover it at the cost of
+            # another doomed request against the same exhausted client budget.
+            quota.trip_from_exception(account.platform, credential, e)
+            if account.connection_status in (
+                SocialAccount.ConnectionStatus.CONNECTED,
+                SocialAccount.ConnectionStatus.ERROR,
+            ):
+                account.connection_status = SocialAccount.ConnectionStatus.CONNECTED
+            account.last_error = friendly_health_check_error(e)
+        except Exception as e:
+            logger.warning("Health check: profile fetch failed for %s: %s", account, e)
+            account.connection_status = SocialAccount.ConnectionStatus.ERROR
+            account.last_error = friendly_health_check_error(e)
 
     account.last_health_check_at = timezone.now()
-    account.save(
-        update_fields=[
-            "oauth_access_token",
-            "oauth_refresh_token",
-            "token_expires_at",
-            "follower_count",
-            "avatar_url",
-            "account_name",
-            "account_handle",
-            "connection_status",
-            "last_error",
-            "last_health_check_at",
-            "updated_at",
-        ]
-    )
+    fields = [
+        "follower_count",
+        "avatar_url",
+        "account_name",
+        "account_handle",
+        "connection_status",
+        "last_error",
+        "last_health_check_at",
+        "updated_at",
+    ]
+    # Tokens were saved inside the shared refresh lock. Saving only metadata
+    # here preserves any publisher refresh that happened during get_profile.
+    account._skip_analytics_backfill = True
+    try:
+        account.save(update_fields=fields)
+    finally:
+        del account._skip_analytics_backfill
 
     # A fix for a broken subscription is worthless if nothing re-runs it; this
     # is the only thing that does so unattended. Bounded inside

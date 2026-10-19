@@ -26,7 +26,10 @@ from uuid import UUID
 
 from background_task import background
 from django.db import transaction
+from django.db.models import F, Q
 from django.utils import timezone
+
+from providers.exceptions import APIError, QuotaExceededError, TokenExpiredError
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,56 @@ def post_sync_interval(age: timedelta) -> timedelta | None:
         if max_age is None or age < max_age:
             return interval
     return None  # unreachable — the table always ends in (None, None)
+
+
+# ---------------------------------------------------------------------------
+# Failure backoff — the other half of the cadence.
+# ---------------------------------------------------------------------------
+
+# A post whose fetch fails writes no snapshot, so cadence alone cannot slow it
+# down; without a backoff it is "due" on every tick forever. These bounds are
+# the ladder's own: start at its tightest rung and stop at its loosest, so a
+# failing post is never retried more often than a brand-new one nor less often
+# than a three-month-old one.
+_SYNC_FAILURE_BACKOFF_BASE = timedelta(hours=1)
+_SYNC_FAILURE_BACKOFF_MAX = timedelta(days=7)
+
+# The doubling reaches the cap at nine failures, but the stored counter keeps
+# growing — a post failing for a year lands in the hundreds. Clamping the
+# exponent keeps the arithmetic honest; without it the multiplication overflows
+# long before the ``min()`` gets a chance to apply the cap.
+_SYNC_FAILURE_MAX_DOUBLINGS = 16
+
+# How close to expiry an access token has to be before the sync spends a refresh
+# call on it. This is a clock-skew margin, not a schedule: a Google access token
+# lives one hour, so anything wider is permanently true and would buy a refresh
+# call per account per hour for nothing, while anything narrower risks handing a
+# token to an API call that expires mid-pass. Contrast
+# ``apps.publisher.engine._PUBLISH_REFRESH_WINDOW``, which is user-triggered and
+# can afford to be generous.
+_ANALYTICS_REFRESH_WINDOW = timedelta(minutes=10)
+
+# The optional YouTube Analytics per-video fetch is independent of the Data
+# API post sync. Retry only that fetch, twice, rather than replaying a full
+# account backfill after an upstream 5xx.
+_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS = (timedelta(hours=1), timedelta(hours=3))
+
+
+def _analytics_failure_backoff(failure_count: int) -> timedelta:
+    """How long to leave a post alone after ``failure_count`` failures in a row.
+
+    Doubles from one hour and caps at a week: 1h, 2h, 4h, 8h … A post that
+    cannot be fetched at all (deleted video, revoked visibility) settles at one
+    wasted call a week instead of one an hour, while a post failing for a
+    transient reason is back within the hour.
+    """
+    if failure_count <= 0:
+        return timedelta(0)
+    # Clamp the shift before doing it: the cap is reached by the ninth failure,
+    # but the counter keeps climbing, and ``timedelta * 2**40`` raises
+    # OverflowError rather than saturating.
+    doublings = min(failure_count - 1, _SYNC_FAILURE_MAX_DOUBLINGS)
+    return min(_SYNC_FAILURE_BACKOFF_BASE * (2**doublings), _SYNC_FAILURE_BACKOFF_MAX)
 
 
 # Per-platform backfill window (days) on initial connect.
@@ -173,6 +226,20 @@ def _post_metrics_to_dict(metrics, platform: str) -> dict[str, float]:
             out[key] = float(v)
 
     extra = getattr(metrics, "extra", {}) or {}
+    if platform == "youtube":
+        # Reported zero is different from an absent Data/Analytics API field.
+        native = dict(extra.get("reported_metrics", {}))
+        if "reported_metrics" not in extra:
+            for source, key in (("video_views", "views"), ("likes", "likes"), ("comments", "comments")):
+                value = getattr(metrics, source, 0)
+                if value:
+                    native[key] = float(value)
+        if getattr(metrics, "shares", 0):
+            native["shares"] = float(metrics.shares)
+        for key in ("watch_time", "avg_view_pct", "shares"):
+            if key in extra:
+                native[key] = float(extra[key])
+        return native
     # Generic extras that match the catalog key exactly.
     for key in _GENERIC_POST_EXTRA_KEYS:
         v = extra.get(key)
@@ -276,6 +343,119 @@ def _resolve_provider(account):
     return get_provider(account.platform, _resolve_publish_credentials(account))
 
 
+def _analytics_provider_and_token(account) -> tuple:
+    """Provider plus an access token fresh enough to survive this account's pass.
+
+    The sync used to hand ``account.oauth_access_token`` straight to the
+    provider, unrefreshed. For a platform whose access token lives an hour and
+    whose only refresher is a six-hourly health check, that meant roughly five
+    of every six hourly runs called the API with a token that had already
+    expired — every call failing, every post left looking un-synced, and (before
+    the backoff below) every post therefore retried again an hour later.
+
+    Best-effort, like the publish path: a refresh we cannot complete leaves the
+    old token in place so the API call surfaces the real error instead of a
+    refresh error. The exception is a refusal that says the *grant* is gone —
+    retrying that forever is pointless and invisible, so flag the account and
+    let the health check, which owns ``connection_status``, decide the rest.
+    """
+    provider = _resolve_provider(account)
+    if account.platform == "instagram":
+        from .instagram_access import resolve_token
+
+        account._instagram_analytics_failed = False
+        account._instagram_analytics_status_recorded = None
+        if account.oauth_facebook_user_access_token:
+            return provider, resolve_token(account)
+    access_token = account.oauth_access_token
+    if not (account.token_expires_within(_ANALYTICS_REFRESH_WINDOW) and account.oauth_refresh_token):
+        return provider, access_token
+
+    try:
+        access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
+    except Exception as exc:
+        if account.platform == "youtube":
+            from apps.social_accounts.youtube_compliance import permanent_grant_rejection, purge_connection
+
+            if permanent_grant_rejection(exc):
+                purge_connection(account, check_generation=True)
+                raise TokenExpiredError("YouTube authorization was permanently rejected", platform="youtube") from exc
+        if _is_dead_grant(exc):
+            logger.warning("analytics: OAuth grant for %s is gone (%s); flagging for reconnect", account, exc)
+            _mark_needs_reconnect(account)
+            if account.platform != "instagram":
+                _enqueue_health_check(account)
+        else:
+            logger.warning("analytics: token refresh failed for %s: %s", account, exc)
+    return provider, access_token
+
+
+def _is_dead_grant(exc: Exception) -> bool:
+    """Whether a refresh failure means the user's grant is gone for good.
+
+    Classified with the same machinery the health check and the connection UI
+    use, rather than by sniffing the message, so the three surfaces cannot drift
+    on what counts as "reconnect required". A network blip or a 5xx on the token
+    endpoint classifies as something else and is left alone — retrying is the
+    right move there.
+    """
+    from apps.social_accounts.error_messages import _RECONNECT, _classify
+
+    try:
+        return _classify(exc) == _RECONNECT
+    except Exception:  # pragma: no cover - classification must never break the sync
+        return False
+
+
+def _enqueue_health_check(account) -> None:
+    """Hand a dead grant to the task that owns ``connection_status``.
+
+    Deliberately not writing ``connection_status`` / ``last_error`` from here:
+    ``apps.social_accounts.tasks.check_social_account_health`` is their single
+    documented writer, and setting ``TOKEN_EXPIRING`` from the analytics path
+    would also silently stop inbox polling, which filters on ``CONNECTED``.
+    """
+    from apps.social_accounts.tasks import check_social_account_health
+
+    with contextlib.suppress(Exception):
+        check_social_account_health(str(account.id))
+
+
+def _record_post_sync_success(post_ids: list, now=None) -> None:
+    """Stamp the attempt and clear the failure streak for posts we just fetched.
+
+    Uses ``update()`` rather than ``instance.save()`` so it can never write back
+    a stale copy of a row the publish engine is touching concurrently.
+    """
+    if not post_ids:
+        return
+    from apps.composer.models import PlatformPost
+
+    PlatformPost.objects.filter(pk__in=post_ids).update(
+        analytics_attempted_at=now or timezone.now(),
+        analytics_failure_count=0,
+    )
+
+
+def _record_post_sync_failure(post_ids: list, now=None) -> None:
+    """Stamp the attempt and extend the failure streak for posts that came back empty.
+
+    Only for a call that actually reached the platform and returned no data for
+    *that id*. A quota block, an expired token, or any other account-wide
+    refusal must NOT come through here: those posts were never really attempted,
+    and counting them would exile perfectly good posts for a week because of a
+    problem that had nothing to do with them.
+    """
+    if not post_ids:
+        return
+    from apps.composer.models import PlatformPost
+
+    PlatformPost.objects.filter(pk__in=post_ids).update(
+        analytics_attempted_at=now or timezone.now(),
+        analytics_failure_count=F("analytics_failure_count") + 1,
+    )
+
+
 def _is_insufficient_scope(exc: Exception) -> bool:
     """Best-effort recognition of "you don't have the right scope" errors.
 
@@ -327,8 +507,41 @@ def _write_post_snapshot(
     *,
     raw: dict | None = None,
     errors: dict | None = None,
+    youtube_generation: int | None = None,
 ) -> int:
     from .models import PostInsightsSnapshot
+
+    if post.social_account.platform == "youtube":
+        from django.db import transaction
+
+        from apps.social_accounts.models import SocialAccount
+
+        # The expected generation belongs to the grant used for the request.
+        # A lazy SocialAccount lookup after HTTP can see a renewed connection.
+        if youtube_generation is None:
+            return 0
+        with transaction.atomic():
+            if (
+                not SocialAccount.objects.select_for_update()
+                .filter(
+                    pk=post.social_account_id,
+                    youtube_data_generation=youtube_generation,
+                )
+                .exists()
+            ):
+                return 0
+            if not type(post).objects.filter(pk=post.pk).exists():
+                return 0
+            count = 0
+            for key, value in metric_values.items():
+                PostInsightsSnapshot.objects.update_or_create(
+                    platform_post=post,
+                    metric_key=key,
+                    date=on_date,
+                    defaults={"value": value, "raw": raw or {}, "errors": errors or {}},
+                )
+                count += 1
+            return count
 
     if not metric_values:
         return 0
@@ -381,7 +594,15 @@ def _needs_empty_follower_count_refresh(account) -> bool:
     return account.follower_count <= 0 and account.platform in _FOLLOWER_TOTAL_REFRESH_PLATFORMS
 
 
-def _sync_account_metrics(account, on_date: dt_date, *, force_today: bool = False) -> None:
+def _sync_account_metrics(
+    account,
+    on_date: dt_date,
+    *,
+    force_today: bool = False,
+    provider=None,
+    access_token: str | None = None,
+    deadline=None,
+) -> None:
     """Fetch account-level metrics for ``on_date`` and any recent missing days.
 
     Walks ``on_date`` and the prior ``_ACCOUNT_METRICS_RECENT_DAYS - 1`` days,
@@ -402,13 +623,35 @@ def _sync_account_metrics(account, on_date: dt_date, *, force_today: bool = Fals
     For YouTube, also fetches per-video Analytics-API metrics (watch_time,
     avg_view_pct, shares) that the Data API can't provide per-post — see
     :func:`_sync_youtube_post_analytics`.
+
+    ``provider`` / ``access_token`` let a caller that is already iterating an
+    account's work resolve them once and pass them down. Resolving per call
+    means re-reading the account's credentials and decrypting its token every
+    time; more importantly, a token resolved here is refreshed here, so the
+    caller and the callee could otherwise end up holding different ones.
+
+    ``deadline`` bounds the optional YouTube Analytics per-video sweep so a
+    large channel cannot consume the entire hourly task budget in one account.
     """
     from datetime import datetime, time
 
     from .metrics import PLATFORM_METRICS
     from .models import AccountInsightsSnapshot
 
-    provider = _resolve_provider(account)
+    if provider is None or access_token is None:
+        provider, access_token = _analytics_provider_and_token(account)
+    if account.platform == "youtube":
+        from .youtube_reports import sync_channel_reports
+
+        try:
+            sync_channel_reports(account, provider, access_token, force=force_today)
+        except (QuotaExceededError, TokenExpiredError):
+            raise
+        except Exception as exc:
+            _record_analytics_error(account, exc, provider)
+            logger.warning("YouTube channel report failed for %s (%s)", account.pk, type(exc).__name__)
+        _sync_youtube_post_analytics(account, provider, access_token, on_date, deadline=deadline)
+        return
     tz = timezone.get_current_timezone()
     # Providers whose stats endpoint returns only lifetime totals (TikTok)
     # must NOT have those totals written into past dates as if they were
@@ -432,14 +675,19 @@ def _sync_account_metrics(account, on_date: dt_date, *, force_today: bool = Fals
         start = datetime.combine(target, time.min, tzinfo=tz)
         end = datetime.combine(target, time.max, tzinfo=tz)
         try:
-            metrics = provider.get_account_metrics(account.oauth_access_token, (start, end))
+            metrics = provider.get_account_metrics(access_token, (start, end))
         except NotImplementedError:
             return
+        except (QuotaExceededError, TokenExpiredError):
+            # These are account-wide outcomes. Let _sync_one_account trip the
+            # quota breaker or flag the token instead of turning them into a
+            # per-day warning that the hourly cron quietly forgets.
+            raise
         except Exception as exc:
-            if _is_insufficient_scope(exc):
-                _mark_needs_reconnect(account)
+            _record_analytics_error(account, exc, provider)
             logger.warning("get_account_metrics failed for %s on %s: %s", account, target, exc)
             return
+        _record_instagram_success(account)
         _refresh_follower_count(account, metrics)
         fetched_followers = getattr(metrics, "followers", None)
         if fetched_followers is not None:
@@ -463,10 +711,18 @@ def _sync_account_metrics(account, on_date: dt_date, *, force_today: bool = Fals
         _write_account_snapshot(account, {"followers": float(current_followers)}, on_date)
 
     if account.platform == "youtube":
-        _sync_youtube_post_analytics(account, provider, on_date)
+        _sync_youtube_post_analytics(account, provider, access_token, on_date, deadline=deadline)
 
 
-def _sync_youtube_post_analytics(account, provider, on_date: dt_date) -> None:
+def _sync_youtube_post_analytics(
+    account,
+    provider,
+    access_token: str,
+    on_date: dt_date,
+    *,
+    deadline=None,
+    retry_attempt: int = 0,
+) -> None:
     """Snapshot lifetime per-video YouTube Analytics metrics for ``on_date``.
 
     Bridges the gap between the YouTube Data API (which exposes per-video
@@ -486,6 +742,7 @@ def _sync_youtube_post_analytics(account, provider, on_date: dt_date) -> None:
 
     from apps.composer.models import PlatformPost
 
+    youtube_generation = account.youtube_data_generation
     post_ids = list(
         PlatformPost.objects.filter(
             social_account=account,
@@ -498,18 +755,49 @@ def _sync_youtube_post_analytics(account, provider, on_date: dt_date) -> None:
     if not post_ids:
         return
 
+    if deadline is not None and timezone.now() >= deadline:
+        logger.warning(
+            "analytics: stopped YouTube post analytics for %s — %s budget spent; next tick resumes",
+            account,
+            _RUN_BUDGET,
+        )
+        return
+
     tz = timezone.get_current_timezone()
     start = datetime.combine(_YOUTUBE_ANALYTICS_LIFETIME_START, time.min, tzinfo=tz)
     end = datetime.combine(on_date, time.max, tzinfo=tz)
 
     try:
-        per_video = provider.get_post_analytics(account.oauth_access_token, post_ids, (start, end))
+        per_video = provider.get_post_analytics(access_token, post_ids, (start, end), deadline=deadline)
     except NotImplementedError:
         return
+    except (QuotaExceededError, TokenExpiredError):
+        # The Analytics API failure applies to the account, not to each video.
+        # The caller owns breaker/reconnect handling and must see it.
+        raise
     except Exception as exc:
-        if _is_insufficient_scope(exc):
-            _mark_needs_reconnect(account)
-        logger.warning("get_post_analytics failed for %s on %s: %s", account, on_date, exc)
+        _record_analytics_error(account, exc, provider)
+        retryable = isinstance(exc, APIError) and exc.status_code is not None and exc.status_code >= 500
+        if retryable and retry_attempt < len(_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS):
+            delay = _YOUTUBE_POST_ANALYTICS_RETRY_DELAYS[retry_attempt]
+            retry_youtube_post_analytics(
+                str(account.id),
+                on_date.isoformat(),
+                retry_attempt + 1,
+                schedule=int(delay.total_seconds()),
+                remove_existing_tasks=True,
+            )
+        else:
+            delay = None
+        logger.warning(
+            "YouTube optional per-video Analytics failed for account %s on %s: status=%s error_type=%s; "
+            "Data API post metrics are independent; next_retry=%s",
+            account.id,
+            on_date,
+            getattr(exc, "status_code", None),
+            type(exc).__name__,
+            delay,
+        )
         return
 
     if not per_video:
@@ -530,33 +818,137 @@ def _sync_youtube_post_analytics(account, provider, on_date: dt_date) -> None:
             on_date,
             raw=extra.get("raw_insights", extra),
             errors=extra.get("insight_errors", {}),
+            youtube_generation=youtube_generation,
         )
 
+    if retry_attempt:
+        logger.info("YouTube optional per-video Analytics retry recovered account %s on %s", account.id, on_date)
 
-def _sync_post_metrics(post, on_date: dt_date) -> None:
-    """Fetch this post's current metrics and write today's snapshot rows."""
-    account = post.social_account
-    if account.platform in {"facebook", "instagram", "instagram_login"} and _looks_like_uuid(post.platform_post_id):
+
+@background(schedule=0)
+def retry_youtube_post_analytics(account_id: str, on_date_iso: str, attempt: int) -> None:
+    """Retry only the optional Analytics API call after a transient 5xx."""
+    from apps.common import quota
+    from apps.social_accounts.models import SocialAccount
+
+    from . import services
+
+    try:
+        account = SocialAccount.objects.get(id=account_id)
+    except SocialAccount.DoesNotExist:
+        return
+    if (
+        account.platform != "youtube"
+        or account.connection_status != SocialAccount.ConnectionStatus.CONNECTED
+        or account.analytics_needs_reconnect
+        or services.analytics_availability(account.platform) is not None
+    ):
+        return
+    if attempt < 1 or attempt > len(_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS):
+        return
+
+    on_date = dt_date.fromisoformat(on_date_iso)
+    try:
+        provider, access_token = _analytics_provider_and_token(account)
+    except Exception as exc:
+        logger.warning(
+            "YouTube optional Analytics retry could not build provider for account %s: error_type=%s",
+            account.id,
+            type(exc).__name__,
+        )
+        return
+
+    key = quota.credential_key(getattr(provider, "credentials", None))
+    blocked_until = quota.quota_blocked_until("youtube", key, "analytics")
+    if blocked_until:
+        # A quota block does not spend a 5xx retry. Preserve this account/date
+        # even when the regular daily account snapshot prevents another fetch.
+        retry_youtube_post_analytics(
+            account_id,
+            on_date_iso,
+            attempt,
+            schedule=blocked_until + timedelta(seconds=1),
+            remove_existing_tasks=True,
+        )
+        logger.info(
+            "YouTube optional Analytics retry deferred for account %s until %s due to quota block",
+            account.id,
+            blocked_until,
+        )
+        return
+
+    try:
+        _sync_youtube_post_analytics(
+            account,
+            provider,
+            access_token,
+            on_date,
+            deadline=timezone.now() + _RUN_BUDGET,
+            retry_attempt=attempt,
+        )
+    except QuotaExceededError as exc:
+        _handle_quota_exhaustion(account, exc, key=key, scope="analytics", cache={})
+    except TokenExpiredError:
+        logger.warning("YouTube optional Analytics retry token rejected for account %s", account.id)
+        _mark_needs_reconnect(account)
+        if account.platform != "instagram":
+            _enqueue_health_check(account)
+
+
+def _has_unusable_platform_post_id(post, platform: str) -> bool:
+    """Meta posts whose ``platform_post_id`` is really an internal UUID.
+
+    A publish that half-failed can leave our own row id in the field; calling
+    Meta with it is guaranteed to fail, so skip without spending the request.
+    """
+    if platform in {"facebook", "instagram", "instagram_login"} and _looks_like_uuid(post.platform_post_id):
         logger.warning(
             "Skipping %s analytics for PlatformPost %s because platform_post_id looks like an internal UUID.",
-            account.platform,
+            platform,
             post.id,
         )
+        return True
+    return False
+
+
+def _sync_post_metrics(post, on_date: dt_date, *, provider=None, access_token: str | None = None) -> None:
+    """Fetch one post's current metrics and write today's snapshot rows.
+
+    The single-post path, used by platforms without a batch endpoint. Callers
+    inside an account loop pass ``provider`` / ``access_token`` so they are
+    resolved once rather than per post — resolving them here meant a credential
+    query and a token decrypt for every post on the channel.
+    """
+    account = post.social_account
+    if _has_unusable_platform_post_id(post, account.platform):
         return
-    provider = _resolve_provider(account)
+    if provider is None or access_token is None:
+        provider, access_token = _analytics_provider_and_token(account)
+    youtube_generation = account.youtube_data_generation if account.platform == "youtube" else None
     try:
-        metrics = provider.get_post_metrics(account.oauth_access_token, post.platform_post_id)
+        metrics = provider.get_post_metrics(access_token, post.platform_post_id)
     except NotImplementedError:
         return
+    except (QuotaExceededError, TokenExpiredError):
+        raise
     except Exception as exc:
-        if _is_insufficient_scope(exc):
-            _mark_needs_reconnect(account)
+        _record_analytics_error(account, exc, provider)
         logger.warning("get_post_metrics failed for post %s (%s): %s", post.id, account.platform, exc)
+        _record_post_sync_failure([post.pk])
         return
+    _record_instagram_success(account)
+    _write_post_metrics_snapshot(post, metrics, account.platform, on_date, youtube_generation=youtube_generation)
+    _record_post_sync_success([post.pk])
+
+
+def _write_post_metrics_snapshot(
+    post, metrics, platform: str, on_date: dt_date, *, youtube_generation: int | None = None
+) -> None:
+    """Write today's snapshot rows for one post's fetched metrics."""
     extra = getattr(metrics, "extra", {}) or {}
     _write_post_snapshot(
         post,
-        _post_metrics_to_dict(metrics, account.platform),
+        _post_metrics_to_dict(metrics, platform),
         on_date,
         raw={
             "fields": extra.get("raw_fields", {}),
@@ -565,7 +957,184 @@ def _sync_post_metrics(post, on_date: dt_date) -> None:
             "attempted_insight_post_ids": extra.get("attempted_insight_post_ids", []),
         },
         errors=extra.get("insight_errors", {}),
+        youtube_generation=youtube_generation,
     )
+
+
+def _sync_account_posts(
+    account,
+    provider,
+    access_token: str,
+    posts,
+    on_date: dt_date,
+    *,
+    deadline=None,
+) -> tuple[int, int, int]:
+    """Sync per-post metrics for one account. Returns ``(synced, failed, api_calls)``.
+
+    Prefers the platform's batched endpoint when it has one: YouTube's
+    ``videos.list`` charges the same single quota unit for fifty ids as for one,
+    so asking one at a time spent fifty times the quota it needed to. Platforms
+    without a batch endpoint keep the per-post loop, which costs the same number
+    of requests either way and buys per-post error isolation — one bad id there
+    must not cost the rest of the account.
+
+    Raises :class:`QuotaExceededError` / :class:`TokenExpiredError` to the
+    caller: those are account-wide verdicts, not facts about any one post, and
+    the caller needs them to trip the breaker. Crucially, they leave every post's
+    sync state untouched — see :func:`_record_post_sync_failure`.
+    """
+    posts = [p for p in posts if not _has_unusable_platform_post_id(p, account.platform)]
+    if not posts:
+        return 0, 0, 0
+
+    batch_size = max(1, getattr(provider, "post_metrics_batch_size", 1))
+    if batch_size == 1:
+        return _sync_account_posts_individually(
+            account,
+            provider,
+            access_token,
+            posts,
+            on_date,
+            deadline=deadline,
+        )
+
+    youtube_generation = account.youtube_data_generation if account.platform == "youtube" else None
+    synced = failed = api_calls = 0
+    first_error = None
+    for offset in range(0, len(posts), batch_size):
+        if deadline is not None and timezone.now() >= deadline:
+            logger.warning(
+                "analytics: stopped post sync for %s — %s budget spent; next tick resumes",
+                account,
+                _RUN_BUDGET,
+            )
+            break
+        chunk = posts[offset : offset + batch_size]
+        by_platform_id = {p.platform_post_id: p for p in chunk}
+        api_calls += 1
+        try:
+            metrics_by_id = provider.get_post_metrics_batch(access_token, list(by_platform_id))
+        except NotImplementedError:
+            return synced, failed, api_calls - 1
+        except (QuotaExceededError, TokenExpiredError):
+            # A quota or token failure is not a fact about this chunk. Leave all
+            # post state untouched and let the account-level handler decide.
+            raise
+        except Exception as exc:
+            # A regular API/transport failure belongs to this chunk only. Stamp
+            # those posts so a bad response cannot make the whole account due
+            # again on the next tick, then continue with later chunks.
+            first_error = first_error or exc
+            _record_analytics_error(account, exc, provider)
+            attempted_at = timezone.now()
+            _record_post_sync_failure([p.pk for p in by_platform_id.values()], attempted_at)
+            failed += len(by_platform_id)
+            logger.debug(
+                "get_post_metrics_batch failed for %s (%s), %s posts: %s",
+                account,
+                account.platform,
+                len(by_platform_id),
+                exc,
+            )
+            continue
+
+        # Everything below is local work. The transaction opens only once the
+        # HTTP call has returned, so a slow platform never holds a database
+        # connection open across the network — and one chunk's rows still land
+        # together or not at all.
+        attempted_at = timezone.now()
+        hit_ids, miss_ids = [], []
+        with transaction.atomic():
+            for platform_post_id, post in by_platform_id.items():
+                metrics = metrics_by_id.get(platform_post_id)
+                if metrics is None:
+                    # Absent from the response: deleted, made private, or not
+                    # ours. Never write zeros — that would flatten real history.
+                    miss_ids.append(post.pk)
+                    continue
+                _write_post_metrics_snapshot(
+                    post, metrics, account.platform, on_date, youtube_generation=youtube_generation
+                )
+                hit_ids.append(post.pk)
+
+            _record_post_sync_success(hit_ids, attempted_at)
+            _record_post_sync_failure(miss_ids, attempted_at)
+        synced += len(hit_ids)
+        failed += len(miss_ids)
+
+    if first_error is not None:
+        logger.warning(
+            "analytics: %s of %s batched post metric fetches failed for %s (%s) — first error: %s",
+            failed,
+            synced + failed,
+            account,
+            account.platform,
+            first_error,
+        )
+    return synced, failed, api_calls
+
+
+def _sync_account_posts_individually(
+    account,
+    provider,
+    access_token,
+    posts,
+    on_date,
+    *,
+    deadline=None,
+) -> tuple[int, int, int]:
+    """Per-post fallback for platforms with no batch endpoint.
+
+    Each post's failure is contained to that post — which is the whole reason
+    this path still exists — but an account-wide verdict still propagates, so a
+    dead token doesn't quietly burn the whole channel one request at a time.
+    """
+    youtube_generation = account.youtube_data_generation if account.platform == "youtube" else None
+    synced = failed = api_calls = 0
+    first_error = None
+    for post in posts:
+        if deadline is not None and timezone.now() >= deadline:
+            logger.warning(
+                "analytics: stopped post sync for %s — %s budget spent; next tick resumes",
+                account,
+                _RUN_BUDGET,
+            )
+            break
+        try:
+            metrics = provider.get_post_metrics(access_token, post.platform_post_id)
+        except NotImplementedError:
+            return synced, failed, api_calls
+        except (QuotaExceededError, TokenExpiredError):
+            raise
+        except Exception as exc:
+            api_calls += 1
+            failed += 1
+            first_error = first_error or exc
+            _record_analytics_error(account, exc, provider)
+            logger.debug("get_post_metrics failed for post %s (%s): %s", post.id, account.platform, exc)
+            _record_post_sync_failure([post.pk], timezone.now())
+            continue
+        api_calls += 1
+        _record_instagram_success(account)
+        attempted_at = timezone.now()
+        with transaction.atomic():
+            _write_post_metrics_snapshot(
+                post, metrics, account.platform, on_date, youtube_generation=youtube_generation
+            )
+            _record_post_sync_success([post.pk], attempted_at)
+        synced += 1
+
+    if first_error is not None:
+        logger.warning(
+            "analytics: %s of %s post metric fetches failed for %s (%s) — first error: %s",
+            failed,
+            synced + failed,
+            account,
+            account.platform,
+            first_error,
+        )
+    return synced, failed, api_calls
 
 
 def _looks_like_uuid(value: str) -> bool:
@@ -588,7 +1157,30 @@ def _refresh_follower_count(account, metrics) -> None:
     account.save(update_fields=["follower_count", "updated_at"])
 
 
+def _record_analytics_error(account, exc, provider):
+    if account.platform == "instagram":
+        from .instagram_access import record_failure
+
+        record_failure(account, exc, provider)
+    elif _is_insufficient_scope(exc):
+        _mark_needs_reconnect(account)
+
+
+def _record_instagram_success(account):
+    if account.platform == "instagram":
+        from .instagram_access import record_success
+
+        record_success(account)
+
+
 def _mark_needs_reconnect(account):
+    if account.platform == "instagram":
+        from apps.social_accounts.models import SocialAccount
+
+        from .instagram_access import record_status
+
+        record_status(account, SocialAccount.AnalyticsStatus.RECONNECT, "expired_user_token")
+        return
     if account.analytics_needs_reconnect:
         return
     account.analytics_needs_reconnect = True
@@ -596,27 +1188,48 @@ def _mark_needs_reconnect(account):
 
 
 def _post_cadence_due(post, now=None, *, platform: str | None = None) -> bool:
-    """Decide whether ``post`` is due for a new ``_sync_post_metrics`` sync.
+    """Decide whether ``post`` is due for a new per-post metrics fetch.
 
-    Looks at the latest ``PostInsightsSnapshot.captured_at`` for ``post`` and
-    compares it against the decay schedule. Excludes the platform-specific
-    Analytics-only metric keys listed in
-    :data:`_POST_NON_CADENCE_METRICS_BY_PLATFORM` so a snapshot written by a
-    different sync path (the batched YouTube per-video Analytics fetch in
-    :func:`_sync_youtube_post_analytics`) doesn't reset the cadence and
-    starve the Data-API loop of refreshes.
+    Driven by ``PlatformPost.analytics_attempted_at`` — when we last *tried* —
+    rather than by when we last succeeded. That distinction is the whole point.
+    Cadence used to be read from the newest ``PostInsightsSnapshot.captured_at``,
+    and a failed fetch writes no snapshot, so a post that kept failing looked
+    never-synced and came back due on every single hourly tick, ignoring the
+    decay ladder entirely. Multiply that by every post on a channel and an
+    account-wide problem (an expired token, say) turns into a self-sustaining
+    storm that empties a day of API quota in an hour and then keeps failing
+    *because* the quota is empty.
+
+    On top of the ladder, a post with a failure streak waits out
+    :func:`_analytics_failure_backoff`, so something permanently unfetchable
+    settles at one wasted call a week.
+
+    Posts with no attempt stamp — rows written before the field existed — fall
+    back to the old snapshot signal. That fallback is what lets this ship with
+    no data migration: each such post takes the branch at most once, because the
+    first attempt stamps it. (It is also the last thing keeping
+    :data:`_POST_NON_CADENCE_METRICS_BY_PLATFORM` alive; once no row has a null
+    stamp, both can go.)
 
     ``platform`` may be supplied by callers iterating posts of a known
     account to avoid the implicit ``post.social_account.platform`` lookup.
     """
-    from .models import PostInsightsSnapshot
-
     now = now or timezone.now()
     if not post.published_at:
         return False
     cadence = post_sync_interval(now - post.published_at)
     if cadence is None:
         return False  # past the 90-day horizon.
+
+    attempted = post.analytics_attempted_at
+    if attempted is not None:
+        wait = cadence
+        if post.analytics_failure_count:
+            wait = max(cadence, _analytics_failure_backoff(post.analytics_failure_count))
+        return (now - attempted) >= wait
+
+    from .models import PostInsightsSnapshot
+
     qs = PostInsightsSnapshot.objects.filter(platform_post=post)
     platform = platform or post.social_account.platform
     excluded = _POST_NON_CADENCE_METRICS_BY_PLATFORM.get(platform)
@@ -629,11 +1242,157 @@ def _post_cadence_due(post, now=None, *, platform: str | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Per-account orchestration
+# ---------------------------------------------------------------------------
+
+# How long one cron pass may spend before it stops and leaves the rest to the
+# next tick. Half the hourly interval, so a long pass can never still be running
+# when its successor is due — django-background-tasks' MAX_RUN_TIME defaults to
+# 3600s, exactly the repeat interval, so an over-running pass gets unlocked and
+# can overlap itself. Fixing that globally is not an option: the same worker
+# runs the publish cycle, where an unlock-and-rerun risks a double post.
+#
+# This is only safe because per-post attempt stamps make a truncated pass
+# resumable, and because ``_due_posts_for`` orders by attempt time nulls-first
+# so the next tick continues where this one stopped instead of re-walking the
+# same head of the queue. Removing either would turn this into starvation.
+_RUN_BUDGET = timedelta(minutes=30)
+
+
+def _due_posts_for(account, now):
+    """Posts of ``account`` that could plausibly be due, cheapest-first.
+
+    Narrows in SQL before loading: the ladder's tightest rung is one hour, so
+    anything attempted within the last hour is provably not due and need not be
+    fetched at all. The remainder is ordered by attempt time, nulls first, so a
+    pass cut short by ``_RUN_BUDGET`` resumes with the longest-neglected posts
+    rather than re-walking the same ones every tick.
+    """
+    from apps.composer.models import PlatformPost
+
+    cap_days = BACKFILL_DAYS_PER_PLATFORM.get(account.platform, DEFAULT_BACKFILL_DAYS)
+    if cap_days == 0:
+        return []
+    return list(
+        PlatformPost.objects.filter(
+            social_account=account,
+            status=PlatformPost.Status.PUBLISHED,
+            published_at__gte=now - timedelta(days=cap_days),
+        )
+        .exclude(platform_post_id="")
+        .filter(
+            Q(analytics_attempted_at__isnull=True) | Q(analytics_attempted_at__lte=now - _SYNC_FAILURE_BACKOFF_BASE)
+        )
+        .order_by(F("analytics_attempted_at").asc(nulls_first=True))
+    )
+
+
+def _handle_quota_exhaustion(account, exc, *, key: str, scope: str | None = None, cache) -> None:
+    """Record the block so the rest of this pass — and the next — stop calling.
+
+    The platform has already answered "not until later". Every further request
+    against that credential is a guaranteed failure that still costs a request
+    and still logs, which is how one bad hour used to turn into a bad week.
+
+    A thin wrapper now: the decision moved to ``apps.common.quota`` once the
+    inbox needed it too, because the second copy is where the scope fallbacks
+    silently diverged and split the breaker in two.
+    """
+    from apps.common import quota
+
+    if account.platform == "instagram":
+        _record_analytics_error(account, exc, None)
+    quota.trip_from_exception(
+        account.platform,
+        key,
+        exc,
+        default_scope=scope if scope is not None else "",
+        fallback_backoff=_SYNC_FAILURE_BACKOFF_BASE,
+        cache=cache,
+    )
+
+
+def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadline=None) -> tuple[int, int, int]:
+    """Run one account's whole analytics pass. Returns ``(synced, failed, api_calls)``.
+
+    Quota and token verdicts are caught here rather than per post: they are
+    facts about the account — or about the credential behind it — and the only
+    useful response is to stop and let the breaker say when to try again.
+    Handling them here is also what keeps them off the per-post failure
+    counters, so an account-wide outage cannot exile every good post for a week.
+    """
+    from apps.common import quota
+
+    from .models import AccountInsightsSnapshot
+
+    try:
+        provider, access_token = _analytics_provider_and_token(account)
+    except Exception as exc:
+        logger.warning("analytics: could not build provider for %s: %s", account, exc)
+        return 0, 0, 0
+
+    key = quota.credential_key(getattr(provider, "credentials", None))
+    account_scope, post_scope = quota.scopes_for(account.platform)
+
+    def blocked(scope):
+        return quota.quota_blocked_until(account.platform, key, scope, cache=cache)
+
+    try:
+        if not blocked(account_scope):
+            has_today_rows = AccountInsightsSnapshot.objects.filter(social_account=account, date=on_date).exists()
+            if account.platform == "youtube":
+                from .models import YouTubePeriodReport
+                from .youtube_reports import reporting_window
+
+                report_start, report_end = reporting_window(7)
+                has_today_rows = YouTubePeriodReport.objects.filter(
+                    social_account=account,
+                    start_date=report_start,
+                    end_date=report_end,
+                    captured_at__gte=now - timedelta(hours=24),
+                ).exists()
+            if not account.analytics_needs_reconnect and (
+                force_today or not has_today_rows or _needs_empty_follower_count_refresh(account)
+            ):
+                try:
+                    _sync_account_metrics(
+                        account,
+                        on_date,
+                        force_today=force_today,
+                        provider=provider,
+                        access_token=access_token,
+                        deadline=deadline,
+                    )
+                except QuotaExceededError as exc:
+                    _handle_quota_exhaustion(account, exc, key=key, scope=account_scope, cache=cache)
+                    if account_scope == post_scope:
+                        return 0, 0, 0
+
+        if blocked(post_scope):
+            return 0, 0, 0
+        due = [p for p in _due_posts_for(account, now) if _post_cadence_due(p, now, platform=account.platform)]
+        return _sync_account_posts(account, provider, access_token, due, on_date, deadline=deadline)
+    except QuotaExceededError as exc:
+        _handle_quota_exhaustion(account, exc, key=key, scope=post_scope, cache=cache)
+        return 0, 0, 0
+    except TokenExpiredError as exc:
+        # Refused after we already tried to refresh, so the grant itself is
+        # suspect. Hand it to the task that owns connection_status, and do not
+        # count it against any post — none of them were really attempted.
+        logger.warning("analytics: %s rejected our token for %s; flagging for reconnect", account.platform, account)
+        _mark_needs_reconnect(account)
+        if account.platform != "instagram":
+            _enqueue_health_check(account)
+        logger.debug("token rejection detail for %s: %s", account, exc)
+        return 0, 0, 0
+
+
+# ---------------------------------------------------------------------------
 # Public entrypoints
 # ---------------------------------------------------------------------------
 
 
-@background(schedule=0)
+@background(schedule=0, remove_existing_tasks=True)
 def backfill_account_analytics(account_id: str, days: int | None = None) -> None:
     """One-shot backfill on account connect / reconnect.
 
@@ -642,8 +1401,12 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     deferred until we extend providers to return daily series).
 
     Per-post: for every published post within the platform's window, fetch
-    its current cumulative metrics and write today's snapshot rows.
+    its current cumulative metrics and write today's snapshot rows. Goes
+    through the same batched path as the cron, so connecting a channel with
+    three months of history costs a handful of API calls rather than one per
+    post.
     """
+    from apps.common import quota
     from apps.composer.models import PlatformPost
     from apps.social_accounts.models import SocialAccount
 
@@ -659,25 +1422,94 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     if cap == 0:
         return
     days = min(days or cap, cap)
-    today = timezone.now().date()
-    cutoff = timezone.now() - timedelta(days=days)
+    now = timezone.now()
+    today = now.date()
+    cache: dict = {}
 
-    _sync_account_metrics(account, today, force_today=True)
+    try:
+        provider, access_token = _analytics_provider_and_token(account)
+    except Exception as exc:
+        logger.warning("analytics: could not build provider for %s: %s", account, exc)
+        return
 
-    posts = PlatformPost.objects.filter(
-        social_account=account,
-        status=PlatformPost.Status.PUBLISHED,
-        published_at__gte=cutoff,
-    ).exclude(platform_post_id="")
-    for post in posts:
-        with transaction.atomic():
-            _sync_post_metrics(post, today)
+    key = quota.credential_key(getattr(provider, "credentials", None))
+    account_scope, post_scope = quota.scopes_for(account.platform)
+
+    try:
+        if not quota.quota_blocked_until(account.platform, key, account_scope, cache=cache):
+            try:
+                _sync_account_metrics(
+                    account,
+                    today,
+                    force_today=True,
+                    provider=provider,
+                    access_token=access_token,
+                )
+            except QuotaExceededError as exc:
+                _handle_quota_exhaustion(account, exc, key=key, scope=account_scope, cache=cache)
+                if account_scope == post_scope:
+                    return
+
+        if quota.quota_blocked_until(account.platform, key, post_scope, cache=cache):
+            logger.info("analytics: skipping %s backfill — %s quota is spent", account, account.platform)
+            return
+
+        posts = list(
+            PlatformPost.objects.filter(
+                social_account=account,
+                status=PlatformPost.Status.PUBLISHED,
+                published_at__gte=now - timedelta(days=days),
+            ).exclude(platform_post_id="")
+        )
+        synced, failed, api_calls = _sync_account_posts(account, provider, access_token, posts, today)
+    except QuotaExceededError as exc:
+        _handle_quota_exhaustion(account, exc, key=key, scope=post_scope, cache=cache)
+        return
+    except TokenExpiredError:
+        logger.warning("analytics: %s rejected our token during backfill of %s", account.platform, account)
+        _mark_needs_reconnect(account)
+        if account.platform != "instagram":
+            _enqueue_health_check(account)
+        return
+
+    logger.info(
+        "analytics backfill: %s — %s posts synced, %s failed, %s API calls",
+        account,
+        synced,
+        failed,
+        api_calls,
+    )
+
+
+def deduplicate_pending_backfills() -> int:
+    """Keep one pending job per parameter set, including pre-fix backlogs.
+
+    Never remove a locked job. Its platform requests may already be in flight,
+    and a genuine reconnect may have queued a follow-up while it was running.
+    """
+    from background_task.models import Task
+    from django.db.models import Count, Max
+
+    pending = Task.objects.filter(
+        task_name=backfill_account_analytics.name,
+        locked_at__isnull=True,
+        locked_by__isnull=True,
+        failed_at__isnull=True,
+        repeat=0,
+    )
+    duplicates = list(pending.values("task_hash").annotate(count=Count("pk"), keep=Max("pk")).filter(count__gt=1))
+    deleted = 0
+    for group in duplicates:
+        # Recheck locks and only remove jobs older than the snapshot's survivor.
+        # A reconnect can replace the group with a newer job before this DELETE.
+        count, _ = pending.filter(task_hash=group["task_hash"], pk__lt=group["keep"]).delete()
+        deleted += count
+    return deleted
 
 
 @background(schedule=0)
 def sync_all_account_analytics() -> None:
     """Hourly cron: refresh enabled accounts on the decay-by-age schedule."""
-    from apps.composer.models import PlatformPost
     from apps.social_accounts.models import AnalyticsPlatformConfig, SocialAccount
 
     from . import services
@@ -685,47 +1517,51 @@ def sync_all_account_analytics() -> None:
     # Filter on the same predicate the page and the agent API use, not just the
     # admin toggle. A platform with no analytics API at all (DEV.to, Bluesky,
     # ...) is "enabled" as far as AnalyticsPlatformConfig is concerned, and the
-    # ``cap_days == 0`` guard below only skips the per-post loop — so without
-    # this those accounts reached _sync_account_metrics every single hour, built
-    # a provider, and failed. They never write a snapshot row, so ``has_today_rows``
+    # ``cap_days == 0`` guard only skips the per-post loop — so without this
+    # those accounts reached _sync_account_metrics every single hour, built a
+    # provider, and failed. They never write a snapshot row, so ``has_today_rows``
     # never became True and the waste repeated forever.
     enabled = AnalyticsPlatformConfig.enabled_platforms()
     syncable = [p for p in enabled if services.analytics_availability(p, enabled) is None]
     if not syncable:
         return
-    today = timezone.now().date()
+
+    started = timezone.now()
+    today = started.date()
+    deadline = started + _RUN_BUDGET
+    # One breaker lookup per credential per run, not per account: accounts
+    # overwhelmingly share one OAuth client, so without this the breaker would
+    # cost a query per account to answer the same question.
+    cache: dict = {}
 
     accounts = SocialAccount.objects.filter(
         connection_status=SocialAccount.ConnectionStatus.CONNECTED,
         platform__in=syncable,
     ).select_related("workspace")
-    from .models import AccountInsightsSnapshot
 
+    totals = [0, 0, 0]  # synced, failed, api_calls
+    seen = truncated = 0
     for account in accounts:
-        # Account-level: at most once per day per account. Skip if today's
-        # row already exists so an hourly cron doesn't turn into 24 API calls.
-        # Also skip accounts already flagged for analytics reconnect — their
-        # token can't read the Analytics API, so retrying only re-fails and
-        # re-logs every hour. Reconnecting clears the flag and runs a one-shot
-        # backfill (see backfill_account_analytics), so the cron resumes on its
-        # own. The per-post Data-API loop below still runs (it uses the
-        # publish/read scopes the account already has).
-        has_today_rows = AccountInsightsSnapshot.objects.filter(social_account=account, date=today).exists()
-        if not account.analytics_needs_reconnect and (
-            not has_today_rows or _needs_empty_follower_count_refresh(account)
-        ):
-            _sync_account_metrics(account, today)
+        now = timezone.now()
+        if now >= deadline:
+            truncated = 1
+            logger.warning(
+                "analytics sync: stopped after %s accounts — %s budget spent; next tick resumes",
+                seen,
+                _RUN_BUDGET,
+            )
+            break
+        seen += 1
+        result = _sync_one_account(account, today, now, cache=cache, deadline=deadline)
+        totals = [a + b for a, b in zip(totals, result, strict=True)]
 
-        # Per-post: only those whose cadence window has elapsed
-        cap_days = BACKFILL_DAYS_PER_PLATFORM.get(account.platform, DEFAULT_BACKFILL_DAYS)
-        if cap_days == 0:
-            continue
-        cutoff = timezone.now() - timedelta(days=cap_days)
-        posts = PlatformPost.objects.filter(
-            social_account=account,
-            status=PlatformPost.Status.PUBLISHED,
-            published_at__gte=cutoff,
-        ).exclude(platform_post_id="")
-        for post in posts:
-            if _post_cadence_due(post, platform=account.platform):
-                _sync_post_metrics(post, today)
+    blocked = sum(1 for value in cache.values() if value is not None and value > timezone.now())
+    logger.info(
+        "analytics sync: %s accounts, %s posts synced, %s failed, %s API calls, %s credential(s) quota-blocked%s",
+        seen,
+        totals[0],
+        totals[1],
+        totals[2],
+        blocked,
+        " (run truncated)" if truncated else "",
+    )

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import time
+from collections.abc import Callable
 from datetime import datetime
+from functools import partial
 from urllib.parse import urlencode
 
 from .base import SocialProvider
-from .exceptions import OAuthError, PublishError
+from .exceptions import APIError, OAuthError, PublishError
 from .types import (
     AccountProfile,
     AuthType,
@@ -21,11 +26,53 @@ from .types import (
     PublishResult,
     RateLimitConfig,
     ReplyResult,
+    UploadCache,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CHARS = 500
+
+# Mastodon processes video (and large images) after the upload returns: the v2
+# media endpoint answers 202 with a null ``url``, and a status attaching media
+# that is still processing is refused with HTTP 422. Same inline wait as the
+# Instagram, Threads and LinkedIn providers, and the same ~2 minute ceiling: the
+# whole publish cycle waits for the slowest post, so a longer wait delays every
+# other channel's due posts. Media that takes longer is not lost — the upload is
+# remembered and the engine's retry resumes waiting on it instead of uploading
+# (and restarting the transcode) again.
+MEDIA_POLL_INTERVAL = 5  # seconds
+MEDIA_PROCESSING_TIMEOUT = 120  # seconds
+
+# Mastodon deletes unattached media after a day; stay well inside that. A
+# remembered upload is re-checked before use either way.
+UPLOAD_REUSE_TTL = 6 * 3600  # seconds
+
+# How long Mastodon remembers an Idempotency-Key (PostStatusService, setex 3600).
+# A retry after a lost response is only deduplicated inside this window, so the
+# engine's whole retry ladder has to fit in it — pinned by a test.
+IDEMPOTENCY_TTL = 3600  # seconds
+
+# Mastodon's own wording for the 422 above (media_attachments.validations.not_ready).
+_NOT_READY_MARKER = "not finished processing"
+
+# Shown to the user as-is (a PublishError message passes through). The timeout
+# is retryable, so neither may promise a retry that stops being true once the
+# retries run out.
+MEDIA_TIMEOUT_MESSAGE = "Mastodon took too long to process the attached media."
+MEDIA_FAILED_MESSAGE = "Mastodon couldn't process the attached media. Check the file and publish again."
+
+# What GET /api/v1/media/:id says about an attachment.
+_READY = "ready"
+_PROCESSING = "processing"
+# Not there to ask about: attached to a status already, deleted, or a server
+# that implements the upload API but not this endpoint.
+_UNKNOWN = "unknown"
+
+
+def _file_digest(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 class MastodonProvider(SocialProvider):
@@ -225,9 +272,26 @@ class MastodonProvider(SocialProvider):
         """Publish a status to Mastodon."""
         # Upload media first if present
         media_ids: list[str] = []
-        for media_path in content.media_files or []:
-            media_id = self._upload_media(access_token, media_path)
+        digests: list[str] = []
+        processing: list[str] = []
+        for position, media_path in enumerate(content.media_files or []):
+            digest = _file_digest(media_path)
+            cache_key = self._upload_cache_key(access_token, content.idempotency_key, position, digest)
+            media_id, state = self._reuse_or_upload(access_token, media_path, cache_key, content.upload_cache)
             media_ids.append(media_id)
+            digests.append(digest)
+            if state == _PROCESSING:
+                processing.append(media_id)
+
+        deadline = time.monotonic() + MEDIA_PROCESSING_TIMEOUT
+        for media_id in processing:
+            self._poll_until(
+                partial(self._media_settled, access_token, media_id),
+                deadline=deadline,
+                interval=MEDIA_POLL_INTERVAL,
+                on_timeout=self._media_timeout,
+                should_stop=content.should_stop,
+            )
 
         # Build status params
         params: dict = {}
@@ -258,13 +322,13 @@ class MastodonProvider(SocialProvider):
         if content.extra.get("in_reply_to_id"):
             params["in_reply_to_id"] = content.extra["in_reply_to_id"]
 
-        resp = self._request(
-            "POST",
-            f"{self.instance_url}/api/v1/statuses",
-            access_token=access_token,
-            data=params,
+        data = self._create_status(
+            access_token,
+            params,
+            self._idempotency_headers(content.idempotency_key, params, digests),
+            deadline,
+            content.should_stop,
         )
-        data = resp.json()
 
         return PublishResult(
             platform_post_id=data["id"],
@@ -294,8 +358,12 @@ class MastodonProvider(SocialProvider):
     # Media upload
     # ------------------------------------------------------------------
 
-    def _upload_media(self, access_token: str, file_path: str) -> str:
-        """Upload a media file and return its media ID."""
+    def _upload_media(self, access_token: str, file_path: str) -> tuple[str, bool]:
+        """Upload a media file. Returns its media ID and whether it is ready to attach.
+
+        200 means processed; 202 means Mastodon accepted the file and is still
+        processing it, which is the normal answer for video.
+        """
         with open(file_path, "rb") as f:
             resp = self._request(
                 "POST",
@@ -304,7 +372,138 @@ class MastodonProvider(SocialProvider):
                 files={"file": f},
             )
         data = resp.json()
-        return data["id"]
+        return str(data["id"]), resp.status_code == 200
+
+    def _upload_cache_key(self, access_token: str, publish_key: str | None, position: int, digest: str) -> str | None:
+        """Where an upload is remembered, or None when it must not be shared.
+
+        Scoped to one publish (the engine's per-PlatformPost key) and one slot
+        in it. A Mastodon attachment can belong to only one status, so two
+        posts carrying the same file must never be handed the same media ID —
+        they may publish concurrently, and the second would lose its media.
+        Media IDs also belong to one account on one instance; the token stands
+        in for the account and is hashed so it never reaches the cache.
+        """
+        if not publish_key:
+            return None
+        account = hashlib.sha256(f"{self.instance_url}\0{access_token}".encode()).hexdigest()[:32]
+        publish = hashlib.sha256(publish_key.encode()).hexdigest()[:32]
+        return f"mastodon-media:{account}:{publish}:{position}:{digest}"
+
+    def _reuse_or_upload(
+        self, access_token: str, file_path: str, key: str | None, cache: UploadCache | None
+    ) -> tuple[str, str]:
+        """Return a media ID for this file and its state, uploading only if needed.
+
+        An earlier attempt may have uploaded the same bytes and given up while
+        Mastodon was still processing them. Reusing that upload means the retry
+        waits for the transcode already under way rather than starting a new
+        one — otherwise a video that takes longer than one wait never posts.
+        """
+        cached = cache.get(key) if cache is not None and key is not None else None
+        if cached:
+            state = self._media_state(access_token, cached)
+            if state != _UNKNOWN:
+                return cached, state
+            # Attached to a status already (an earlier attempt posted, but its
+            # response was lost) or cleaned up by the instance: it cannot be
+            # attached again. The idempotency key still finds that status.
+        media_id, ready = self._upload_media(access_token, file_path)
+        if cache is not None and key is not None:
+            cache.set(key, media_id, UPLOAD_REUSE_TTL)
+        return media_id, _READY if ready else _PROCESSING
+
+    def _media_state(self, access_token: str, media_id: str) -> str:
+        """Ask Mastodon whether an attachment has finished processing.
+
+        ``GET /api/v1/media/:id`` answers 206 while processing, 200 once done,
+        422 when processing failed, and 404 for media already attached to a
+        status (it only looks at unattached media).
+        """
+        try:
+            resp = self._request(
+                "GET",
+                f"{self.instance_url}/api/v1/media/{media_id}",
+                access_token=access_token,
+            )
+        except APIError as exc:
+            if exc.status_code == 422:
+                # Re-uploading the same file would fail the same way.
+                raise PublishError(
+                    MEDIA_FAILED_MESSAGE,
+                    platform=self.platform_name,
+                    raw_response=exc.raw_response,
+                    retryable=False,
+                ) from exc
+            if exc.status_code in (404, 405, 410, 501):
+                return _UNKNOWN
+            raise
+        return _READY if resp.status_code == 200 else _PROCESSING
+
+    def _media_settled(self, access_token: str, media_id: str) -> bool:
+        return self._media_state(access_token, media_id) != _PROCESSING
+
+    def _media_timeout(self) -> PublishError:
+        return PublishError(MEDIA_TIMEOUT_MESSAGE, platform=self.platform_name)
+
+    @staticmethod
+    def _idempotency_headers(base_key: str | None, params: dict, digests: list[str]) -> dict | None:
+        """Mastodon's Idempotency-Key, scoped to this exact content.
+
+        Mastodon remembers a key for an hour and answers a repeat with the
+        status it already created, so a retry after a lost response (timeout,
+        5xx after the write) cannot post twice. The content is part of the key
+        because Mastodon ignores the body on a repeat: a post edited and
+        rescheduled inside that hour must publish the edit, not be reported
+        as published with what went out before. Media IDs change with every
+        upload, so the files' digests stand in for them.
+        """
+        if not base_key:
+            return None
+        authored = {k: v for k, v in params.items() if k != "media_ids[]"}
+        content = json.dumps({"params": authored, "media": digests}, sort_keys=True)
+        return {"Idempotency-Key": f"{base_key}-{hashlib.sha256(content.encode()).hexdigest()[:16]}"}
+
+    def _create_status(
+        self,
+        access_token: str,
+        params: dict,
+        headers: dict | None,
+        deadline: float,
+        should_stop: Callable[[], bool] | None,
+    ) -> dict:
+        """POST the status, waiting out a 422 for media that is still processing.
+
+        Covers a server that reports readiness a moment before it accepts the
+        status, and one whose media endpoint could not be asked at all. The
+        422 is raised before anything is written, so re-sending is safe.
+        """
+        created: dict = {}
+
+        def attempt() -> bool:
+            try:
+                resp = self._request(
+                    "POST",
+                    f"{self.instance_url}/api/v1/statuses",
+                    access_token=access_token,
+                    headers=headers,
+                    data=params,
+                )
+            except APIError as exc:
+                if exc.status_code == 422 and _NOT_READY_MARKER in str(exc.raw_response.get("error", "")):
+                    return False
+                raise
+            created.update(resp.json())
+            return True
+
+        self._poll_until(
+            attempt,
+            deadline=deadline,
+            interval=MEDIA_POLL_INTERVAL,
+            on_timeout=self._media_timeout,
+            should_stop=should_stop,
+        )
+        return created
 
     # ------------------------------------------------------------------
     # Analytics

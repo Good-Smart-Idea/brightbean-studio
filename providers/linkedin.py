@@ -36,6 +36,13 @@ TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 REVOKE_URL = "https://www.linkedin.com/oauth/v2/revoke"
 API_BASE = "https://api.linkedin.com"
 
+# Ceiling for media fetched from a caller-supplied URL. Mirrors the media
+# library's own 20MB image cap; providers are Django-independent so it is
+# restated here rather than read from settings. LinkedIn's own image limit is
+# well under this, so the constant bounds our disk usage rather than deciding
+# what LinkedIn will accept.
+MAX_REMOTE_MEDIA_BYTES = 20 * 1024 * 1024
+
 # Required headers for LinkedIn REST API.
 # LinkedIn sunsets versioned APIs after ~1 year; bump LinkedIn-Version
 # to the latest YYYYMM at https://learn.microsoft.com/en-us/linkedin/marketing/versioning
@@ -477,6 +484,7 @@ class LinkedInProvider(SocialProvider):
             raise PublishError(
                 "poll_options required in content.extra for LinkedIn poll posts",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         body = self._build_post_body(author, content.text)
@@ -710,23 +718,27 @@ class LinkedInProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def _upload_binary(self, access_token: str, upload_url: str, source: str) -> None:
-        """Read media from a local file path or URL and upload to LinkedIn.
+        """Stream media from a local file path or URL to LinkedIn.
 
         Args:
             source: A local file path or an HTTP(S) URL to download from.
-        """
-        media_bytes = self._read_media_bytes(source)
 
-        with httpx.Client(timeout=120.0) as client:
-            upload_resp = client.put(
-                upload_url,
-                content=media_bytes,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/octet-stream",
-                    **LINKEDIN_HEADERS,
-                },
-            )
+        Never materializes the media as ``bytes``. A local path is handed to
+        httpx as an open file object; a URL is streamed to a temp file first,
+        because a remote URL has no size we control and ``resp.content`` on one
+        is an unbounded read straight into the worker's heap.
+        """
+        with self._media_handle(source) as media:
+            with httpx.Client(timeout=120.0) as client:
+                upload_resp = client.put(
+                    upload_url,
+                    content=media,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/octet-stream",
+                        **LINKEDIN_HEADERS,
+                    },
+                )
             if upload_resp.status_code >= 400:
                 raise PublishError(
                     f"LinkedIn media upload failed: {upload_resp.status_code}",
@@ -735,15 +747,56 @@ class LinkedInProvider(SocialProvider):
                 )
 
     @staticmethod
-    def _read_media_bytes(source: str) -> bytes:
-        """Load media into memory from a local file path or HTTP(S) URL."""
-        if source.startswith(("http://", "https://")):
-            with httpx.Client(timeout=120.0) as client:
-                resp = client.get(source)
+    @contextlib.contextmanager
+    def _media_handle(source: str):
+        """Yield an open, readable file object for a local path or HTTP(S) URL.
+
+        The URL branch is bounded. A local path is something we put there and
+        already size-checked at upload; a URL is supplied by the caller and has
+        no size we control, so streaming it unchecked just moves an unbounded
+        read from the heap onto the dyno's shared ephemeral disk.
+        """
+        if not source.startswith(("http://", "https://")):
+            with open(source, "rb") as f:
+                yield f
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=".linkedin-media") as spool:
+            with httpx.Client(timeout=120.0) as client, client.stream("GET", source) as resp:
                 resp.raise_for_status()
-                return resp.content
-        with open(source, "rb") as f:
-            return f.read()
+                LinkedInProvider._reject_oversize(resp.headers.get("Content-Length"))
+
+                written = 0
+                for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                    written += len(chunk)
+                    # Checked per chunk as well as up front: Content-Length is
+                    # the server's claim, not a guarantee, and it is absent
+                    # entirely on a chunked response.
+                    LinkedInProvider._reject_oversize(written)
+                    spool.write(chunk)
+            spool.flush()
+            spool.seek(0)
+            yield spool
+
+    @staticmethod
+    def _reject_oversize(size) -> None:
+        """Raise if ``size`` exceeds the remote-media ceiling. None is ignored."""
+        if size is None:
+            return
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return
+        if size > MAX_REMOTE_MEDIA_BYTES:
+            raise PublishError(
+                f"Remote media exceeds the {MAX_REMOTE_MEDIA_BYTES // (1024 * 1024)}MB limit.",
+                platform="linkedin",
+                # Deterministic: the file at that URL will be the same size on
+                # every attempt. Without this the engine schedules the full
+                # backoff ladder and re-downloads it each time, to fail
+                # identically, before telling the user anything.
+                retryable=False,
+            )
 
     def _upload_video_chunk(self, upload_url: str, chunk: bytes) -> str:
         """PUT a single video chunk and return its ETag for finalizeUpload.
@@ -792,6 +845,7 @@ class LinkedInProvider(SocialProvider):
             raise PublishError(
                 "No video source provided",
                 platform=self.platform_name,
+                retryable=False,
             )
 
         url = content.media_urls[0]
@@ -823,9 +877,10 @@ class LinkedInProvider(SocialProvider):
         400 MEDIA_ASSET_WAITING_UPLOAD or MEDIA_ASSET_PROCESSING_FAILED — see
         https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/videos-api#api-error-details
         """
-        deadline = time.monotonic() + timeout_seconds
         last_status: str | None = None
-        while True:
+
+        def available() -> bool:
+            nonlocal last_status
             resp = self._request(
                 "GET",
                 f"{API_BASE}/rest/videos/{_encode_urn(video_urn)}",
@@ -834,8 +889,6 @@ class LinkedInProvider(SocialProvider):
             )
             data = resp.json()
             status = data.get("status")
-            if status == "AVAILABLE":
-                return
             if status == "PROCESSING_FAILED":
                 raise PublishError(
                     f"LinkedIn rejected the video during processing: "
@@ -844,12 +897,17 @@ class LinkedInProvider(SocialProvider):
                     raw_response=data,
                 )
             last_status = status
-            if time.monotonic() >= deadline:
-                raise PublishError(
-                    f"Timed out waiting for LinkedIn video to become AVAILABLE (last status: {last_status})",
-                    platform=self.platform_name,
-                )
-            time.sleep(poll_interval)
+            return status == "AVAILABLE"
+
+        self._poll_until(
+            available,
+            deadline=time.monotonic() + timeout_seconds,
+            interval=poll_interval,
+            on_timeout=lambda: PublishError(
+                f"Timed out waiting for LinkedIn video to become AVAILABLE (last status: {last_status})",
+                platform=self.platform_name,
+            ),
+        )
 
     @staticmethod
     def _post_urn_to_url(urn: str) -> str | None:

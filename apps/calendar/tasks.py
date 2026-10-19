@@ -9,12 +9,25 @@ from dateutil.relativedelta import relativedelta
 from django.utils import timezone
 
 from apps.composer.models import PlatformPost, Post, PostMedia
+from apps.composer.services import post_media_types, publish_blocker
 
 from .models import RecurrenceRule
 
 logger = logging.getLogger(__name__)
 
 LOOKAHEAD_DAYS = 90
+
+# Source rows whose future occurrences are still meant to publish on their own.
+# A row the team pulled back to draft, put on hold, or sent for review or
+# rejected has not committed its recurrences either, so those clone as drafts.
+_RECURRING_COMMITTED_STATUSES = frozenset(
+    {
+        PlatformPost.Status.SCHEDULED,
+        PlatformPost.Status.PUBLISHING,
+        PlatformPost.Status.PUBLISHED,
+        PlatformPost.Status.FAILED,
+    }
+)
 
 
 def generate_recurring_posts():
@@ -66,6 +79,10 @@ def generate_recurring_posts():
                 .values_list("scheduled_at__date", flat=True)
             )
 
+        # Every clone carries the source's media, so one answer serves each
+        # recurrence date and platform of this rule.
+        media_types = post_media_types(source)
+
         for d in dates:
             if d in existing_dates or d <= today_local:
                 continue
@@ -85,10 +102,25 @@ def generate_recurring_posts():
             )
 
             # Clone platform posts in bulk, preserving per-platform offsets
-            source_pps = list(source.platform_posts.all())
+            source_pps = list(source.platform_posts.select_related("social_account"))
             if source_pps:
                 new_pps = []
                 for pp in source_pps:
+                    # The source was checked when it was scheduled, but its media
+                    # or board can have gone since. A clone that can only fail is
+                    # left as a draft at its date: still on the calendar to fix,
+                    # but not handed to the publisher.
+                    blocked = publish_blocker(
+                        pp.social_account, media_types=media_types, platform_extra=pp.platform_extra
+                    )
+                    if blocked:
+                        logger.warning(
+                            "Recurrence of post %s on %s left as a draft for %s: %s",
+                            source.id,
+                            d,
+                            pp.social_account_id,
+                            blocked,
+                        )
                     # Preserve the offset between source PP's scheduled_at and
                     # source post's scheduled_at, so per-platform time deltas
                     # carry into each recurrence.
@@ -109,7 +141,9 @@ def generate_recurring_posts():
                             # provider defaults and loses the creator's choices.
                             platform_extra=copy.deepcopy(pp.platform_extra) if pp.platform_extra else {},
                             scheduled_at=pp_scheduled,
-                            status="scheduled",
+                            status=(
+                                "scheduled" if pp.status in _RECURRING_COMMITTED_STATUSES and not blocked else "draft"
+                            ),
                         )
                     )
                 PlatformPost.objects.bulk_create(new_pps)

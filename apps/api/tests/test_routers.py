@@ -561,7 +561,18 @@ class TestPlatformQuota:
             )
             assert r.status_code == 201
 
-        # Now schedule one — must succeed.
+        # Now schedule one — must succeed. With an image, which Instagram
+        # needs before anything will be scheduled to it.
+        from apps.media_library.models import MediaAsset
+
+        image = MediaAsset.objects.create(
+            organization=ig_account.workspace.organization,
+            workspace=ig_account.workspace,
+            file="test/photo.jpg",
+            filename="photo.jpg",
+            media_type=MediaAsset.MediaType.IMAGE,
+            mime_type="image/jpeg",
+        )
         when = (timezone.now() + timedelta(hours=1)).isoformat()
         r = ig_client.post(
             "/api/v1/posts/",
@@ -571,6 +582,7 @@ class TestPlatformQuota:
                     "caption": "this one should succeed",
                     "action": "schedule",
                     "scheduled_at": when,
+                    "media_asset_ids": [str(image.id)],
                 }
             ),
             content_type="application/json",

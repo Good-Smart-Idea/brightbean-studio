@@ -11,6 +11,8 @@
 <style>
     /* Fix parent overflow clipping the calendar */
     main:has(.cross-calendar-main) > div { overflow: visible !important; }
+    .cross-cal-scroll { overflow-x: auto; }
+    .cross-cal-month { min-width: 840px; }
 
     .cross-cal-day {
         min-height: 110px;
@@ -64,7 +66,7 @@
     .pi-linkedin_personal { background: #0A66C2; }
     .pi-linkedin_company  { background: #0A66C2; }
     .pi-tiktok     { background: #010101; }
-    .pi-youtube    { background: #FF0000; }
+    .pi-youtube { background: transparent !important; width: auto !important; min-width: 45px; color: #57534e; font-size: 10px; }
     .pi-pinterest  { background: #E60023; }
     .pi-threads    { background: #000000; }
     .pi-bluesky    { background: #0085FF; }
@@ -112,7 +114,7 @@
 {% block content %}
 <div class="cross-calendar-main" x-data="{ viewOpen: false, wsOpen: false }">
     <!-- Toolbar -->
-    <div class="bg-white border-b border-stone-200 px-6 py-3 flex items-center gap-3">
+    <div class="bg-white border-b border-stone-200 px-6 py-3 flex flex-wrap items-center gap-3">
         <!-- Navigation arrows -->
         <div class="flex items-center gap-2">
             <a href="?view={{ view_type }}&date={{ prev_date }}{% for sid in selected_workspace_ids %}&workspace={{ sid }}{% endfor %}{% if request.GET.channel %}&channel={{ request.GET.channel }}{% endif %}{% if request.GET.tag %}&tag={{ request.GET.tag }}{% endif %}{% if request.GET.status %}&status={{ request.GET.status }}{% endif %}"
@@ -165,7 +167,7 @@
         <div class="flex-1"></div>
 
         <!-- Right side: filter dropdowns -->
-        <div x-data class="flex items-center gap-2">
+        <div x-data class="flex min-w-0 flex-wrap items-center gap-2">
             <!-- Status filter -->
             <div class="relative">
                 <svg class="org-filter-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
@@ -252,6 +254,7 @@
     <!-- Calendar content -->
     <div class="px-6 pt-4">
         {% if view_type == 'month' %}
+        <div class="cross-cal-scroll"><div class="cross-cal-month">
         <!-- Day headers -->
         <div class="grid grid-cols-7 text-center mb-1">
             {% for day_name in day_names %}
@@ -301,6 +304,7 @@
             {% endfor %}
         </div>
 
+        </div></div>
         {% elif view_type == 'week' %}
         {% include "organizations/partials/week_grid.html" %}
 

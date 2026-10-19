@@ -20,6 +20,7 @@ from ninja.openapi.docs import Swagger
 from apps.api.auth import ApiKeyAuth, McpAuth
 from apps.api.routers.accounts import router as accounts_router
 from apps.api.routers.analytics import router as analytics_router
+from apps.api.routers.inbox import router as inbox_router
 from apps.api.routers.me import router as me_router
 from apps.api.routers.media import router as media_router
 from apps.api.routers.posts import router as posts_router
@@ -41,12 +42,24 @@ api = NinjaAPI(
         "Programmatic access for external AI agents. Authentication is via "
         "scoped bearer tokens; create one from the Organization → API Keys "
         "page in the Brightbean Studio settings.\n\n"
+        "**User-Agent.** Send a `User-Agent` header naming your client "
+        "(e.g. `my-agent/1.0`). The hosted Studio sits behind Cloudflare, "
+        "which rejects Python's standard-library default "
+        "(`Python-urllib/3.x`) with 403 and a plain-text `error code: 1010` "
+        "body before the request reaches the API. Any value of your own "
+        "gets through; `requests`, `httpx`, curl and Node clients already "
+        "send one that does.\n\n"
         "**Rate limits.** Per-key write rate is 120/min, read 300/min, "
-        "with a 1000/min aggregate cap per workspace. Limits are enforced "
-        "as HTTP 429 with a JSON body that includes `tier`, `limit`, "
+        "with a 1000/min aggregate cap per workspace. Each key may also make "
+        "at most 1,000 calls per UTC hour and 20,000 per UTC day, REST and "
+        "MCP together (`tier` `per_key_hourly` / `per_key_daily`; "
+        "`retry_after` is the time until that window resets). Limits are "
+        "enforced as HTTP 429 with a JSON body that includes `tier`, `limit`, "
         "`remaining`, `retry_after`, and a `Retry-After` header. "
         "Headers `X-RateLimit-Limit` and `X-RateLimit-Remaining` are "
         "emitted **only on 429 responses**, not on every response.\n\n"
+        "**Polling.** The inbox syncs every 5 minutes and analytics every "
+        "hour; polling either faster returns the same data.\n\n"
         "**Per-platform daily caps.** Posting against a connected account "
         "is also bounded by a per-`SocialAccount` 24-hour rolling cap "
         "(e.g. Instagram 25/day, LinkedIn 100/day). Over-quota requests "
@@ -57,6 +70,14 @@ api = NinjaAPI(
         "Google Business; LinkedIn Personal in OIDC mode), the "
         "`first_comment` field is silently dropped at publish time — call "
         "`GET /accounts/` or `GET /me/` first to check before composing.\n\n"
+        "**Posts that can't publish.** Scheduling is refused with 422 when "
+        "the post would certainly fail at publish time: an account whose "
+        "`requires_video` is `true` (TikTok, YouTube) with no video attached, "
+        "one whose `requires_media` is `true` (Instagram, Pinterest) with no "
+        "media at all, or a Pinterest pin, which needs a board the API can't "
+        "set yet. Create Pinterest posts as drafts and schedule them from the "
+        "composer after choosing a board. The same rule applies to PATCHing "
+        "the media of a scheduled post.\n\n"
         "**Deleting posts.** Posts cannot be deleted via the API in v1. "
         "Cancel a scheduled post with `POST /posts/{id}/cancel`; remove "
         "drafts from the workspace's drafts list in the web UI. Published "
@@ -76,6 +97,7 @@ api.add_router("/accounts", accounts_router)
 api.add_router("/posts", posts_router)
 api.add_router("/media", media_router)
 api.add_router("/analytics", analytics_router)
+api.add_router("/inbox", inbox_router)
 # MCP Streamable HTTP transport. Same audit + rate limits as REST, but a
 # wider auth class: ``McpAuth`` accepts both bb_studio_ keys AND OAuth 2.1
 # access tokens (Claude Desktop's native connector flow). Mounted last so
@@ -233,6 +255,18 @@ def _action_for_path(method: str, path: str, *, status_code: int) -> str:
             return f"media.upload.{status_code}"
         if method == "GET":
             return f"media.read.{status_code}"
+    if "/inbox/" in path or path.endswith("/inbox"):
+        if "/replies" in path or "/reply" in path:
+            if path.endswith("/send"):
+                return f"inbox.reply.send.{status_code}"
+            if method == "POST":
+                return f"inbox.reply.create.{status_code}"
+            if method == "PATCH":
+                return f"inbox.reply.update.{status_code}"
+            if method == "DELETE":
+                return f"inbox.reply.discard.{status_code}"
+        if method == "GET":
+            return f"inbox.read.{status_code}"
     if "/mcp" in path:
         return f"mcp.error.{status_code}"
     if "/accounts" in path:

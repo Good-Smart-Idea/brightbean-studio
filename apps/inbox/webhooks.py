@@ -6,6 +6,7 @@ import json
 import logging
 
 from django.conf import settings
+from django.db import transaction
 from django.http import HttpResponse, HttpResponseForbidden
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -14,6 +15,7 @@ from django_ratelimit.decorators import ratelimit
 from apps.common.validators import safe_xml_fromstring
 from apps.credentials.models import resolve_app_secret, resolve_app_secrets
 from apps.social_accounts.models import SocialAccount
+from providers.meta_messaging import message_timestamp, normalize_attachments
 
 from .models import InboxMessage
 from .sentiment import analyze_sentiment
@@ -391,6 +393,7 @@ def _upsert_instagram_mention(account, value: dict):
     )
 
 
+@transaction.atomic
 def _handle_facebook_messaging(account, messaging: dict):
     """Handle a Facebook/Instagram messaging event (DM)."""
     message_data = messaging.get("message", {})
@@ -399,16 +402,43 @@ def _handle_facebook_messaging(account, messaging: dict):
         return
 
     sender = messaging.get("sender", {})
-    text = message_data.get("text", "")
+    if message_data.get("is_echo") or _is_own_activity(account, sender):
+        return
+    sender_id = str(sender.get("id") or "")
+    if not sender_id:
+        return
+    if message_data.get("is_deleted"):
+        existing = (
+            InboxMessage.objects.select_for_update()
+            .filter(social_account=account, platform_message_id=str(mid), message_type="dm")
+            .first()
+        )
+        if existing:
+            existing.body = ""
+            existing.extra = {**existing.extra, "is_deleted": True, "attachments": []}
+            existing.save(update_fields=["body", "extra"])
+        return
+    text = message_data.get("text") or ""
+    stamp = message_timestamp(messaging.get("timestamp"))
+    extra = {
+        **messaging,
+        "sender_id": sender_id,
+        "platform_timestamp": stamp.isoformat() if stamp else None,
+        "attachments": normalize_attachments(message_data.get("attachments", [])),
+        "is_unsupported": bool(message_data.get("is_unsupported")),
+    }
+    if messaging.get("conversation_id"):
+        extra["conversation_id"] = str(messaging["conversation_id"])
 
     _create_if_new(
         account=account,
         platform_message_id=str(mid),
         message_type=InboxMessage.MessageType.DM,
         sender_name=sender.get("name", sender.get("id", "Unknown")),
-        sender_id=sender.get("id", ""),
+        sender_id=sender_id,
         body=text,
-        extra=messaging,
+        extra=extra,
+        received_at=stamp,
     )
 
 
@@ -420,6 +450,7 @@ def _create_if_new(
     sender_id: str,
     body: str,
     extra: dict,
+    received_at=None,
 ):
     """Create InboxMessage if it doesn't already exist (deduplication)."""
     from django.utils import timezone
@@ -434,7 +465,7 @@ def _create_if_new(
         "body": body,
         "sentiment": analyze_sentiment(body),
         "extra": extra,
-        "received_at": timezone.now(),
+        "received_at": received_at or timezone.now(),
     }
 
     # Link back to the post being commented on, matching what the poll does.

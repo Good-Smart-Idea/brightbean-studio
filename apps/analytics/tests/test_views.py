@@ -6,11 +6,14 @@ the queryset feeding the switcher, so a connected Instagram (Direct) account
 simply wasn't there and nothing anywhere said why.
 """
 
+from datetime import timedelta
+
 import pytest
 from django.urls import reverse
 from django.utils import timezone
 
 from apps.accounts.models import User
+from apps.analytics.models import AccountInsightsSnapshot
 from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.organizations.models import Organization
 from apps.social_accounts.models import AnalyticsPlatformConfig, SocialAccount
@@ -198,3 +201,64 @@ def test_pages_never_leak_raw_template_tags(owner_client, workspace, platform):
 
     assert "{#" not in body
     assert "{%" not in body
+
+
+@pytest.mark.django_db
+def test_youtube_dashboard_ignores_legacy_account_estimates(owner_client, workspace):
+    """Legacy rows cannot supply native YouTube cards or engagement rates."""
+    account = _account(workspace, "youtube", "Tube")
+    today = timezone.now().date()
+    for offset in range(14):
+        for metric, value in {
+            "views": 100,
+            "likes": 8,
+            "comments": 2,
+            "shares": 1,
+            "watch_time": 30,
+            "avg_view_pct": 45,
+        }.items():
+            AccountInsightsSnapshot.objects.create(
+                social_account=account,
+                metric_key=metric,
+                date=today - timedelta(days=offset),
+                value=value,
+            )
+
+    response = owner_client.get(_account_url(workspace, account) + "?range=7")
+    body = response.content.decode()
+
+    assert response.context["engagement"] is None
+    assert "Engagement rate" not in body
+    assert "Daily average · calculated by BrightBean" not in body
+    assert "Metrics reported by YouTube" in body
+    assert all(not card["derived"].available for card in response.context["hero_cards"])
+
+
+@pytest.mark.django_db
+def test_youtube_daily_counts_are_not_reconstructed_from_lifetime_snapshots(owner_client, workspace):
+    """Missing native daily reports stay unavailable despite lifetime snapshots."""
+    from apps.analytics.models import PostInsightsSnapshot
+    from apps.composer.models import PlatformPost, Post
+
+    account = _account(workspace, "youtube", "Tube")
+    platform_post = PlatformPost.objects.create(
+        post=Post.objects.create(workspace=workspace, caption="video"),
+        social_account=account,
+        status=PlatformPost.Status.PUBLISHED,
+        published_at=timezone.now() - timedelta(days=60),
+        platform_post_id="video-1",
+    )
+    today = timezone.now().date()
+    for offset, views in ((3, 100), (1, 160)):
+        PostInsightsSnapshot.objects.create(
+            platform_post=platform_post, metric_key="views", date=today - timedelta(days=offset), value=views
+        )
+
+    response = owner_client.get(_account_url(workspace, account) + "?range=7")
+    body = response.content.decode()
+
+    assert "Estimated by BrightBean from per-video counts" not in body
+    assert response.context["chart"]["derived"].estimated is False
+    assert response.context["chart"]["derived"].available is False
+    # Today has no snapshot yet: a gap in the chart, not a drop to zero views.
+    assert response.context["chart_series_json"].endswith("null]")
