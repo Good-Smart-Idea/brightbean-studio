@@ -73,10 +73,9 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        # Pulled via AWS's public mirror of Docker Hub official images —
-        # avoids anonymous Docker Hub pulls, whose timeouts/rate limits
-        # broke main CI on 2026-06-10 (run 27262568530).
-        image: public.ecr.aws/docker/library/postgres:16-alpine
+        # Public-repository jobs use GitHub-hosted runners. Pull the official
+        # image directly: the ECR mirror rejected these runners with a data limit.
+        image: postgres:16-alpine
         env:
           POSTGRES_DB: brightbean_test
           POSTGRES_USER: postgres
