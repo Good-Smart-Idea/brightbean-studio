@@ -5,7 +5,9 @@ https://github.com/brightbeanxyz/brightbean-studio commit
 48801fdcd1009e6ed4863fa9942222a478a297e2 (112 commits ahead of the shared base).
 
 Preserved GSI AI Assist/BYOK, its encrypted provider configuration and regression
-tests, GSI rules-file symlinks, and self-hosted Actions runner labels. Resolved
+tests and GSI rules-file symlinks. Corrected CI to GitHub-hosted runners because
+the repository is public: public projects run free there, while self-hosted
+runners would expose Ada to outside pull-request code. Resolved
 additive composer imports and retained both the upstream Instagram credential
 expectation and GSI AI-provider tests. Three files normalized with CI-pinned ruff.
 
