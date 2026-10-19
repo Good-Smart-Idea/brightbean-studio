@@ -753,7 +753,7 @@
                 <div class="sidebar-connect-channels" x-show="!sidebarCollapsed">
                 <div class="sidebar-section-label">Connect channels</div>
                 {% for platform_key, platform_label in sidebar_connectable_platforms|slice:":3" %}
-                <a href="{% url 'social_accounts:connect' workspace_id=request.workspace.id %}" class="sidebar-nav-item">
+                <a href="{% url 'social_accounts:connect' workspace_id=request.workspace.id %}#connect-{{ platform_key }}" class="sidebar-nav-item">
                     {% if platform_key != 'youtube' %}
                     <div class="relative flex-shrink-0">
                         <div class="w-4 h-4 flex items-center justify-center rounded-lg bg-stone-100">
