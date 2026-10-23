@@ -413,6 +413,9 @@ def oauth_callback(request, platform):
                 messages.warning(request, warning)
                 return redirect("social_accounts:list", workspace_id=workspace_id)
 
+        if platform == PlatformCredential.Platform.GOOGLE_BUSINESS:
+            return _connect_google_business(request, provider, tokens, workspace_id)
+
         # Standard single-account flow (non-Facebook/Instagram platforms)
         profile = provider.get_profile(tokens.access_token)
         _create_or_update_account(
@@ -992,7 +995,103 @@ def resolve_page_account_token(page: dict, platform: str, user_access_token: str
     token = page.get("access_token")
     if not token and platform == PlatformCredential.Platform.INSTAGRAM:
         token = user_access_token
+    # Google Business has no per-location token. The user grant that listed
+    # the locations is the grant that publishes to every one of them.
+    if not token and platform == PlatformCredential.Platform.GOOGLE_BUSINESS:
+        token = user_access_token
     return token or ""
+
+
+def _google_location_aliases(platform_id: str) -> set[str]:
+    """Ids that mean the same location: the v4 parent and ``locations/{id}``."""
+    from providers.google_business import stored_google_business_target
+
+    aliases = {platform_id}
+    _account, location = stored_google_business_target(platform_id)
+    if location:
+        aliases.add(location)
+    return aliases
+
+
+def _adopt_legacy_google_location(workspace_id, platform_id: str) -> str:
+    """Point a pre-picker row at the account-qualified parent instead of duplicating it.
+
+    Those rows stored ``locations/{locationId}``. Reconnecting that location
+    now stores ``accounts/{account}/locations/{location}``. Updating the old
+    row keeps its queue and history on the same social account.
+    """
+    from providers.google_business import stored_google_business_target
+
+    account_name, location_name = stored_google_business_target(platform_id)
+    if not account_name or not location_name or platform_id == location_name:
+        return platform_id
+    already_qualified = SocialAccount.objects.filter(
+        workspace_id=workspace_id,
+        platform=PlatformCredential.Platform.GOOGLE_BUSINESS,
+        account_platform_id=platform_id,
+    ).exists()
+    if already_qualified:
+        return platform_id
+    SocialAccount.objects.filter(
+        workspace_id=workspace_id,
+        platform=PlatformCredential.Platform.GOOGLE_BUSINESS,
+        account_platform_id=location_name,
+    ).update(account_platform_id=platform_id)
+    return platform_id
+
+
+def _connect_google_business(request, provider, tokens, workspace_id):
+    """Connect one location immediately, or ask when the login has several.
+
+    A single location stays a one-step connect. Two or more reuse the page
+    picker so each location becomes its own social account.
+    """
+    from providers.types import AccountProfile
+
+    locations = provider.list_connectable_locations(tokens.access_token)
+    if not locations:
+        messages.warning(
+            request,
+            "No Google Business locations were found for this login. "
+            "If you expected to see one, confirm this Google account manages a Business Profile, then try again.",
+        )
+        return redirect("social_accounts:list", workspace_id=workspace_id)
+
+    existing_ids = set(
+        SocialAccount.objects.filter(
+            workspace_id=workspace_id,
+            platform=PlatformCredential.Platform.GOOGLE_BUSINESS,
+        ).values_list("account_platform_id", flat=True)
+    )
+    for location in locations:
+        location["already_connected"] = bool(_google_location_aliases(location["id"]) & existing_ids)
+
+    if len(locations) == 1:
+        location = locations[0]
+        profile = AccountProfile(platform_id=location["id"], name=location["name"])
+        _create_or_update_account(
+            workspace_id=workspace_id,
+            platform=PlatformCredential.Platform.GOOGLE_BUSINESS,
+            profile=profile,
+            authorizing_user=request.user,
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            expires_in=tokens.expires_in,
+        )
+        messages.success(request, f"Connected {profile.name} successfully.")
+        return redirect("calendar:calendar", workspace_id=workspace_id)
+
+    request.session["oauth_page_select"] = {
+        "workspace_id": workspace_id,
+        "platform": PlatformCredential.Platform.GOOGLE_BUSINESS,
+        "user_tokens": {
+            "access_token": tokens.access_token,
+            "refresh_token": tokens.refresh_token,
+            "expires_in": tokens.expires_in,
+        },
+        "pages": locations,
+    }
+    return redirect("social_accounts:select_account")
 
 
 @transaction.atomic
@@ -1040,10 +1139,14 @@ def _create_or_update_account(
             "analytics_status": SocialAccount.AnalyticsStatus.CHECKING,
         }
 
+    platform_id = profile.platform_id
+    if platform == PlatformCredential.Platform.GOOGLE_BUSINESS:
+        platform_id = _adopt_legacy_google_location(workspace_id, platform_id)
+
     account, created = SocialAccount.objects.update_or_create(
         workspace_id=workspace_id,
         platform=platform,
-        account_platform_id=profile.platform_id,
+        account_platform_id=platform_id,
         defaults={
             **analytics_defaults,
             "account_name": profile.name,

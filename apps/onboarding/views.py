@@ -527,6 +527,31 @@ def connection_oauth_callback(request, platform):
             )
             return redirect("onboarding:connection_page", token=token)
 
+        # Connection links have no location picker. Connect every location as
+        # its own social account, the same way a link connects every Page.
+        # One location is still a single account.
+        if platform == PlatformCredential.Platform.GOOGLE_BUSINESS:
+            from providers.types import AccountProfile
+
+            locations = provider.list_connectable_locations(tokens.access_token)
+            if not locations:
+                request.session["connection_link_error"] = "No Google Business locations were found for this login."
+                return redirect("onboarding:connection_page", token=token)
+            for location in locations:
+                account = _create_or_update_account(
+                    workspace_id=workspace_id,
+                    platform=platform,
+                    profile=AccountProfile(platform_id=location["id"], name=location["name"]),
+                    access_token=tokens.access_token,
+                    refresh_token=tokens.refresh_token,
+                    expires_in=tokens.expires_in,
+                )
+                ConnectionLinkUsage.objects.get_or_create(
+                    connection_link=link,
+                    social_account=account,
+                )
+            return redirect("onboarding:connection_page", token=token)
+
         # Standard single-account flow
         profile = provider.get_profile(tokens.access_token)
         account = _create_or_update_account(

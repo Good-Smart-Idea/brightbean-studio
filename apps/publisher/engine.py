@@ -116,6 +116,13 @@ def _resolve_publish_credentials(account):
         # comment's ``username`` without a ``from`` object, and an unrecognised
         # own comment lands in the inbox as an inbound message from ourselves.
         credentials["account_handle"] = account.account_handle
+    elif platform == "google_business":
+        # Org credentials are one pair for the whole org. Each connected
+        # location carries its own account and location names; those win over
+        # a pin such as location_id=accounts/X/locations/Y on the org row.
+        from providers.google_business import apply_stored_google_business_target
+
+        apply_stored_google_business_target(credentials, account.account_platform_id)
 
     return credentials
 

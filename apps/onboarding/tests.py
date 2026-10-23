@@ -221,3 +221,46 @@ class TestConnectionLinkPageTokens:
             assert account.facebook_user_token_expires_at <= timezone.now() + timezone.timedelta(seconds=expiry_seconds)
             assert (account.token_expires_at is None) == promoted
             assert account.connection_status == "connected"
+
+
+@pytest.mark.django_db
+def test_google_business_connection_link_connects_every_location(client, workspace, connection_link):
+    """A link has no picker, so each location still becomes its own account."""
+    nonce = "nonce-gbp"
+    state = _sign_connection_link_state(workspace.id, "google_business", connection_link.token, nonce)
+    session = client.session
+    session[CONNECTION_LINK_OAUTH_SESSION_KEY] = {
+        "nonce": nonce,
+        "workspace_id": str(workspace.id),
+        "platform": "google_business",
+        "token": connection_link.token,
+    }
+    session.save()
+    provider = MagicMock()
+    provider.exchange_code.return_value = OAuthTokens(
+        access_token="user-token", refresh_token="refresh", expires_in=3600
+    )
+    provider.list_connectable_locations.return_value = [
+        {"id": "accounts/9/locations/1", "name": "Cafe"},
+        {"id": "accounts/9/locations/2", "name": "Kiosk"},
+    ]
+
+    with (
+        patch("apps.onboarding.views._get_provider_for_platform", return_value=provider),
+        patch("apps.social_accounts.views.subscribe_account_webhooks_task"),
+    ):
+        response = client.get(
+            reverse("onboarding:oauth_callback", kwargs={"platform": "google_business"}),
+            {"code": "auth-code", "state": state},
+        )
+
+    assert response.status_code == 302
+    provider.get_profile.assert_not_called()
+    from apps.social_accounts.models import SocialAccount
+
+    ids = set(
+        SocialAccount.objects.filter(workspace=workspace, platform="google_business").values_list(
+            "account_platform_id", flat=True
+        )
+    )
+    assert ids == {"accounts/9/locations/1", "accounts/9/locations/2"}
