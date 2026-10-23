@@ -124,6 +124,88 @@ def test_publish_post_uses_account_qualified_local_posts_path(monkeypatch, crede
         assert locations.url.params["readMask"] == READ_MASK
 
 
+def test_list_connectable_locations_ignores_an_org_pin_and_qualifies_each_one(monkeypatch):
+    """Connect must see every location, not the one location_id pinned on the org."""
+    seen = _install(
+        monkeypatch,
+        [
+            {"accounts": [{"name": "accounts/9"}, {"name": "accounts/8"}]},
+            {
+                "locations": [
+                    {
+                        "name": "locations/1",
+                        "title": "Cafe",
+                        "storefrontAddress": {"addressLines": ["1 Main"]},
+                    },
+                    {"name": "locations/2", "title": "Kiosk"},
+                ]
+            },
+            {"locations": [{"name": "locations/3", "title": "Other"}]},
+        ],
+    )
+    provider = GoogleBusinessProvider(
+        {
+            "client_id": "cid",
+            "client_secret": "sec",
+            "account_id": "accounts/9",
+            "location_id": "accounts/9/locations/1",
+        }
+    )
+
+    rows = provider.list_connectable_locations("ya29.token")
+
+    assert [row["id"] for row in rows] == [
+        "accounts/9/locations/1",
+        "accounts/9/locations/2",
+        "accounts/8/locations/3",
+    ]
+    assert rows[0]["name"] == "Cafe"
+    assert rows[0]["category"] == "1 Main"
+    location_calls = [request for request in seen if request.url.path.endswith("/locations")]
+    assert [request.url.path for request in location_calls] == [
+        "/v1/accounts/9/locations",
+        "/v1/accounts/8/locations",
+    ]
+    assert all(request.url.params["readMask"] == READ_MASK for request in location_calls)
+
+
+def test_get_profile_uses_the_stored_location_not_the_first(monkeypatch):
+    """A health check must not rename this connection to a sibling location."""
+    seen = _install(
+        monkeypatch,
+        [
+            {
+                "locations": [
+                    {"name": "locations/1", "title": "First"},
+                    {
+                        "name": "locations/2",
+                        "title": "Second",
+                        "storefrontAddress": {"addressLines": ["2 Main"]},
+                        "phoneNumbers": {"primaryPhone": "555-0100"},
+                    },
+                ]
+            }
+        ],
+    )
+    provider = GoogleBusinessProvider(
+        {
+            "client_id": "cid",
+            "client_secret": "sec",
+            "account_id": "accounts/9",
+            "location_id": "locations/2",
+        }
+    )
+
+    profile = provider.get_profile("ya29.token")
+
+    assert profile.name == "Second"
+    assert profile.platform_id == "locations/2"
+    assert profile.extra == {"address": "2 Main", "phone": "555-0100"}
+    assert len(seen) == 1
+    assert seen[0].url.path == "/v1/accounts/9/locations"
+    assert seen[0].url.params["readMask"] == READ_MASK
+
+
 def test_get_post_metrics_uses_account_qualified_local_post_name(monkeypatch):
     """localPosts.get is v4/accounts/{account}/locations/{location}/localPosts/{post}."""
     seen = _install(

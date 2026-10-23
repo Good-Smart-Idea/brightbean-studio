@@ -11,8 +11,8 @@
             {% include "social_accounts/partials/_platform_icon.html" with platform=platform size="6" %}
         </div>
         {% endif %}
-        <h2 class="text-xl font-semibold text-stone-900">Select Account{{ pages|length|pluralize }}</h2>
-        <p class="text-sm text-stone-500 mt-1">Your {% if platform == "youtube" %}YouTube{% else %}{{ platform|title }}{% endif %} login has access to multiple accounts. Select which one{{ pages|length|pluralize }} to connect.</p>
+        <h2 class="text-xl font-semibold text-stone-900">{% if platform == "google_business" %}Select location{{ pages|length|pluralize }}{% else %}Select Account{{ pages|length|pluralize }}{% endif %}</h2>
+        <p class="text-sm text-stone-500 mt-1">{% if platform == "google_business" %}Your Google Business login has access to multiple locations. Select which one{{ pages|length|pluralize }} to connect.{% else %}Your {% if platform == "youtube" %}YouTube{% else %}{{ platform|title }}{% endif %} login has access to multiple accounts. Select which one{{ pages|length|pluralize }} to connect.{% endif %}</p>
     </div>
 
     <form method="post" action="{% url 'social_accounts:select_account' %}">
