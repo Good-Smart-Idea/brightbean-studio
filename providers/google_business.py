@@ -27,6 +27,30 @@ ACCOUNTS_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
 BUSINESS_INFO_API = "https://mybusinessbusinessinformation.googleapis.com/v1"
 POSTS_API = "https://mybusiness.googleapis.com/v4"
 
+# accounts.locations.list rejects a call that omits readMask. These are the
+# Location fields connect reads back; publish only needs ``name``.
+LOCATION_READ_MASK = "name,title,storefrontAddress,phoneNumbers"
+
+
+def _resource_id(resource_name: str) -> str:
+    """Last segment of a resource name, or the value when it is already an id."""
+    return resource_name.strip("/").rsplit("/", 1)[-1]
+
+
+def _v4_location_parent(account_id: str, location_id: str) -> str:
+    """Parent for v4 localPosts methods: ``accounts/{account}/locations/{location}``.
+
+    Business Information location names are ``locations/{locationId}`` and do
+    not include the account. A credential may be that name, a bare id, or the
+    full account-qualified parent.
+    """
+    location = location_id.strip("/")
+    if location.startswith("accounts/") and "/locations/" in location:
+        account_part, _, after = location.partition("/locations/")
+        location_part = after.split("/", 1)[0]
+        return f"{account_part}/locations/{location_part}"
+    return f"accounts/{_resource_id(account_id)}/locations/{_resource_id(location)}"
+
 
 class GoogleBusinessProvider(SocialProvider):
     """Google Business Profile provider.
@@ -190,19 +214,23 @@ class GoogleBusinessProvider(SocialProvider):
         if self.credentials.get("location_id"):
             return self.credentials["location_id"]
 
-        resp = self._request(
-            "GET",
-            f"{BUSINESS_INFO_API}/{account_id}/locations",
-            access_token=access_token,
-        )
-        data = resp.json()
-        locations = data.get("locations", [])
+        locations = self._list_locations(access_token, account_id)
         if not locations:
             raise PublishError(
                 "No locations found for Google Business account",
                 platform=self.platform_name,
             )
         return locations[0]["name"]
+
+    def _list_locations(self, access_token: str, account_id: str) -> list[dict]:
+        """List locations. ``readMask`` is required by accounts.locations.list."""
+        resp = self._request(
+            "GET",
+            f"{BUSINESS_INFO_API}/{account_id}/locations",
+            access_token=access_token,
+            params={"readMask": LOCATION_READ_MASK},
+        )
+        return resp.json().get("locations", [])
 
     # ------------------------------------------------------------------
     # Profile
@@ -211,14 +239,7 @@ class GoogleBusinessProvider(SocialProvider):
     def get_profile(self, access_token: str) -> AccountProfile:
         """Fetch the Google Business account and primary location info."""
         account_id = self._get_account_id(access_token)
-
-        resp = self._request(
-            "GET",
-            f"{BUSINESS_INFO_API}/{account_id}/locations",
-            access_token=access_token,
-        )
-        data = resp.json()
-        locations = data.get("locations", [])
+        locations = self._list_locations(access_token, account_id)
 
         if locations:
             loc = locations[0]
@@ -278,7 +299,7 @@ class GoogleBusinessProvider(SocialProvider):
 
         resp = self._request(
             "POST",
-            f"{POSTS_API}/{location_id}/localPosts",
+            f"{POSTS_API}/{_v4_location_parent(account_id, location_id)}/localPosts",
             access_token=access_token,
             json=body,
         )
@@ -296,7 +317,12 @@ class GoogleBusinessProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
-        """Fetch metrics for a Google Business local post."""
+        """Fetch metrics for a Google Business local post.
+
+        ``post_id`` is the LocalPost ``name`` stored at publish time
+        (``accounts/{account}/locations/{location}/localPosts/{post}``), which
+        is already the account-qualified ``localPosts.get`` path.
+        """
         resp = self._request(
             "GET",
             f"{POSTS_API}/{post_id}",
