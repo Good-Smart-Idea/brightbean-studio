@@ -1,0 +1,32 @@
+# Review-required Mergify config (GSI standard template + approval-gated queue).
+# ci.yml jobs on every PR to main.
+queue_rules:
+  - name: default
+    merge_method: squash
+    batch_size: 1
+    # Gate queue entry so a bare "@Mergifyio queue" cannot merge an unreviewed PR.
+    queue_conditions:
+      - base=main
+      - -draft
+      - "#approved-reviews-by>=1"
+      - "#changes-requested-reviews-by=0"
+      - "check-success=Lint (ruff)"
+      - "check-success=Type check (mypy)"
+      - "check-success=Test (pytest)"
+      - "check-success=Docker build"
+      - "check-success=Secret scan (gitleaks)"
+
+pull_request_rules:
+  - name: auto-merge safe PRs (approved, green, no conflicts, opted in)
+    conditions:
+      - base=main
+      - -draft
+      - -conflict
+      - "#changes-requested-reviews-by=0"
+      - "#approved-reviews-by>=1"
+      - -check-pending~=.*
+      - -check-failure~=.*
+      - label=automerge
+    actions:
+      queue:
+        name: default
