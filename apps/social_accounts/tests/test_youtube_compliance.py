@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 from io import StringIO
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from django.core.management import call_command
@@ -213,13 +214,17 @@ def test_missing_scope_is_retryable_and_does_not_force_existing_reconnection(cha
 
 def test_history_keeps_180_days_and_drops_arbitrary_old_response_payloads(channel):
     now = timezone.now()
+    # Retention uses the America/Los_Angeles calendar. UTC is already the next
+    # day between 00:00 and 07:00 UTC (8 PM–3 AM ET), so a UTC date here would
+    # land on the wrong side of the 180-day cutoff.
+    pacific_today = now.astimezone(ZoneInfo("America/Los_Angeles")).date()
     old = AccountInsightsSnapshot.objects.create(
-        social_account=channel, metric_key="views", date=now.date() - timedelta(days=181), value=4
+        social_account=channel, metric_key="views", date=pacific_today - timedelta(days=181), value=4
     )
     retained = AccountInsightsSnapshot.objects.create(
         social_account=channel,
         metric_key="views",
-        date=now.date() - timedelta(days=179),
+        date=pacific_today - timedelta(days=179),
         value=3,
         raw={"source": "youtube_analytics", "copied_profile": "Old"},
     )
@@ -441,11 +446,12 @@ def test_staging_gate_prevents_automatic_retention_cleanup(channel):
 def test_latest_lifetime_statistic_survives_history_expiry_only_for_verified_video(channel):
     old = video(channel, age=400)
     now = timezone.now()
+    pacific_today = now.astimezone(ZoneInfo("America/Los_Angeles")).date()
     current = PostInsightsSnapshot.objects.create(
-        platform_post=old, metric_key="watch_time", date=now.date() - timedelta(days=190), value=240
+        platform_post=old, metric_key="watch_time", date=pacific_today - timedelta(days=190), value=240
     )
     previous = PostInsightsSnapshot.objects.create(
-        platform_post=old, metric_key="watch_time", date=now.date() - timedelta(days=191), value=230
+        platform_post=old, metric_key="watch_time", date=pacific_today - timedelta(days=191), value=230
     )
     provider = provider_for(channel)
     provider.get_post_metrics_batch.return_value = {"old-video": PostMetrics(extra={"reported_metrics": {"views": 2}})}

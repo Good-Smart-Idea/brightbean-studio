@@ -8,6 +8,7 @@ import pytest
 from django.test import override_settings
 from django.urls import NoReverseMatch, Resolver404, resolve, reverse
 
+from apps.credentials import ai_providers
 from apps.credentials.ai_providers import AIProviderError, generate_text
 from apps.credentials.forms import PlatformCredentialAdminForm
 from apps.credentials.models import (
@@ -543,3 +544,69 @@ def test_generate_text_malformed_response_wrapped(mock_post):
     mock_post.return_value = _mock_response({"unexpected": "shape"})
     with pytest.raises(AIProviderError):
         generate_text("openai", "sk-test", "gpt-4o-mini", "say hi")
+
+
+def test_generate_text_blank_key_or_model_does_not_call_api():
+    with patch("apps.credentials.ai_providers.httpx.post") as mock_post:
+        with pytest.raises(AIProviderError):
+            generate_text("openrouter", "", "anthropic/claude-sonnet-4", "say hi")
+        with pytest.raises(AIProviderError, match="model"):
+            generate_text("openrouter", "sk-or-test", "  ", "say hi")
+    mock_post.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_rejected_key_is_friendly(mock_post, status):
+    resp = MagicMock()
+    resp.status_code = status
+    mock_post.return_value = resp
+    with pytest.raises(AIProviderError) as excinfo:
+        generate_text("openai", "sk-bad", "gpt-4o-mini", "say hi")
+    assert excinfo.value.status == status
+    assert "API key" in str(excinfo.value)
+    assert "sk-bad" not in str(excinfo.value)
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_generate_text_rate_limit(mock_post):
+    resp = MagicMock()
+    resp.status_code = 429
+    mock_post.return_value = resp
+    with pytest.raises(AIProviderError) as excinfo:
+        generate_text("anthropic", "sk-ant-test", "claude-haiku-4-5-20251001", "say hi")
+    assert excinfo.value.status == 429
+    assert "sk-ant-test" not in str(excinfo.value)
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_test_provider_config_openrouter_success(mock_post):
+    mock_post.return_value = _mock_response({"choices": [{"message": {"content": "OK"}}]})
+    config = AIProviderConfig(provider="openrouter", api_key="sk-or-test", model="anthropic/claude-sonnet-4")
+    ok, detail, latency_ms = ai_providers.test_provider_config(config)
+    assert ok is True
+    assert detail == "OK (anthropic/claude-sonnet-4)"
+    assert latency_ms is not None
+    assert mock_post.call_args.args[0] == "https://openrouter.ai/api/v1/chat/completions"
+    assert mock_post.call_args.kwargs["json"]["messages"][0]["content"] == "Reply with OK"
+    assert "sk-or-test" not in detail
+
+
+@patch("apps.credentials.ai_providers.httpx.post")
+def test_test_provider_config_failure_hides_key(mock_post):
+    resp = MagicMock()
+    resp.status_code = 401
+    mock_post.return_value = resp
+    config = AIProviderConfig(provider="openai", api_key="sk-live-secret", model="gpt-4o-mini")
+    ok, detail, latency_ms = ai_providers.test_provider_config(config)
+    assert ok is False
+    assert latency_ms is None
+    assert "API key" in detail
+    assert "sk-live-secret" not in detail
+
+
+def test_masked_api_key_shows_only_the_last_four():
+    config = AIProviderConfig(api_key="sk-super-secret-123")
+    assert config.masked_api_key == "****-123"
+    assert "secret" not in config.masked_api_key
+    assert AIProviderConfig(api_key="ab").masked_api_key == "****"

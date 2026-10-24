@@ -191,6 +191,11 @@ class AIProviderConfig(models.Model):
         ANTHROPIC = "anthropic", "Anthropic"
         OPENROUTER = "openrouter", "OpenRouter"
 
+    class TestResult(models.TextChoices):
+        SUCCESS = "success", "Success"
+        FAILURE = "failure", "Failure"
+        UNTESTED = "untested", "Untested"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
         "organizations.Organization",
@@ -207,6 +212,9 @@ class AIProviderConfig(models.Model):
         default=False,
         help_text="Used when an AI action doesn't specify a provider override.",
     )
+    tested_at = models.DateTimeField(blank=True, null=True)
+    test_result = models.CharField(max_length=20, choices=TestResult.choices, default=TestResult.UNTESTED)
+    test_message = models.CharField(max_length=255, blank=True, default="")
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -219,6 +227,14 @@ class AIProviderConfig(models.Model):
 
     def __str__(self):
         return f"{self.organization.name} - {self.get_provider_display()}"
+
+    @property
+    def masked_api_key(self):
+        """Last four characters only. The plaintext key is never rendered."""
+        key = self.api_key or ""
+        if len(key) <= 4:
+            return "****"
+        return "****" + key[-4:]
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)

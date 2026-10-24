@@ -1,4 +1,6 @@
-"""Tests for the org-settings AI Providers page (save / set default / delete)."""
+"""Tests for the org-settings AI Providers page (save / set default / delete / test)."""
+
+from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 from django.urls import reverse
@@ -76,3 +78,81 @@ class AIProvidersSettingsTests(TestCase):
         AIProviderConfig.objects.create(organization=self.org, provider="openai", api_key="k1", model="gpt-4o-mini")
         self.client.post(self.url, {"action": "delete", "provider": "openai"})
         self.assertFalse(AIProviderConfig.objects.filter(organization=self.org, provider="openai").exists())
+
+    def test_delete_default_promotes_another_provider(self):
+        AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="k1", model="gpt-4o-mini", is_default=True
+        )
+        other = AIProviderConfig.objects.create(
+            organization=self.org, provider="anthropic", api_key="k2", model="claude-haiku-4-5-20251001"
+        )
+        self.client.post(self.url, {"action": "delete", "provider": "openai"})
+        other.refresh_from_db()
+        self.assertTrue(other.is_default)
+        self.assertFalse(AIProviderConfig.objects.filter(organization=self.org, provider="openai").exists())
+
+    def test_save_clears_previous_test_result(self):
+        AIProviderConfig.objects.create(
+            organization=self.org,
+            provider="openai",
+            api_key="sk-original",
+            model="gpt-4o-mini",
+            is_default=True,
+            test_result=AIProviderConfig.TestResult.SUCCESS,
+            test_message="OK (gpt-4o-mini)",
+            tested_at=timezone.now(),
+        )
+        self.client.post(self.url, {"action": "save", "provider": "openai", "api_key": "", "model": "gpt-4o"})
+        config = AIProviderConfig.objects.get(organization=self.org, provider="openai")
+        self.assertEqual(config.api_key, "sk-original")
+        self.assertEqual(config.model, "gpt-4o")
+        self.assertEqual(config.test_result, AIProviderConfig.TestResult.UNTESTED)
+        self.assertEqual(config.test_message, "")
+        self.assertIsNone(config.tested_at)
+
+    def test_test_connection_records_success_and_failure(self):
+        config = AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-a", model="gpt-4o-mini"
+        )
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.raise_for_status = MagicMock()
+        ok.json.return_value = {"choices": [{"message": {"content": "OK"}}]}
+        with patch("apps.credentials.ai_providers.httpx.post", return_value=ok):
+            response = self.client.post(self.url, {"action": "test", "provider": "openai"})
+        self.assertEqual(response.status_code, 302)
+        config.refresh_from_db()
+        self.assertEqual(config.test_result, AIProviderConfig.TestResult.SUCCESS)
+        self.assertIn("gpt-4o-mini", config.test_message)
+        self.assertNotIn("sk-a", config.test_message)
+        self.assertIsNotNone(config.tested_at)
+
+        bad = MagicMock()
+        bad.status_code = 401
+        with patch("apps.credentials.ai_providers.httpx.post", return_value=bad):
+            self.client.post(self.url, {"action": "test", "provider": "openai"})
+        config.refresh_from_db()
+        self.assertEqual(config.test_result, AIProviderConfig.TestResult.FAILURE)
+        self.assertIn("API key", config.test_message)
+        self.assertNotIn("sk-a", config.test_message)
+
+    def test_test_connection_without_config(self):
+        response = self.client.post(self.url, {"action": "test", "provider": "openrouter"})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(AIProviderConfig.objects.filter(organization=self.org).count(), 0)
+
+    def test_settings_page_masks_api_key_and_offers_test(self):
+        AIProviderConfig.objects.create(
+            organization=self.org,
+            provider="openrouter",
+            api_key="sk-totally-secret",
+            model="anthropic/claude-sonnet-4",
+            test_result=AIProviderConfig.TestResult.SUCCESS,
+            test_message="OK (anthropic/claude-sonnet-4)",
+        )
+        html = self.client.get(self.url).content.decode()
+        self.assertIn("****cret", html)
+        self.assertNotIn("sk-totally-secret", html)
+        self.assertIn("Test connection", html)
+        self.assertIn("OpenRouter", html)
+        self.assertIn("OK (anthropic/claude-sonnet-4)", html)
