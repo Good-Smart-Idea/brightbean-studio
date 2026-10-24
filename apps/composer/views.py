@@ -1539,6 +1539,7 @@ def preview(request, workspace_id):
 
 # AI Assist (F-2.1 / F-5.3) — prompt builders per action. Each takes the
 # posted context dict and returns the text sent to the provider.
+_AI_MAX_INPUT_CHARS = 4000
 _AI_ACTION_PROMPTS = {
     "generate_caption": lambda ctx: (
         "Write 3 short, distinct social media caption variations for the topic/instruction below. "
@@ -1608,9 +1609,9 @@ def ai_assist(request, workspace_id):
         )
 
     ctx = {
-        "prompt": request.POST.get("prompt", "").strip(),
-        "caption": request.POST.get("caption", "").strip(),
-        "tone": request.POST.get("tone", "professional").strip() or "professional",
+        "prompt": request.POST.get("prompt", "")[:_AI_MAX_INPUT_CHARS].strip(),
+        "caption": request.POST.get("caption", "")[:_AI_MAX_INPUT_CHARS].strip(),
+        "tone": (request.POST.get("tone", "professional") or "")[:_AI_MAX_INPUT_CHARS].strip() or "professional",
     }
     if action == "generate_caption" and not ctx["prompt"]:
         return JsonResponse({"error": "Enter a topic or instruction first."}, status=400)

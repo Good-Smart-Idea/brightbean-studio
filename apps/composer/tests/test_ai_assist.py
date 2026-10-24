@@ -129,6 +129,22 @@ class AIAssistEndpointTests(ComposerAIAssistTestCase):
         self.assertEqual(response.status_code, 400)
 
     @patch("apps.credentials.ai_providers.httpx.post")
+    def test_generate_caption_truncates_input_at_4000_chars(self, mock_post):
+        AIProviderConfig.objects.create(
+            organization=self.org, provider="openai", api_key="sk-test", model="gpt-4o-mini", is_default=True
+        )
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"choices": [{"message": {"content": "Caption one"}}]}
+        mock_post.return_value = resp
+        overflow = "SHOULD_NOT_APPEAR"
+        response = self.client.post(self.url, {"ai_action": "generate_caption", "prompt": ("A" * 4000) + overflow})
+        self.assertEqual(response.status_code, 200)
+        content = mock_post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("A" * 4000, content)
+        self.assertNotIn(overflow, content)
+
+    @patch("apps.credentials.ai_providers.httpx.post")
     def test_provider_error_maps_to_502(self, mock_post):
         import httpx
 
