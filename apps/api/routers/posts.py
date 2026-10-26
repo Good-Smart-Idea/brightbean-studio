@@ -408,6 +408,38 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
     return _post_to_response(request, post)
 
 
+@router.post("/{post_id}/submit-for-review", response=PostResponse, summary="Submit a draft for internal approval")
+def submit_for_review(request, post_id: uuid.UUID):
+    """Request human review without scheduling, approving, or publishing.
+
+    Pending-review retries are a no-op. Lock the post and its children so
+    concurrent submissions cannot create duplicate approval actions.
+    """
+    from django.db import transaction
+
+    from apps.approvals.services import submit_for_review as submit_post_for_review
+    from apps.composer.models import PlatformPost
+
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "create_posts")
+    scoped_post = _get_workspace_post(request, post_id)
+    if scoped_post.author_id != request.user.id:
+        _require_perm(request, "edit_others_posts")
+
+    with transaction.atomic():
+        post = Post.objects.select_for_update().get(id=scoped_post.id)
+        children = list(PlatformPost.objects.select_for_update().filter(post=post))
+        states = {pp.status for pp in children}
+        if not states or not states.issubset({"draft", "pending_review"}):
+            raise HttpError(409, "Only draft or already pending-review posts can be submitted.")
+        if "draft" in states:
+            submit_post_for_review(post, request.user, post.workspace)
+
+    post.refresh_from_db()
+    log_audit_entry(request, action="post.submit_for_review", target_id=post.id, status_code=200)
+    return _post_to_response(request, post)
+
+
 @router.post("/{post_id}/schedule", response=PostResponse, summary="Schedule a draft")
 def schedule(request, post_id: uuid.UUID, payload: ScheduleRequest):
     enforce_http_rate_limits(request, is_write=True)
