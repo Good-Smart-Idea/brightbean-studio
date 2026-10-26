@@ -57,7 +57,13 @@ can_approve, display_timezone, and the parent Alpine scope (selectedPosts, diffO
                 {% if post.media_attachments.all %}
                 <div class="flex gap-2 mb-3 flex-wrap">
                     {% for pm in post.media_attachments.all %}
-                    {% if pm.media_asset.thumbnail %}
+                    {% if pm.media_asset.is_video and pm.media_asset.file %}
+                    <video src="{{ pm.media_asset.file.url }}" controls playsinline muted preload="metadata"
+                           aria-label="Review video: {{ pm.media_asset.filename }}"
+                           class="w-full rounded-lg bg-black object-contain" style="max-height: 480px;">
+                        <a href="{{ pm.media_asset.file.url }}" target="_blank" rel="noopener">Open video</a>
+                    </video>
+                    {% elif pm.media_asset.thumbnail %}
                     <img src="{{ pm.media_asset.thumbnail.url }}" alt="" class="w-14 h-14 rounded-lg object-cover border border-stone-200">
                     {% elif pm.media_asset.file and pm.media_asset.media_type == 'image' %}
                     <img src="{{ pm.media_asset.file.url }}" alt="" class="w-14 h-14 rounded-lg object-cover border border-stone-200">

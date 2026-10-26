@@ -6,12 +6,15 @@ Context: media_attachments, post, workspace.
 {% for attachment in media_attachments %}
 <div class="media-thumb" draggable="true">
     {% if attachment.media_asset.is_video %}
-    <video src="{{ attachment.media_asset.file.url }}#t=0.5" data-asset-id="{{ attachment.media_asset.id }}" class="w-full h-full object-cover" muted preload="metadata"></video>
+    <a href="{{ attachment.media_asset.file.url }}" target="_blank" rel="noopener"
+       aria-label="Play video: {{ attachment.media_asset.filename }}" class="block w-full h-full bg-black">
+        <video src="{{ attachment.media_asset.file.url }}#t=0.5" data-asset-id="{{ attachment.media_asset.id }}" class="w-full h-full object-contain" muted playsinline preload="metadata"></video>
     <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
         <div class="w-5 h-5 rounded-full bg-black/50 flex items-center justify-center">
             <svg class="w-2.5 h-2.5 text-white ml-px" fill="currentColor" viewBox="0 0 20 20"><path d="M6.3 2.841A1.5 1.5 0 004 4.11V15.89a1.5 1.5 0 002.3 1.269l9.344-5.89a1.5 1.5 0 000-2.538L6.3 2.84z"/></svg>
         </div>
     </div>
+    </a>
     {% elif attachment.media_asset.thumbnail %}
     <img src="{{ attachment.media_asset.thumbnail.url }}" alt="{{ attachment.alt_text|default:attachment.media_asset.filename }}">
     {% elif attachment.media_asset.file %}
