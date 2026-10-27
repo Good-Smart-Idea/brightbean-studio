@@ -393,9 +393,9 @@ class PlatformPost(models.Model):
     # ``derive_post_status``.
     VALID_TRANSITIONS = {
         "draft": {"pending_review", "scheduled", "publishing"},
-        "pending_review": {"approved", "changes_requested", "rejected"},
+        "pending_review": {"approved", "changes_requested", "rejected", "draft"},
         "approved": {"pending_client", "scheduled", "publishing", "draft", "on_hold", "pending_review"},
-        "pending_client": {"approved", "changes_requested", "rejected"},
+        "pending_client": {"approved", "changes_requested", "rejected", "draft"},
         "changes_requested": {"pending_review", "draft"},
         "rejected": {"draft", "pending_review"},
         "scheduled": {"publishing", "draft"},
