@@ -37,6 +37,7 @@ from apps.composer.models import PlatformPost
 from apps.composer.services import publish_blocker, usable_media_types
 from apps.credentials.models import resolve_platform_credentials
 from apps.media_library.storage import download_to_path
+from apps.publisher.native_uploads import NativeUploadCache
 from apps.social_accounts.error_messages import (
     FIRST_COMMENT_GENERIC_MESSAGE,
     PUBLISH_CONFIRM_TIMEOUT_MESSAGE,
@@ -49,6 +50,7 @@ from apps.social_accounts.error_messages import (
     friendly_publish_error,
     is_credential_rejection,
 )
+from apps.social_accounts.native_video import instagram_native_credentials
 from providers import VIDEO_POST_TYPES, get_provider
 from providers.exceptions import ProviderError, PublishError, RateLimitError
 from providers.types import PostType, PublishContent, PublishState
@@ -105,9 +107,13 @@ def _resolve_publish_credentials(account):
             )
     elif platform == "facebook":
         credentials["page_id"] = account.account_platform_id
+        credentials["native_video_account_connected"] = (
+            not account.needs_reconnect and not account.workspace.is_archived
+        )
     elif platform in ("instagram", "instagram_login"):
         credentials["ig_user_id"] = account.account_platform_id
         if platform == "instagram":
+            credentials.update(instagram_native_credentials(account))
             credentials["page_id"] = account.webhook_target_id
             credentials["missing_scopes"] = account.missing_scopes
             credentials["messaging_access"] = account.messaging_access
@@ -755,7 +761,26 @@ class PublishEngine:
         # Refreshes an expiring token first — covers OAuth2 providers *and*
         # session providers like Bluesky, whose accessJwt expires after only a
         # few hours and must be renewed before each publish.
-        provider, access_token = _provider_and_access_token(account)
+        initial_assets = [pm.media_asset for pm in attachments if pm.media_asset.file]
+        initial_type = self._resolve_post_type(
+            platform=platform,
+            platform_extra=platform_post.platform_extra or {},
+            media_count=len(initial_assets),
+            first_media_type=initial_assets[0].media_type if initial_assets else None,
+        )
+        native_video = (
+            platform == "instagram"
+            and initial_type in (PostType.REEL, PostType.VIDEO)
+            or platform == "facebook"
+            and initial_type == PostType.REEL
+        )
+        if native_video:
+            # Native Meta video uses only the existing same-account grant.
+            # Configuration preflight and dispatch never refresh or widen it.
+            provider = get_provider(platform, _resolve_publish_credentials(account))
+            access_token = account.oauth_access_token
+        else:
+            provider, access_token = _provider_and_access_token(account)
 
         # Download media from storage (S3/cloud) to temp files for upload
         # and collect public URLs (presigned R2 / absolute) for providers
@@ -782,22 +807,23 @@ class PublishEngine:
         # so pulling the bytes down for them is pure cost — and on a small dyno
         # an expensive one. The loop below still runs for them: it is also what
         # collects media_urls, first_media_type and the video duration.
-        needs_local_media = provider.needs_local_media
+        available_assets = [pm.media_asset for pm in attachments if pm.media_asset.file]
+        platform_extra = platform_post.platform_extra or {}
+        post_type = self._resolve_post_type(
+            platform=platform,
+            platform_extra=platform_extra,
+            media_count=len(available_assets),
+            first_media_type=available_assets[0].media_type if available_assets else None,
+        )
+        needs_local_media = provider.needs_local_media or post_type in getattr(provider, "binary_video_post_types", ())
 
-        first_media_type = None
         primary_video_duration = None
-        usable_attachments = 0
         app_url = getattr(settings, "APP_URL", "").rstrip("/")
         try:
             for pm in attachments:
                 asset = pm.media_asset
                 if not asset.file:
                     continue
-                usable_attachments += 1
-                # Track the first media type for post type detection
-                if first_media_type is None:
-                    first_media_type = asset.media_type
-
                 # Capture the first video's duration so providers can enforce
                 # platform max-duration limits (e.g. TikTok max_video_post_duration_sec).
                 if primary_video_duration is None and asset.media_type == "video":
@@ -868,16 +894,6 @@ class PublishEngine:
                 except MediaAsset.DoesNotExist:
                     logger.warning("Cover image asset %s not found", cover_asset_id)
 
-            post_type = self._resolve_post_type(
-                platform=platform,
-                platform_extra=platform_extra,
-                # Count attachments, NOT downloaded files: media_files is empty
-                # for URL-only providers, and counting it there would silently
-                # demote every Instagram/Threads carousel to a single post.
-                media_count=usable_attachments,
-                first_media_type=first_media_type,
-            )
-
             content = PublishContent(
                 text=platform_post.effective_caption or "",
                 title=platform_post.effective_title,
@@ -893,7 +909,11 @@ class PublishEngine:
                 # Stable per PlatformPost, so every retry of this row sends the
                 # same key; a clone or a new post is a new row and a new key.
                 idempotency_key=f"brightbean-{platform_post.id}",
-                upload_cache=_provider_upload_cache,
+                upload_cache=(
+                    NativeUploadCache(platform_post)
+                    if post_type in getattr(provider, "binary_video_post_types", ())
+                    else _provider_upload_cache
+                ),
                 should_stop=SHUTDOWN_REQUESTED.is_set,
             )
 
