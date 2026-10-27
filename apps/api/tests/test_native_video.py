@@ -262,3 +262,100 @@ def test_org_shared_media_requires_same_organization(native_case, foreign):
         write(cache, "creating")
         native_case[6].refresh_from_db()
         assert native_case[6].native_upload_state["progress"]["phase"] == "creating"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "change", ["same", "ig_grant", "page_grant", "author", "workspace", "media_ownership", "missing_digest"]
+)
+def test_new_worker_rejects_changed_binding_before_provider_post(native_case, tmp_path, change):
+    import copy
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from apps.accounts.models import User
+    from apps.composer.models import PostMedia
+    from apps.media_library.models import MediaAsset
+    from apps.organizations.models import Organization
+    from apps.workspaces.models import Workspace
+    from providers.meta_video import publish_native_video
+    from providers.types import PostType, PublishContent
+
+    account, post, child = native_case[2], native_case[5], native_case[6]
+    if change == "page_grant":
+        account.platform = "facebook"
+        account.save(update_fields=["platform"])
+    asset = MediaAsset.objects.create(
+        workspace=None,
+        organization=native_case[1].organization,
+        file="shared/video.mp4",
+        filename="video.mp4",
+        media_type="video",
+        processing_status="completed",
+    )
+    PostMedia.objects.create(post=post, media_asset=asset)
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"immutable video bytes")
+    content = PublishContent(
+        text=post.caption,
+        media_files=[str(path)],
+        post_type=PostType.REEL,
+        idempotency_key=str(child.pk),
+        upload_cache=NativeUploadCache(child),
+    )
+    provider = MagicMock(platform_name="Instagram")
+    provider._request.return_value = httpx.Response(200, json={"success": True})
+    arguments = dict(
+        target="1784",
+        token="synthetic",
+        kind="ig-api-upload",
+        create=lambda: ("container1", "https://rupload.facebook.com/ig-api-upload/v25.0/container1"),
+        wait=MagicMock(side_effect=PublishError("processing timed out")),
+        publish=MagicMock(),
+    )
+    with pytest.raises(PublishError, match="processing timed out"):
+        publish_native_video(provider, content, **arguments)
+    child.refresh_from_db()
+    original = copy.deepcopy(child.native_upload_state)
+    if change in ("ig_grant", "page_grant"):
+        if change == "ig_grant":
+            account.oauth_facebook_user_access_token = "rotated-user-grant"
+        else:
+            account.oauth_access_token = "rotated-page-grant"
+        account.save()
+    elif change == "author":
+        post.author = User.objects.create_user(
+            email="changed-native-author@example.com", password="testpass", name="Other"
+        )
+        post.save(update_fields=["author"])
+    elif change == "workspace":
+        post.workspace = Workspace.objects.create(name="Moved", organization=native_case[1].organization)
+        post.save(update_fields=["workspace"])
+    elif change == "media_ownership":
+        asset.organization = Organization.objects.create(name="Foreign native media")
+        asset.save(update_fields=["organization"])
+    elif change == "missing_digest":
+        child.native_upload_state.pop("binding")
+        child.save(update_fields=["native_upload_state"])
+        original = copy.deepcopy(child.native_upload_state)
+    content.upload_cache = NativeUploadCache(PlatformPost.objects.get(pk=child.pk))
+    provider._request.reset_mock()
+    if change == "same":
+        from providers.types import PublishResult
+
+        arguments["wait"] = MagicMock()
+        arguments["publish"] = MagicMock(return_value=PublishResult(platform_post_id="published1"))
+        result = publish_native_video(provider, content, **arguments)
+        assert result.platform_post_id == "published1"
+        arguments["publish"].assert_called_once_with("container1")
+        provider._request.assert_not_called()
+        child.refresh_from_db()
+        assert child.native_upload_state["progress"]["phase"] == "complete"
+        return
+    with pytest.raises(PublishError):
+        publish_native_video(provider, content, **arguments)
+    provider._request.assert_not_called()
+    child.refresh_from_db()
+    assert child.native_upload_state == original
+    assert child.native_upload_state["progress"]["upload_id"] == "container1"

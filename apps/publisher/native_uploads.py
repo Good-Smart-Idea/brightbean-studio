@@ -20,6 +20,9 @@ class NativeUploadCache:
     def __init__(self, platform_post):
         self.pk = platform_post.pk
         self.binding = self._binding(platform_post)
+        self.binding_digest = hashlib.sha256(
+            json.dumps(self.binding, default=str, separators=(",", ":")).encode()
+        ).hexdigest()
         self.seen = None
         self.loaded = False
 
@@ -38,7 +41,9 @@ class NativeUploadCache:
             str(account.account_platform_id),
             row.effective_caption,
             hashlib.sha256(str(token or "").encode()).hexdigest(),
-            str(account.facebook_user_token_expires_at) if account.platform == "instagram" else None,
+            account.facebook_user_token_expires_at.timestamp()
+            if account.platform == "instagram" and account.facebook_user_token_expires_at is not None
+            else None,
             json.dumps(row.platform_specific_media, sort_keys=True),
             json.dumps(row.platform_extra, sort_keys=True),
             tuple(
@@ -54,6 +59,7 @@ class NativeUploadCache:
             .select_related("post__workspace", "social_account__workspace")
             .get(pk=self.pk)
         )
+        binding = self._binding(row)
         if (
             row.status != PlatformPost.Status.PUBLISHING
             or row.platform_post_id
@@ -64,9 +70,9 @@ class NativeUploadCache:
             or any(
                 asset_workspace != row.post.workspace_id
                 and not (asset_workspace is None and asset_org == row.post.workspace.organization_id)
-                for _, _, asset_workspace, asset_org in self._binding(row)[-1]
+                for _, _, asset_workspace, asset_org in binding[-1]
             )
-            or self._binding(row) != self.binding
+            or binding != self.binding
         ):
             raise PublishError(
                 "Native upload authorization or content changed; reconcile before retrying.", retryable=False
@@ -80,7 +86,7 @@ class NativeUploadCache:
             self.seen = row.native_upload_state
             if not self.seen:
                 return None
-            if self.seen.get("key") != key:
+            if self.seen.get("key") != key or self.seen.get("binding") != self.binding_digest:
                 raise PublishError(
                     "Native upload content changed; reconcile the existing session before retrying.", retryable=False
                 )
@@ -121,7 +127,7 @@ class NativeUploadCache:
                 raise PublishError("Native upload session changed.", retryable=False)
             if row.native_upload_state != self.seen:
                 raise PublishError("Native upload ownership changed; reconcile before retrying.", retryable=False)
-            state = {"key": key, "progress": progress}
+            state = {"key": key, "binding": self.binding_digest, "progress": progress}
             row.native_upload_state = state
             row.save(update_fields=["native_upload_state"])
             self.seen = state

@@ -30,7 +30,9 @@ or successful publication. No credentials or upload URLs are returned.
 excluded from generic API/composer input and `platform_extra`. Clones start empty.
 Its key hashes the stable child identity, canonical target, caption, post type,
 video size, and a streamed SHA-256 of the file bytes. Temporary paths and hosted
-URL queries do not affect it; no caption, token, local path, or media URL is stored.
+URL queries do not affect it. A separate canonical binding digest also rejects
+account/grant, author, attachment ownership, or storage identity changes across
+worker instances. No caption, token, local path, or media URL is stored.
 
 Each short transaction locks the child, rechecks workspace/account/content and
 publishing state, and compares the previous checkpoint. Locks are released before
