@@ -225,7 +225,7 @@ class TestScheduleRouteHonoursApprovalWorkflow:
 
         # Pre-create a draft directly (bypassing create_post so we can
         # isolate the schedule route).
-        post = Post.objects.create(workspace=workspace, caption="needs approval")
+        post = Post.objects.create(workspace=workspace, author=user, caption="needs approval")
         PlatformPost.objects.create(post=post, social_account=social_account, status="draft")
 
         when = (timezone.now() + timedelta(hours=1)).isoformat()
