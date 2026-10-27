@@ -234,31 +234,27 @@ def _privacy(row):
     return value[:64] if isinstance(value, str) else ""
 
 
-def _invalid_post_node(exc):
-    """Only a definitive missing/type Post node permits a bare-Video read.
+def _post_type_probe_allowed(exc):
+    """Permit one owner-verified Video probe for an unavailable Post type.
 
-    Never turn authentication, quota, transport, 5xx, malformed data, or a
-    generic exception into a second request against a different node type.
+    Graph code 100 can conflate a wrong node type with missing access. It
+    proves neither absence nor ownership. Only the second response's exact
+    Video ID and Page owner can establish a positive result.
     """
     raw = exc.raw_response if isinstance(exc.raw_response, dict) else {}
     error = raw.get("error") or {}
     error = error if isinstance(error, dict) else {}
     if error.get("code") in (10, 102, 190, 200):
         return False
-    message = str(error.get("message", "")).lower()
-    # Graph's combined "missing OR cannot load due to permissions" response
-    # is ambiguous, not a definitive type/not-found answer.
-    if any(marker in message for marker in ("permission", "access token", "session")):
-        return False
     if exc.status_code == 404:
         return True
     if exc.status_code != 400 or error.get("code") != 100:
         return False
+    message = str(error.get("message", "")).lower()
     return any(
         marker in message
         for marker in (
             "unsupported get request",
-            "does not exist",
             "nonexisting field",
             "non-existing field",
             "unknown path components",
@@ -298,7 +294,7 @@ def fetch_facebook_video(account, platform_post) -> NativeVideoResponse:
             "GET", f"{FACEBOOK_HOST}/{canonical_id}", access_token=token, params={"fields": FACEBOOK_POST_FIELDS}
         ).json()
     except APIError as exc:
-        if not _invalid_post_node(exc):
+        if not _post_type_probe_allowed(exc):
             raise
         video = _read_video(provider, token, identifier, leaf)
         return NativeVideoResponse(

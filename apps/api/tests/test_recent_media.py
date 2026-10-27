@@ -327,11 +327,11 @@ def test_bare_video_only_after_definitive_missing_or_type_post(setup, fb_post, m
         (500, 1, "upstream failed"),
         (400, 190, "invalid access token"),
         (404, 200, "permission denied"),
-        (400, 100, "Unsupported get request; missing or cannot load due to permissions"),
+        (400, 100, "Permissions error without a node type marker"),
         (400, 100, "Invalid parameter"),
     ],
 )
-def test_no_bare_video_probe_on_auth_quota_server_or_ambiguous_error(
+def test_no_bare_video_probe_on_auth_quota_server_or_unrelated_error(
     setup, fb_post, monkeypatch, status, code, message
 ):
     error = APIError("never-return", status_code=status, raw_response={"error": {"code": code, "message": message}})
@@ -433,3 +433,42 @@ def test_non_numeric_object_reference_never_followed(setup, fb_post, monkeypatch
 )
 def test_facebook_permalink_keeps_only_essential_numeric_ids(url, expected):
     assert adapter._permalink(url, facebook=True) == expected
+
+
+def ambiguous_post_error():
+    return APIError(
+        "never-return",
+        status_code=400,
+        raw_response={
+            "error": {
+                "code": 100,
+                "error_subcode": 33,
+                "message": "Unsupported get request. Object does not exist or cannot load due to permissions",
+            }
+        },
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("owner,expected", [("456", 200), ("999", 502)])
+def test_ambiguous_post_can_only_establish_owner_verified_video(setup, fb_post, monkeypatch, owner, expected):
+    provider = fake_provider(
+        monkeypatch, {"id": "456"}, ambiguous_post_error(), video_node(id="987", **{"from": {"id": owner}})
+    )
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == expected
+    assert provider._request.call_count == 3
+    assert "never-return" not in response.content.decode()
+    if expected == 200:
+        assert response.json()["receipt_node_type"] == "video"
+        assert response.json()["post_is_published"] is None
+        assert response.json()["public_visibility_verified"] is False
+
+
+@pytest.mark.django_db
+def test_both_node_reads_unavailable_never_claim_absence(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, ambiguous_post_error(), ambiguous_post_error())
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 502
+    assert provider._request.call_count == 3
+    assert "never-return" not in response.content.decode()
