@@ -261,7 +261,8 @@ def transition_platform_post(
     # MCP transition tool, the composer's HTMX `transition_platform_post`
     # view) is covered.
     if target_status == "scheduled":
-        _require_approval_gate_passes(platform_post.post.workspace)
+        if platform_post.status != "approved":
+            _require_approval_gate_passes(platform_post.post.workspace)
         require_publishable(platform_post)
 
     with transaction.atomic():
