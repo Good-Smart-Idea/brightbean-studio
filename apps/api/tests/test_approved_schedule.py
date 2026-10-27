@@ -134,3 +134,18 @@ def test_approved_preserves_account_scope_media_and_quota(review_case, schedule_
     assert not schedule_call[0]()
     child.refresh_from_db()
     assert child.status == "approved"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("persisted_state", ["draft", "pending_client"])
+def test_service_never_trusts_stale_approved_instance(review_case, persisted_state):
+    from apps.composer.services import transition_platform_post
+
+    child = review_case[6]
+    PlatformPost.objects.filter(pk=child.pk).update(status=persisted_state)
+    child.status = "approved"
+    with pytest.raises(ValueError):
+        transition_platform_post(child, "scheduled", scheduled_at=timezone.now())
+    child.refresh_from_db()
+    assert child.status == persisted_state
+    assert child.scheduled_at is None
