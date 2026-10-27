@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from ninja import Query, Router
+from ninja import Query, Router, Schema
 from ninja.errors import HttpError
 
 from apps.api.limits import enforce_http_rate_limits
@@ -96,4 +96,36 @@ def published_media(request, account_id: uuid.UUID, platform_post_id: uuid.UUID)
     except Exception:
         raise HttpError(502, "Native video could not be verified. No post was changed or retried.") from None
     log_audit_entry(request, action="accounts.published_media", target_id=account.id, status_code=200)
+    return result
+
+
+class NativeVideoConfigurationResponse(Schema):
+    supported: bool
+    configured: bool
+    blocker: str
+    provider_eligibility_verified: bool = False
+
+
+@router.get(
+    "/{account_id}/native-video-readiness",
+    response=NativeVideoConfigurationResponse,
+    summary="Read scoped native-video credential configuration without contacting Meta",
+    description=(
+        "Configuration preflight only: no token values, provider requests, refreshes, "
+        "grants, scheduling, or publication. A configured grant is not verified provider eligibility."
+    ),
+)
+def native_video_readiness(request, account_id: uuid.UUID):
+    from django.http import Http404
+
+    from apps.social_accounts.native_video import native_video_configuration
+
+    enforce_http_rate_limits(request, is_write=False)
+    _require_perm(request, "create_posts")
+    _require_perm(request, "publish_directly")
+    account = _resolve_account(request, account_id)
+    if account.workspace_id != request.api_key.workspace_id:
+        raise Http404()
+    result = native_video_configuration(account)
+    log_audit_entry(request, action="accounts.native_video_configuration", target_id=account.id, status_code=200)
     return result

@@ -19,6 +19,7 @@ from .meta_messaging import (
     resolve_recipient_id,
 )
 from .meta_oauth import facebook_login_params
+from .meta_video import publish_native_video, require_facebook_native_configuration
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -99,10 +100,10 @@ FACEBOOK_MAX_ATTACHED_MEDIA = 10
 class FacebookProvider(SocialProvider):
     """Facebook Graph API v25.0 provider."""
 
-    # Publishes from hosted URLs only — the platform fetches the media
-    # itself, so ``PublishContent.media_files`` is never read and the engine
-    # can skip downloading the asset to local disk entirely.
+    # Images and legacy modes use hosted URLs. Only the explicitly listed
+    # native video modes prepare local bytes through the engine cache.
     needs_local_media = False
+    binary_video_post_types = frozenset({PostType.REEL})
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -496,6 +497,53 @@ class FacebookProvider(SocialProvider):
                 "Facebook Reels must be between 3 and 90 seconds",
                 platform=self.platform_name,
                 retryable=False,
+            )
+
+        if content.media_files:
+            require_facebook_native_configuration(self.credentials, access_token)
+            target = str(self.credentials["page_id"])
+            if str(page_id) != target:
+                raise PublishError(
+                    "Facebook video target does not match its connected Page.",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+
+            def create():
+                data = self._request(
+                    "POST",
+                    f"{BASE_URL}/{target}/video_reels",
+                    access_token=access_token,
+                    data={"upload_phase": "start"},
+                ).json()
+                return data.get("video_id"), data.get("upload_url")
+
+            def finish(video_id):
+                payload = {"upload_phase": "finish", "video_id": video_id, "video_state": "PUBLISHED"}
+                if content.text:
+                    payload["description"] = content.text
+                data = self._request(
+                    "POST", f"{BASE_URL}/{target}/video_reels", access_token=access_token, data=payload
+                ).json()
+                if data.get("success") is not True:
+                    raise PublishError(
+                        "Facebook did not confirm Reel publication.", platform=self.platform_name, retryable=False
+                    )
+                return PublishResult(
+                    platform_post_id=self._stored_post_id(video_id),
+                    url=f"https://www.facebook.com/reel/{video_id}",
+                    extra={"video_id": video_id},
+                )
+
+            return publish_native_video(
+                self,
+                content,
+                target=target,
+                token=access_token,
+                kind="video-upload",
+                create=create,
+                wait=lambda _: None,
+                publish=finish,
             )
 
         start_data = self._request(

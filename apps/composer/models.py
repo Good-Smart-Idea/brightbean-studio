@@ -457,6 +457,9 @@ class PlatformPost(models.Model):
         help_text="Per-platform metadata (privacy, tags, thumbnail_asset_id, etc.)",
     )
 
+    # Internal durable native-video progress; never accepted as composer/API input.
+    native_upload_state = models.JSONField(default=dict, db_default={}, blank=True, editable=False)
+
     # Editorial + publishing state
     status = models.CharField(
         max_length=30,

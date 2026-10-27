@@ -32,6 +32,7 @@ from .meta_messaging import (
     validate_instagram_text,
 )
 from .meta_oauth import facebook_login_params
+from .meta_video import publish_native_video, require_instagram_native_token
 from .types import (
     AccountMetrics,
     AccountProfile,
@@ -98,10 +99,10 @@ CONTAINER_POLL_TIMEOUT = 120  # seconds
 class InstagramProvider(SocialProvider):
     """Instagram Graph API provider (via Facebook Graph API v25.0)."""
 
-    # Publishes from hosted URLs only — the platform fetches the media
-    # itself, so ``PublishContent.media_files`` is never read and the engine
-    # can skip downloading the asset to local disk entirely.
+    # Images and legacy modes use hosted URLs. Only the explicitly listed
+    # native video modes prepare local bytes through the engine cache.
     needs_local_media = False
+    binary_video_post_types = frozenset({PostType.REEL, PostType.VIDEO})
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -323,6 +324,33 @@ class InstagramProvider(SocialProvider):
     # ------------------------------------------------------------------
 
     def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
+        if content.post_type in self.binary_video_post_types and content.media_files:
+            token = require_instagram_native_token(self.credentials)
+            target = str(self.credentials["ig_user_id"])
+            if str(content.extra.get("ig_user_id") or target) != target:
+                raise PublishError(
+                    "Instagram video target does not match its connected account.",
+                    platform=self.platform_name,
+                    retryable=False,
+                )
+
+            def create():
+                payload = {"media_type": "REELS", "upload_type": "resumable"}
+                if content.text:
+                    payload["caption"] = content.text
+                data = self._request("POST", f"{BASE_URL}/{target}/media", access_token=token, json=payload).json()
+                return data.get("id"), data.get("uri")
+
+            return publish_native_video(
+                self,
+                content,
+                target=target,
+                token=token,
+                kind="ig-api-upload",
+                create=create,
+                wait=lambda container: self._wait_for_container(token, container, should_stop=content.should_stop),
+                publish=lambda container: self._publish_container(token, target, container),
+            )
         if not content.media_urls:
             raise PublishError(
                 "Instagram requires at least one media item",
@@ -423,7 +451,7 @@ class InstagramProvider(SocialProvider):
             )
         return container_id
 
-    def _wait_for_container(self, access_token: str, container_id: str) -> None:
+    def _wait_for_container(self, access_token: str, container_id: str, *, should_stop=None) -> None:
         """Poll container status until FINISHED or error."""
 
         def finished() -> bool:
@@ -448,6 +476,7 @@ class InstagramProvider(SocialProvider):
             deadline=time.monotonic() + CONTAINER_POLL_TIMEOUT,
             interval=CONTAINER_POLL_INTERVAL,
             on_timeout=lambda: PublishError("Instagram container processing timed out", platform=self.platform_name),
+            should_stop=should_stop,
         )
 
     def _publish_container(self, access_token: str, ig_user_id: str, container_id: str) -> PublishResult:
