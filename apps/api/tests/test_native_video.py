@@ -359,3 +359,67 @@ def test_new_worker_rejects_changed_binding_before_provider_post(native_case, tm
     child.refresh_from_db()
     assert child.native_upload_state == original
     assert child.native_upload_state["progress"]["upload_id"] == "container1"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("complete", [False, True])
+def test_new_worker_natural_expiry_preserves_only_confirmed_receipt(native_case, tmp_path, complete):
+    import copy
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from apps.social_accounts.models import SocialAccount
+    from apps.social_accounts.native_video import instagram_native_credentials
+    from providers.instagram import InstagramProvider
+    from providers.types import PostType, PublishContent
+
+    account, child = native_case[2], native_case[6]
+    account.facebook_user_token_expires_at = datetime.fromtimestamp(1100, UTC)
+    account.save(update_fields=["facebook_user_token_expires_at"])
+    path = tmp_path / "video.mp4"
+    path.write_bytes(b"same stored video")
+    content = PublishContent(
+        text=child.effective_caption,
+        media_files=[str(path)],
+        post_type=PostType.REEL,
+        idempotency_key=str(child.pk),
+        upload_cache=NativeUploadCache(child),
+    )
+    provider = InstagramProvider(instagram_native_credentials(account))
+    provider._request = MagicMock(
+        side_effect=[
+            httpx.Response(
+                200, json={"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"}
+            ),
+            httpx.Response(200, json={"success": True}),
+            httpx.Response(200, json={"id": "published1"}),
+        ]
+    )
+    provider._wait_for_container = MagicMock()
+    with patch("providers.meta_video.time.time", return_value=1000):
+        if complete:
+            provider.publish_post("page", content)
+        else:
+            provider._wait_for_container.side_effect = PublishError("processing timed out")
+            with pytest.raises(PublishError):
+                provider.publish_post("page", content)
+    child.refresh_from_db()
+    original = copy.deepcopy(child.native_upload_state)
+    content.upload_cache = NativeUploadCache(PlatformPost.objects.get(pk=child.pk))
+    replacement = InstagramProvider(instagram_native_credentials(SocialAccount.objects.get(pk=account.pk)))
+    replacement._request = MagicMock(side_effect=AssertionError("no HTTP"))
+    replacement._wait_for_container = MagicMock(side_effect=AssertionError("no processing poll"))
+    with patch("providers.meta_video.time.time", return_value=10000):
+        if complete:
+            result = replacement.publish_post("page", content)
+            assert result.platform_post_id == "published1"
+            assert result.url is None
+        else:
+            with pytest.raises(PublishError, match="user grant.*expired"):
+                replacement.publish_post("page", content)
+    replacement._request.assert_not_called()
+    replacement._wait_for_container.assert_not_called()
+    child.refresh_from_db()
+    assert child.native_upload_state == original

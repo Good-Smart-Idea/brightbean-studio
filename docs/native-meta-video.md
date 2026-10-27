@@ -6,7 +6,9 @@ ask Meta to fetch BrightBean's hosted asset URL. Instagram Login, images,
 carousels, stories, and regular Facebook Page videos retain their existing paths.
 This change does not alter Cloudflare Access or make media public. Native Instagram
 Reels explicitly request `share_to_feed=true`; actual profile/feed placement still
-requires native verification.
+requires native verification. Native results retain the confirmed media ID
+and return no fabricated permalink; a numeric Graph ID is not an Instagram
+shortcode.
 
 The engine reuses its storage-backed local media cache. Native dispatch never
 refreshes credentials: Instagram uses the existing Facebook **user** grant on
@@ -37,8 +39,12 @@ worker instances. No caption, token, local path, or media URL is stored.
 Each short transaction locks the child, rechecks workspace/account/content and
 publishing state, and compares the previous checkpoint. Locks are released before
 network I/O. The phases are creating, created, uploading, uploaded, publishing,
-and complete. IDs are retained for reconciliation. Sessions expire after one hour;
-expiry blocks reuse and never silently creates another session.
+and complete. IDs are retained for reconciliation. Incomplete upload sessions
+expire after one hour; expiry blocks reuse and never silently creates another
+session. Confirmed publication receipts do not expire with the upload session.
+They can be recovered after natural grant expiry with no provider request, but
+only when the persisted binding is unchanged. Incomplete sessions require a
+valid configured grant even before a processing-status read.
 
 A processing timeout leaves `uploaded` intact. A new worker polls the same
 container and then publishes it once. Before every external write its phase is

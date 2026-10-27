@@ -70,7 +70,9 @@ def test_instagram_raw_upload_uses_user_grant_and_no_public_url(content):
         return response({"status_code": "FINISHED"})
 
     provider._request = request
-    assert provider.publish_post("synthetic-page-grant", content).platform_post_id == "published1"
+    result = provider.publish_post("synthetic-page-grant", content)
+    assert result.platform_post_id == "published1"
+    assert result.url is None
     assert all(row[2].get("access_token", "synthetic-user-grant") == "synthetic-user-grant" for row in seen)
     assert "protected.invalid" not in repr(seen)
 
@@ -273,3 +275,75 @@ def test_actual_http_client_does_not_follow_upload_redirect(content):
         instagram().publish_post("page", content)
     assert len(seen) == 2
     assert all("attacker.invalid" not in url for url, _ in seen)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_upload_ttl_does_not_expire_confirmed_receipt(content, complete):
+    import copy
+    from unittest.mock import patch
+
+    provider = instagram()
+    provider._request = MagicMock(
+        side_effect=[
+            response({"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"}),
+            response({"success": True}),
+            response({"id": "published1"}),
+        ]
+    )
+    provider._wait_for_container = MagicMock()
+    with patch("providers.meta_video.time.time", return_value=1000):
+        if complete:
+            assert provider.publish_post("page", content).platform_post_id == "published1"
+        else:
+            provider._wait_for_container.side_effect = PublishError("processing timed out")
+            with pytest.raises(PublishError):
+                provider.publish_post("page", content)
+    original = copy.deepcopy(content.upload_cache.data)
+    provider._request.reset_mock()
+    replacement = instagram()
+    replacement._request = MagicMock(side_effect=AssertionError("no provider request"))
+    with patch("providers.meta_video.time.time", return_value=10000):
+        if complete:
+            assert replacement.publish_post("page", content).platform_post_id == "published1"
+        else:
+            with pytest.raises(PublishError, match="session expired"):
+                provider.publish_post("page", content)
+    provider._request.assert_not_called()
+    assert content.upload_cache.data == original
+    replacement._request.assert_not_called()
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_natural_grant_expiry_allows_only_confirmed_receipt_recovery(content, complete):
+    from unittest.mock import patch
+
+    provider = instagram()
+    provider.credentials["facebook_user_token_expires_at"] = 1100
+    provider._request = MagicMock(
+        side_effect=[
+            response({"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"}),
+            response({"success": True}),
+            response({"id": "published1"}),
+        ]
+    )
+    provider._wait_for_container = MagicMock()
+    with patch("providers.meta_video.time.time", return_value=1000):
+        if complete:
+            provider.publish_post("page", content)
+        else:
+            provider._wait_for_container.side_effect = PublishError("processing timed out")
+            with pytest.raises(PublishError):
+                provider.publish_post("page", content)
+    original = dict(content.upload_cache.data)
+    provider._request.reset_mock()
+    provider._wait_for_container.reset_mock()
+    with patch("providers.meta_video.time.time", return_value=1200):
+        if complete:
+            assert provider.publish_post("page", content).platform_post_id == "published1"
+        else:
+            with pytest.raises(PublishError, match="user grant.*expired") as error:
+                provider.publish_post("page", content)
+            assert error.value.retryable is False
+    provider._request.assert_not_called()
+    provider._wait_for_container.assert_not_called()
+    assert content.upload_cache.data == original

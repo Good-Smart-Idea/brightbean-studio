@@ -325,8 +325,10 @@ class InstagramProvider(SocialProvider):
 
     def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
         if content.post_type in self.binary_video_post_types and content.media_files:
-            token = require_instagram_native_token(self.credentials)
-            target = str(self.credentials["ig_user_id"])
+            token = self.credentials.get("facebook_user_access_token") or ""
+            target = str(self.credentials.get("ig_user_id") or "")
+            if not target:
+                require_instagram_native_token(self.credentials)
             if str(content.extra.get("ig_user_id") or target) != target:
                 raise PublishError(
                     "Instagram video target does not match its connected account.",
@@ -341,6 +343,14 @@ class InstagramProvider(SocialProvider):
                 data = self._request("POST", f"{BASE_URL}/{target}/media", access_token=token, json=payload).json()
                 return data.get("id"), data.get("uri")
 
+            def publish(container):
+                result = self._publish_container(token, target, container)
+                # A Graph media ID is not an Instagram shortcode/permalink.
+                # Native readback can resolve the real link separately.
+                return PublishResult(
+                    platform_post_id=result.platform_post_id, extra={"video_id": result.platform_post_id}
+                )
+
             return publish_native_video(
                 self,
                 content,
@@ -350,7 +360,7 @@ class InstagramProvider(SocialProvider):
                 create=create,
                 authorize=lambda: require_instagram_native_token(self.credentials),
                 wait=lambda container: self._wait_for_container(token, container, should_stop=content.should_stop),
-                publish=lambda container: self._publish_container(token, target, container),
+                publish=publish,
             )
         if not content.media_urls:
             raise PublishError(

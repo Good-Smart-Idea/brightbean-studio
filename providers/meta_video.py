@@ -133,6 +133,17 @@ def publish_native_video(provider, content, *, target, token, kind, create, wait
     cache = content.upload_cache
     raw = cache.get(key)
     state = json.loads(raw) if raw else {}
+    if state.get("phase") == "complete":
+        media_id = state.get("media_id")
+        if not isinstance(media_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", media_id):
+            raise PublishError(
+                "Invalid native publication checkpoint; reconcile before retrying.", platform=platform, retryable=False
+            )
+        return PublishResult(platform_post_id=media_id, extra={"video_id": media_id})
+    # A confirmed receipt needs no live grant. Incomplete sessions must be
+    # authorized even before read-only processing polls, and again per POST.
+    if authorize is not None:
+        authorize()
     expires_at = state.get("expires_at") or str(int(time.time()) + 3600)
     if int(expires_at) <= time.time():
         raise PublishError(
@@ -157,8 +168,6 @@ def publish_native_video(provider, content, *, target, token, kind, create, wait
             retryable=False,
         )
 
-    if state.get("phase") == "complete":
-        return PublishResult(platform_post_id=state["media_id"], extra={"video_id": state["media_id"]})
     if state and state.get("phase") != "uploaded":
         raise unconfirmed()
     if not state:
