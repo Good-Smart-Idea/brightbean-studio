@@ -599,32 +599,31 @@ def _schedule_draft(args: dict, context: dict[str, Any]) -> dict:
 
     api_key = context["api_key"]
     post = _get_post_for_key(api_key, args["post_id"])
-    drafts = [pp for pp in post.platform_posts.all() if pp.status == "draft"]
-    if not drafts:
-        raise JsonRpcError(INVALID_PARAMS, "No draft platform posts to schedule")
+    if post.author_id != context["membership"].user.id:
+        _require_perm(context, "edit_others_posts")
 
-    # Per-platform 24h quota check, one per child, BEFORE we mutate
-    # anything — over-quota fails the whole call with no partial commit.
-    for pp in drafts:
-        try:
-            check_platform_quota(pp.social_account)
-        except HttpError as exc:
-            raise JsonRpcError(
-                INVALID_PARAMS,
-                f"Per-platform daily quota reached for {pp.social_account.platform}: {exc.message}",
-            ) from exc
-
-    # Wrap the per-child loop in a single outer atomic — same reasoning
-    # as ``cancel_post``: a mid-loop ValueError (concurrent admin
-    # transition, state-machine rejection on a later child, workspace
-    # approval-mode rejection from ``transition_platform_post``) rolls
-    # back any earlier ``scheduled`` commits.
     with transaction.atomic():
-        for pp in drafts:
-            try:
-                transition_platform_post(pp, "scheduled", scheduled_at=scheduled_at)
-            except ValueError as exc:
-                raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+        post = Post.objects.select_for_update().get(id=post.id)
+        if post.author_id != context["membership"].user.id:
+            _require_perm(context, "edit_others_posts")
+        children = list(PlatformPost.objects.select_for_update().filter(post=post))
+        allowed_ids = set(api_key.social_accounts.values_list("id", flat=True))
+        if any(pp.social_account_id not in allowed_ids for pp in children):
+            raise JsonRpcError(INVALID_PARAMS, "Post not found")
+        retry = bool(children) and all(pp.status == "scheduled" and pp.scheduled_at == scheduled_at for pp in children)
+        if not retry:
+            if not children or any(pp.status not in {"draft", "approved"} for pp in children):
+                raise JsonRpcError(INVALID_PARAMS, "No draft or final-approved platform posts to schedule atomically")
+            for pp in children:
+                try:
+                    check_platform_quota(pp.social_account)
+                except HttpError as exc:
+                    raise JsonRpcError(INVALID_PARAMS, str(exc.message)) from exc
+            for pp in children:
+                try:
+                    transition_platform_post(pp, "scheduled", scheduled_at=scheduled_at)
+                except ValueError as exc:
+                    raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     post.refresh_from_db()
     return _wrap_text(_serialize_post(post, context))
 
@@ -633,7 +632,7 @@ register_tool(
     Tool(
         name="schedule_draft",
         description=(
-            "Schedule an EXISTING draft post — transitions every draft child to scheduled "
+            "Schedule an EXISTING draft or final-approved post — transitions all eligible children to scheduled "
             "at the given UTC timestamp. Use this for the two-step flow "
             "'create_draft now, schedule_draft later'. For one-shot create-and-schedule, "
             "use schedule_post instead. Requires both create_posts and publish_directly. "

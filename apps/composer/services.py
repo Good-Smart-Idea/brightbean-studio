@@ -253,18 +253,16 @@ def transition_platform_post(
 
     from apps.composer.models import PlatformPost
 
-    # Approval workflow gate — Codex review (PR #53) flagged that the
-    # ``POST /posts/{id}/schedule`` route reached this function with
-    # ``target_status="scheduled"`` and bypassed the approval check
-    # ``create_post`` enforces. The gate belongs here so EVERY path that
-    # promotes a draft to scheduled (REST `/schedule` route, any future
-    # MCP transition tool, the composer's HTMX `transition_platform_post`
-    # view) is covered.
-    if target_status == "scheduled":
-        _require_approval_gate_passes(platform_post.post.workspace)
-        require_publishable(platform_post)
-
     with transaction.atomic():
+        if target_status == "scheduled":
+            # Approval is persisted authority, not a caller-supplied status.
+            # Refresh the same instance under lock so revoked approval and
+            # concurrent state changes cannot be hidden by a stale object.
+            platform_post.refresh_from_db(from_queryset=PlatformPost.objects.select_for_update())
+            if platform_post.status != "approved":
+                _require_approval_gate_passes(platform_post.post.workspace)
+            require_publishable(platform_post)
+
         platform_post.transition_to(target_status)
         # Always include ``updated_at`` — Django docs: when ``update_fields``
         # is explicit, ``auto_now`` fields are NOT touched unless listed.

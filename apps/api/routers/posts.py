@@ -480,7 +480,7 @@ def return_to_draft(request, post_id: uuid.UUID):
     return _post_to_response(request, post)
 
 
-@router.post("/{post_id}/schedule", response=PostResponse, summary="Schedule a draft")
+@router.post("/{post_id}/schedule", response=PostResponse, summary="Schedule a draft or final-approved post")
 def schedule(request, post_id: uuid.UUID, payload: ScheduleRequest):
     enforce_http_rate_limits(request, is_write=True)
     # Same ``publish_directly`` contract as the create-with-schedule
@@ -490,33 +490,35 @@ def schedule(request, post_id: uuid.UUID, payload: ScheduleRequest):
     _require_perm(request, "publish_directly")
     post = _get_workspace_post(request, post_id)
 
-    # Schedule every draft child; a single-account key produces one child,
-    # but defensively we apply the transition to all draft children so we
-    # don't half-schedule.
-    drafts = list(post.platform_posts.filter(status="draft"))
-    if not drafts:
-        raise HttpError(409, "No draft platform posts to schedule.")
+    if post.author_id != request.user.id:
+        _require_perm(request, "edit_others_posts")
 
-    # Quota check is per-account, so we evaluate it once per child before
-    # we touch any state. Doing the checks first means an over-quota
-    # account fails the whole route with 429 — no partial commit.
-    for pp in drafts:
-        check_platform_quota(pp.social_account)
-
-    # Wrap the per-child transitions in a single outer atomic so a
-    # mid-loop ValueError rolls back any earlier ``scheduled`` commits.
-    # Without this, child 1 could be persisted as ``scheduled`` while
-    # child 2's ``transition_to`` rejects the move (concurrent admin
-    # edit, state-machine conflict) — the route 422s but the post is
-    # left in a half-scheduled state.
     from django.db import transaction
+    from django.http import Http404
+
+    from apps.composer.models import PlatformPost
 
     with transaction.atomic():
-        for pp in drafts:
-            try:
-                transition_platform_post(pp, "scheduled", scheduled_at=payload.scheduled_at)
-            except ValueError as exc:
-                raise HttpError(422, str(exc)) from exc
+        post = Post.objects.select_for_update().get(id=post.id)
+        if post.author_id != request.user.id:
+            _require_perm(request, "edit_others_posts")
+        children = list(PlatformPost.objects.select_for_update().filter(post=post))
+        allowed_ids = set(request.api_key.social_accounts.values_list("id", flat=True))
+        if any(pp.social_account_id not in allowed_ids for pp in children):
+            raise Http404()
+        retry = bool(children) and all(
+            pp.status == "scheduled" and pp.scheduled_at == payload.scheduled_at for pp in children
+        )
+        if not retry:
+            if not children or any(pp.status not in {"draft", "approved"} for pp in children):
+                raise HttpError(409, "No draft or final-approved platform posts to schedule atomically.")
+            for pp in children:
+                check_platform_quota(pp.social_account)
+            for pp in children:
+                try:
+                    transition_platform_post(pp, "scheduled", scheduled_at=payload.scheduled_at)
+                except ValueError as exc:
+                    raise HttpError(422, str(exc)) from exc
 
     post.refresh_from_db()
     log_audit_entry(request, action="post.schedule", target_id=post.id, status_code=200)
