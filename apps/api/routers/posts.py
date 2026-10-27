@@ -22,8 +22,9 @@ import uuid
 
 from django.http import HttpRequest
 from django.shortcuts import get_object_or_404
-from ninja import Router
+from ninja import Router, Schema
 from ninja.errors import HttpError
+from pydantic import Field
 
 from apps.api.limits import check_platform_quota, enforce_http_rate_limits
 from apps.api.middleware import (
@@ -477,6 +478,44 @@ def return_to_draft(request, post_id: uuid.UUID):
 
     post.refresh_from_db()
     log_audit_entry(request, action="post.return_to_draft", target_id=post.id, status_code=200)
+    return _post_to_response(request, post)
+
+
+class WithdrawApprovalRequest(Schema):
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+
+@router.post("/{post_id}/withdraw-approval", response=PostResponse, summary="Withdraw an unsent approval to draft")
+def withdraw_approval(request, post_id: uuid.UUID, payload: WithdrawApprovalRequest):
+    """An explicit, audited approval decision; never schedules or unpublishes."""
+    from django.db import transaction
+    from django.http import Http404
+
+    from apps.approvals.services import withdraw_approval as withdraw_post_approval
+    from apps.composer.models import PlatformPost
+
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "create_posts")
+    _require_perm(request, "approve_posts")
+    if not payload.reason.strip():
+        raise HttpError(422, "A withdrawal reason is required.")
+    scoped_post = _get_workspace_post(request, post_id)
+    with transaction.atomic():
+        post = Post.objects.select_for_update().get(id=scoped_post.id)
+        if post.workspace_id != request.api_key.workspace_id:
+            raise Http404()
+        if post.author_id != request.user.id:
+            _require_perm(request, "edit_others_posts")
+        children = list(PlatformPost.objects.select_for_update().filter(post=post))
+        allowed_ids = set(request.api_key.social_accounts.values_list("id", flat=True))
+        if any(pp.social_account_id not in allowed_ids for pp in children):
+            raise Http404()
+        try:
+            withdraw_post_approval(post, request.user, post.workspace, payload.reason)
+        except ValueError as exc:
+            raise HttpError(409, str(exc)) from exc
+        log_audit_entry(request, action="post.withdraw_approval", target_id=post.id, status_code=200)
+    post.refresh_from_db()
     return _post_to_response(request, post)
 
 

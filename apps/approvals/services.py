@@ -159,6 +159,45 @@ def withdraw_review(target, user, workspace):
     return moved
 
 
+def withdraw_approval(post, user, workspace, reason):
+    """Explicitly return an unsent approval to draft, retaining its audit.
+
+    Unlike review withdrawal, this decision requires an approval-capable caller.
+    Validate every locked child before touching any target; never erase a
+    provider receipt or recover an interrupted/failed publish as a draft.
+    """
+    reason = reason.strip()
+    if not reason or len(reason) > 2000:
+        raise ValueError("A withdrawal reason of 1 to 2000 characters is required.")
+    with transaction.atomic():
+        post.refresh_from_db(from_queryset=Post.objects.select_for_update())
+        if post.workspace_id != workspace.id:
+            raise ValueError("Post does not belong to this workspace.")
+        targets = list(PlatformPost.objects.select_for_update().filter(post=post))
+        if (
+            not targets
+            or post.published_at is not None
+            or post.scheduled_at is not None
+            or any(
+                pp.status not in {"draft", "approved"}
+                or pp.platform_post_id
+                or pp.published_at is not None
+                or pp.scheduled_at is not None
+                for pp in targets
+            )
+        ):
+            raise ValueError("Only unsent drafts or approvals can have approval withdrawn.")
+        moved = []
+        for pp in targets:
+            if pp.status == "approved":
+                if not _transition_or_skip(pp, "draft"):
+                    raise ValueError("Approval cannot be withdrawn from this target.")
+                moved.append(pp)
+        if moved:
+            _record_action(post, None, user, ApprovalAction.ActionType.WITHDRAWN, f"Approval withdrawn: {reason}")
+    return moved
+
+
 def approve_post(target, user, workspace, comment=""):
     """Approve a post or single platform post.
 
