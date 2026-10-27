@@ -25,19 +25,20 @@ class NativeUploadCache:
 
     @staticmethod
     def _binding(row):
+        account = row.social_account
+        token = (
+            account.oauth_facebook_user_access_token if account.platform == "instagram" else account.oauth_access_token
+        )
         return (
             str(row.post_id),
             str(row.post.workspace_id),
             str(row.post.author_id),
             str(row.social_account_id),
-            str(row.social_account.account_platform_id),
+            account.platform,
+            str(account.account_platform_id),
             row.effective_caption,
-            hashlib.sha256(
-                str(
-                    row.social_account.oauth_facebook_user_access_token or row.social_account.oauth_access_token or ""
-                ).encode()
-            ).hexdigest(),
-            str(row.social_account.facebook_user_token_expires_at),
+            hashlib.sha256(str(token or "").encode()).hexdigest(),
+            str(account.facebook_user_token_expires_at) if account.platform == "instagram" else None,
             json.dumps(row.platform_specific_media, sort_keys=True),
             json.dumps(row.platform_extra, sort_keys=True),
             tuple(

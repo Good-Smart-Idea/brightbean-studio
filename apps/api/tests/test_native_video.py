@@ -218,3 +218,19 @@ def test_engine_uses_storage_local_path_without_refresh_or_http_download(native_
     sent = provider.publish_post.call_args.args[1]
     assert sent.media_files == [str(local)]
     assert isinstance(sent.upload_cache, NativeUploadCache)
+
+
+@pytest.mark.django_db
+def test_facebook_page_grant_rotation_invalidates_checkpoint_even_with_user_grant(native_case):
+    account = native_case[2]
+    account.platform = "facebook"
+    account.save(update_fields=["platform"])
+    native_case[6].social_account = account
+    cache = NativeUploadCache(native_case[6])
+    cache.get("a" * 64)
+    account.oauth_access_token = "rotated-synthetic-page-grant"
+    account.save()
+    with pytest.raises(PublishError, match="authorization or content changed"):
+        write(cache, "creating")
+    native_case[6].refresh_from_db()
+    assert native_case[6].native_upload_state == {}
