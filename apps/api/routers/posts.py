@@ -440,6 +440,46 @@ def submit_for_review(request, post_id: uuid.UUID):
     return _post_to_response(request, post)
 
 
+@router.post("/{post_id}/return-to-draft", response=PostResponse, summary="Withdraw a pending review to draft")
+def return_to_draft(request, post_id: uuid.UUID):
+    """Withdraw an internal/client review without touching publish states.
+
+    Draft retries are no-ops. All children must be drafts or awaiting review;
+    a scheduled, approved, published, or otherwise non-review child rejects the
+    whole operation before any transition or audit write.
+    """
+    from django.db import transaction
+
+    from apps.approvals.services import withdraw_review
+    from apps.composer.models import PlatformPost
+
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "create_posts")
+    scoped_post = _get_workspace_post(request, post_id)
+    if scoped_post.author_id != request.user.id:
+        _require_perm(request, "edit_others_posts")
+
+    with transaction.atomic():
+        post = Post.objects.select_for_update().get(id=scoped_post.id)
+        children = list(PlatformPost.objects.select_for_update().filter(post=post))
+        # Recheck account scope after locking: a concurrent editor may have
+        # added a target since the initial scoped lookup.
+        allowed_ids = set(request.api_key.social_accounts.values_list("id", flat=True))
+        if any(pp.social_account_id not in allowed_ids for pp in children):
+            from django.http import Http404
+
+            raise Http404()
+        states = {pp.status for pp in children}
+        if not states or not states.issubset({"draft", "pending_review", "pending_client"}):
+            raise HttpError(409, "Only drafts or pending-review posts can be returned to draft.")
+        withdraw_review(post, request.user, post.workspace)
+        sync_post_scheduled_at(post)
+
+    post.refresh_from_db()
+    log_audit_entry(request, action="post.return_to_draft", target_id=post.id, status_code=200)
+    return _post_to_response(request, post)
+
+
 @router.post("/{post_id}/schedule", response=PostResponse, summary="Schedule a draft")
 def schedule(request, post_id: uuid.UUID, payload: ScheduleRequest):
     enforce_http_rate_limits(request, is_write=True)

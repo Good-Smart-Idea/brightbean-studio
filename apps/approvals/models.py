@@ -22,6 +22,7 @@ class ApprovalAction(models.Model):
         REJECTED = "rejected", "Rejected"
         RESUBMITTED = "resubmitted", "Resubmitted"
         HELD = "held", "Hold Requested"
+        WITHDRAWN = "withdrawn", "Review Withdrawn"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     post = models.ForeignKey(

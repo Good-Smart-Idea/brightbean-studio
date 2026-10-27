@@ -133,6 +133,32 @@ def submit_for_review(target, user, workspace):
     return post
 
 
+def withdraw_review(target, user, workspace):
+    """Return eligible review submissions to draft, preserving audit history.
+
+    A per-account withdrawal must not remove reminders for a sibling that
+    remains in the same review stage. This operation never approves or sends.
+    """
+    post, targets, is_bundled = _resolve_targets(target, eligible_from_states={"pending_review", "pending_client"})
+    if post.workspace_id != workspace.id:
+        raise ValueError("Post does not belong to this workspace.")
+
+    with transaction.atomic():
+        moved = [pp for pp in targets if _transition_or_skip(pp, "draft")]
+        if not moved:
+            return []
+        if is_bundled:
+            _record_action(post, None, user, ApprovalAction.ActionType.WITHDRAWN)
+        else:
+            for pp in moved:
+                _record_action(post, pp, user, ApprovalAction.ActionType.WITHDRAWN)
+        for stage in {"pending_review", "pending_client"}:
+            if not post.platform_posts.filter(status=stage).exists():
+                ApprovalReminder.objects.filter(post=post, stage=stage).delete()
+
+    return moved
+
+
 def approve_post(target, user, workspace, comment=""):
     """Approve a post or single platform post.
 
