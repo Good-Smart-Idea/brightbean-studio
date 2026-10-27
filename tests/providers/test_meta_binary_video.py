@@ -51,7 +51,12 @@ def test_instagram_raw_upload_uses_user_grant_and_no_public_url(content):
     def request(method, url, **kwargs):
         seen.append((method, url, kwargs))
         if url.endswith("/media"):
-            assert kwargs["json"] == {"caption": "Original caption", "media_type": "REELS", "upload_type": "resumable"}
+            assert kwargs["json"] == {
+                "caption": "Original caption",
+                "media_type": "REELS",
+                "upload_type": "resumable",
+                "share_to_feed": True,
+            }
             return response({"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"})
         if "rupload" in url:
             assert kwargs["headers"]["Authorization"] == "OAuth synthetic-user-grant"
@@ -220,3 +225,51 @@ def test_resume_survives_new_path_and_rotated_hosted_query(content, tmp_path):
     assert replacement.publish_post("page", content).platform_post_id == "published1"
     assert len(content.upload_cache.data) == 1
     assert replacement._request.call_count == 3
+
+
+def test_grant_expiry_during_processing_blocks_final_post(content):
+    provider = instagram()
+    provider._request = MagicMock(
+        side_effect=[
+            response({"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"}),
+            response({"success": True}),
+        ]
+    )
+
+    def wait(*args, **kwargs):
+        provider.credentials["facebook_user_token_expires_at"] = 1
+
+    provider._wait_for_container = wait
+    with pytest.raises(PublishError, match="expired") as error:
+        provider.publish_post("page", content)
+    assert error.value.retryable is False
+    assert provider._request.call_count == 2
+    assert json.loads(next(iter(content.upload_cache.data.values())))["phase"] == "uploaded"
+
+
+def test_actual_http_client_does_not_follow_upload_redirect(content):
+    from unittest.mock import patch
+
+    import httpx
+
+    seen = []
+
+    def handle(request):
+        seen.append((str(request.url), request.headers.get("Authorization")))
+        if request.url.path.endswith("/media"):
+            return httpx.Response(
+                200, json={"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"}
+            )
+        if request.url.host == "rupload.facebook.com":
+            return httpx.Response(302, headers={"Location": "https://attacker.invalid/receive"})
+        raise AssertionError("Redirect must never be followed")
+
+    transport = httpx.MockTransport(handle)
+    real_client = httpx.Client
+    with (
+        patch("providers.base.httpx.Client", side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)),
+        pytest.raises(PublishError),
+    ):
+        instagram().publish_post("page", content)
+    assert len(seen) == 2
+    assert all("attacker.invalid" not in url for url, _ in seen)

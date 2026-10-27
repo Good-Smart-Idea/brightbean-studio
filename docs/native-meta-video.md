@@ -4,7 +4,9 @@ A single Instagram Reel/video connected through Facebook Login, or an explicit
 Facebook Page Reel, uploads the stored video bytes directly to Meta. It does not
 ask Meta to fetch BrightBean's hosted asset URL. Instagram Login, images,
 carousels, stories, and regular Facebook Page videos retain their existing paths.
-This change does not alter Cloudflare Access or make media public.
+This change does not alter Cloudflare Access or make media public. Native Instagram
+Reels explicitly request `share_to_feed=true`; actual profile/feed placement still
+requires native verification.
 
 The engine reuses its storage-backed local media cache. Native dispatch never
 refreshes credentials: Instagram uses the existing Facebook **user** grant on

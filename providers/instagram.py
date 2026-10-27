@@ -335,7 +335,7 @@ class InstagramProvider(SocialProvider):
                 )
 
             def create():
-                payload = {"media_type": "REELS", "upload_type": "resumable"}
+                payload = {"media_type": "REELS", "upload_type": "resumable", "share_to_feed": True}
                 if content.text:
                     payload["caption"] = content.text
                 data = self._request("POST", f"{BASE_URL}/{target}/media", access_token=token, json=payload).json()
@@ -348,6 +348,7 @@ class InstagramProvider(SocialProvider):
                 token=token,
                 kind="ig-api-upload",
                 create=create,
+                authorize=lambda: require_instagram_native_token(self.credentials),
                 wait=lambda container: self._wait_for_container(token, container, should_stop=content.should_stop),
                 publish=lambda container: self._publish_container(token, target, container),
             )

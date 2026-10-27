@@ -43,7 +43,7 @@ class NativeUploadCache:
             json.dumps(row.platform_extra, sort_keys=True),
             tuple(
                 row.post.media_attachments.order_by("position", "pk").values_list(
-                    "media_asset_id", "media_asset__file", "media_asset__workspace_id"
+                    "media_asset_id", "media_asset__file", "media_asset__workspace_id", "media_asset__organization_id"
                 )
             ),
         )
@@ -61,7 +61,11 @@ class NativeUploadCache:
             or row.post.workspace.is_archived
             or row.social_account.needs_reconnect
             or row.social_account.workspace_id != row.post.workspace_id
-            or any(asset_workspace != row.post.workspace_id for _, _, asset_workspace in self._binding(row)[-1])
+            or any(
+                asset_workspace != row.post.workspace_id
+                and not (asset_workspace is None and asset_org == row.post.workspace.organization_id)
+                for _, _, asset_workspace, asset_org in self._binding(row)[-1]
+            )
             or self._binding(row) != self.binding
         ):
             raise PublishError(

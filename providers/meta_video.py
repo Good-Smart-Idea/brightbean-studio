@@ -90,7 +90,7 @@ def validate_meta_upload_uri(uri, upload_id, *, kind, version="v25.0", platform)
     return uri
 
 
-def publish_native_video(provider, content, *, target, token, kind, create, wait, publish):
+def publish_native_video(provider, content, *, target, token, kind, create, wait, publish, authorize=None):
     """Stream one file, checkpoint before writes, and resume only safe reads.
 
     A network/body/final-publish outcome is ambiguous until its checkpoint is
@@ -145,6 +145,8 @@ def publish_native_video(provider, content, *, target, token, kind, create, wait
         cache.set(key, json.dumps(state), 86400)
 
     def stop_before_write():
+        if authorize is not None:
+            authorize()
         if content.should_stop and content.should_stop():
             raise PublishError("Native video interrupted before the next provider write.", platform=platform)
 
@@ -170,8 +172,8 @@ def publish_native_video(provider, content, *, target, token, kind, create, wait
             uri = validate_meta_upload_uri(uri, upload_id, kind=kind, platform=platform)
         except Exception:
             raise unconfirmed() from None
-        checkpoint("uploading", upload_id=upload_id)
         stop_before_write()
+        checkpoint("uploading", upload_id=upload_id)
         try:
             with open(path, "rb") as body:
                 response = provider._request(

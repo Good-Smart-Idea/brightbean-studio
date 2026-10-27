@@ -542,6 +542,7 @@ class FacebookProvider(SocialProvider):
                 token=access_token,
                 kind="video-upload",
                 create=create,
+                authorize=lambda: require_facebook_native_configuration(self.credentials, access_token),
                 wait=lambda _: None,
                 publish=finish,
             )

@@ -234,3 +234,31 @@ def test_facebook_page_grant_rotation_invalidates_checkpoint_even_with_user_gran
         write(cache, "creating")
     native_case[6].refresh_from_db()
     assert native_case[6].native_upload_state == {}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("foreign", [False, True])
+def test_org_shared_media_requires_same_organization(native_case, foreign):
+    from apps.composer.models import PostMedia
+    from apps.media_library.models import MediaAsset
+    from apps.organizations.models import Organization
+
+    org = Organization.objects.create(name="Foreign") if foreign else native_case[1].organization
+    asset = MediaAsset.objects.create(
+        workspace=None,
+        organization=org,
+        file="shared/reaction.mp4",
+        filename="reaction.mp4",
+        media_type="video",
+        processing_status="completed",
+    )
+    PostMedia.objects.create(post=native_case[5], media_asset=asset)
+    cache = NativeUploadCache(native_case[6])
+    if foreign:
+        with pytest.raises(PublishError, match="authorization or content changed"):
+            cache.get("a" * 64)
+    else:
+        assert cache.get("a" * 64) is None
+        write(cache, "creating")
+        native_case[6].refresh_from_db()
+        assert native_case[6].native_upload_state["progress"]["phase"] == "creating"
