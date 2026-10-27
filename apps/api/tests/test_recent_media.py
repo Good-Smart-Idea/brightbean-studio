@@ -13,6 +13,7 @@ from apps.composer.models import PlatformPost, Post
 from apps.members.models import PERMISSION_KEYS, OrgMembership, WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
+from providers.exceptions import APIError
 
 
 @pytest.fixture
@@ -39,7 +40,9 @@ def get(setup, account=None, suffix="recent-media"):
 
 def fake_provider(monkeypatch, *bodies):
     provider = Mock()
-    provider._request.side_effect = [Mock(json=Mock(return_value=body)) for body in bodies]
+    provider._request.side_effect = [
+        body if isinstance(body, Exception) else Mock(json=Mock(return_value=body)) for body in bodies
+    ]
     monkeypatch.setattr(adapter, "get_provider", Mock(return_value=provider))
     monkeypatch.setattr(adapter, "_resolve_publish_credentials", Mock(return_value={}))
     return provider
@@ -191,12 +194,22 @@ def test_exact_fb_receipt_bound_to_account_no_visibility_inference(setup, fb_pos
         monkeypatch,
         {"id": "456", "name": "GSI"},
         {
-            "id": "987",
+            "id": "456_987",
+            "object_id": "654",
+            "from": {"id": "456"},
+            "is_published": False,
+            "is_hidden": True,
+            "timeline_visibility": "hidden",
+            "privacy": {"value": "EVERYONE"},
+            "permalink_url": "/permalink.php?story_fbid=987&id=456&access_token=<REPLACE_WITH_SECRET>",
+        },
+        {
+            "id": "654",
             "from": {"id": "456"},
             "published": True,
             "status": {"video_status": "ready"},
             "privacy": {"value": "EVERYONE"},
-            "permalink_url": "/gsi/videos/987/",
+            "permalink_url": "/watch/?v=654&access_token=<REPLACE_WITH_SECRET>",
             "access_token": "<REPLACE_WITH_SECRET>",
         },
     )
@@ -204,11 +217,19 @@ def test_exact_fb_receipt_bound_to_account_no_visibility_inference(setup, fb_pos
     assert response.status_code == 200
     body = response.json()
     assert body["published"] is True and body["owner_id"] == "456"
+    assert body["receipt_node_type"] == "post" and body["canonical_post_id"] == "456_987"
+    assert body["post_is_published"] is False and body["post_is_hidden"] is True
+    assert body["timeline_visibility"] == "hidden"
+    assert body["video_id"] == "654" and body["video_lookup_status"] == "available"
+    assert body["permalink"] == "https://www.facebook.com/permalink.php?story_fbid=987&id=456"
     assert body["privacy"] == "EVERYONE"
     assert body["public_visibility_verified"] is False
     assert "never-return" not in str(body)
     assert "<REPLACE_WITH_SECRET>" not in str(body)
     assert all(call.args[0] == "GET" for call in provider._request.call_args_list)
+    assert provider._request.call_count == 3
+    assert provider._request.call_args_list[1].args[1].endswith("/456_987")
+    assert provider._request.call_args_list[2].args[1].endswith("/654")
     fb_post.refresh_from_db()
     assert fb_post.status == "published" and fb_post.platform_post_id == "987"
 
@@ -224,11 +245,16 @@ def test_exact_fb_wrong_local_account_denied(setup, fb_post, monkeypatch):
 
 @pytest.mark.django_db
 def test_exact_fb_wrong_native_owner_redacted(setup, fb_post, monkeypatch):
-    fake_provider(monkeypatch, {"id": "456"}, {"id": "987", "from": {"id": "999", "name": "never-return"}})
+    provider = fake_provider(
+        monkeypatch,
+        {"id": "456"},
+        {"id": "456_987", "object_id": "654", "from": {"id": "999", "name": "never-return"}},
+    )
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 502
     assert "never-return" not in response.content.decode()
     assert "<REPLACE_WITH_SECRET>" not in response.content.decode()
+    assert provider._request.call_count == 2  # Do not follow a foreign Post's object_id.
 
 
 @pytest.mark.django_db
@@ -237,3 +263,173 @@ def test_final_cursor_page_is_not_complete_inventory(setup, monkeypatch):
     body = get(setup, suffix="recent-media?after=previous-page").json()
     assert body["has_more"] is False and body["complete_inventory"] is False
     assert provider._request.call_args.kwargs["params"]["after"] == "previous-page"
+
+
+def page_post(**changes):
+    return {
+        "id": "456_987",
+        "object_id": "654",
+        "from": {"id": "456"},
+        "is_published": True,
+        "is_hidden": False,
+        "timeline_visibility": "normal",
+        "permalink_url": "/permalink.php?story_fbid=987&id=456",
+    } | changes
+
+
+def video_node(**changes):
+    return {
+        "id": "654",
+        "from": {"id": "456"},
+        "published": False,
+        "status": {"video_status": "processing"},
+        "permalink_url": "/watch/?v=654",
+    } | changes
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "upstream_error",
+    [
+        APIError("redacted", status_code=404),
+        APIError(
+            "redacted",
+            status_code=400,
+            raw_response={
+                "error": {"code": 100, "message": "Tried accessing nonexisting field (object_id) on node type (Video)"}
+            },
+        ),
+    ],
+)
+def test_bare_video_only_after_definitive_missing_or_type_post(setup, fb_post, monkeypatch, upstream_error):
+    provider = fake_provider(monkeypatch, {"id": "456"}, upstream_error, video_node(id="987"))
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["receipt_node_type"] == "video" and body["video_id"] == "987"
+    assert body["canonical_post_id"] == "" and body["post_is_published"] is None
+    assert body["public_visibility_verified"] is False
+    assert provider._request.call_count == 3
+    assert provider._request.call_args_list[1].args[1].endswith("/456_987")
+    assert provider._request.call_args_list[2].args[1].endswith("/987")
+    assert all(call.args[0] == "GET" for call in provider._request.call_args_list)
+    fb_post.refresh_from_db()
+    assert fb_post.platform_post_id == "987" and fb_post.status == "published"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "status,code,message",
+    [
+        (401, 190, "access token redacted"),
+        (403, 200, "permission denied"),
+        (429, 4, "rate limit"),
+        (500, 1, "upstream failed"),
+        (400, 190, "invalid access token"),
+        (404, 200, "permission denied"),
+        (400, 100, "Unsupported get request; missing or cannot load due to permissions"),
+        (400, 100, "Invalid parameter"),
+    ],
+)
+def test_no_bare_video_probe_on_auth_quota_server_or_ambiguous_error(
+    setup, fb_post, monkeypatch, status, code, message
+):
+    error = APIError("never-return", status_code=status, raw_response={"error": {"code": code, "message": message}})
+    provider = fake_provider(monkeypatch, {"id": "456"}, error)
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 502
+    assert "never-return" not in response.content.decode()
+    assert provider._request.call_count == 2
+
+
+@pytest.mark.django_db
+def test_no_alternate_native_probe_on_generic_exception(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, RuntimeError("never-return"))
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 502
+    assert "never-return" not in response.content.decode()
+    assert provider._request.call_count == 2
+
+
+@pytest.mark.django_db
+def test_verified_post_without_object_is_not_video_absence_or_public_proof(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(object_id=None))
+    body = get(setup, setup.fb, f"published-media/{fb_post.id}").json()
+    assert body["receipt_node_type"] == "post" and body["post_is_published"] is True
+    assert body["post_is_hidden"] is False and body["timeline_visibility"] == "normal"
+    assert body["video_lookup_status"] == "no_object_id" and body["video_id"] == ""
+    assert body["published"] is None and body["public_visibility_verified"] is False
+    assert provider._request.call_count == 2
+
+
+@pytest.mark.django_db
+def test_video_read_failure_keeps_explicitly_partial_verified_post_proof(setup, fb_post, monkeypatch):
+    error = APIError("never-return", status_code=403, raw_response={"error": {"code": 200}})
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(), error)
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["post_is_published"] is True and body["post_object_id"] == "654"
+    assert body["video_lookup_status"] == "unavailable" and body["video_id"] == ""
+    assert body["published"] is None and body["video_status"] == ""
+    assert body["public_visibility_verified"] is False
+    assert "never-return" not in response.content.decode()
+    assert provider._request.call_count == 3  # No alternative-ID request after refusal.
+
+
+@pytest.mark.django_db
+def test_foreign_video_owner_not_exposed_even_after_owned_post(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(), video_node(**{"from": {"id": "999"}}))
+    assert get(setup, setup.fb, f"published-media/{fb_post.id}").status_code == 502
+    assert provider._request.call_count == 3
+
+
+@pytest.mark.django_db
+def test_own_page_prefixed_receipt_is_not_double_prefixed(setup, fb_post, monkeypatch):
+    fb_post.platform_post_id = "456_987"
+    fb_post.save(update_fields=["platform_post_id"])
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(), video_node())
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 200
+    assert provider._request.call_args_list[1].args[1].endswith("/456_987")
+    assert response.json()["remote_id"] == "456_987"
+
+
+@pytest.mark.django_db
+def test_foreign_page_prefix_never_probed(setup, fb_post, monkeypatch):
+    fb_post.platform_post_id = "999_987"
+    fb_post.save(update_fields=["platform_post_id"])
+    provider = fake_provider(monkeypatch)
+    assert get(setup, setup.fb, f"published-media/{fb_post.id}").status_code == 502
+    provider._request.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_non_numeric_object_reference_never_followed(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(object_id="https://foreign.example/never-return"))
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 502
+    assert "never-return" not in response.content.decode()
+    assert provider._request.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("/watch/?v=654&access_token=never-return&t=3", "https://www.facebook.com/watch/?v=654"),
+        (
+            "https://facebook.com/permalink.php?story_fbid=987&id=456&access_token=never-return",
+            "https://facebook.com/permalink.php?story_fbid=987&id=456",
+        ),
+        (
+            "https://www.facebook.com/story.php?story_fbid=987&id=456&fbid=999&tracking=never-return",
+            "https://www.facebook.com/story.php?story_fbid=987&id=456",
+        ),
+        ("https://www.facebook.com/watch/?v=never-return&id=456", "https://www.facebook.com/watch/?id=456"),
+        ("//foreign.example/watch/?v=654", ""),
+        ("https://foreign.example/watch/?v=654", ""),
+        ("https://user:never-return@www.facebook.com/watch/?v=654", ""),
+    ],
+)
+def test_facebook_permalink_keeps_only_essential_numeric_ids(url, expected):
+    assert adapter._permalink(url, facebook=True) == expected
