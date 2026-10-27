@@ -19,6 +19,7 @@ defence against spending DB cycles for unauthorized callers.
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
 from django.http import HttpRequest
 from django.shortcuts import get_object_or_404
@@ -295,6 +296,132 @@ def retrieve(request, post_id: uuid.UUID):
     post = _get_workspace_post(request, post_id)
     log_audit_entry(request, action="post.read", target_id=post.id, status_code=200)
     return _post_to_response(request, post)
+
+
+class FacebookVideoFormatRequest(Schema):
+    publish_as: Literal["video", "reel"]
+
+    class Config:
+        extra = "forbid"
+
+
+class FacebookVideoFormatResponse(Schema):
+    post_id: uuid.UUID
+    platform_post_id: uuid.UUID
+    social_account_id: uuid.UUID
+    status: str
+    configured_publish_as: Literal["video", "reel"]
+    resolved_post_type: str
+
+
+def _facebook_video_format_response(post, child) -> FacebookVideoFormatResponse:
+    from apps.publisher.engine import PublishEngine
+
+    media_types = list(post.media_attachments.values_list("media_asset__media_type", flat=True))
+    extras = child.platform_extra or {}
+    resolved = PublishEngine._resolve_post_type(
+        "facebook", extras, len(media_types), media_types[0] if media_types else None
+    )
+    return FacebookVideoFormatResponse(
+        post_id=post.id,
+        platform_post_id=child.id,
+        social_account_id=child.social_account_id,
+        status=child.status,
+        configured_publish_as="reel" if extras.get("post_type") == "reel" else "video",
+        resolved_post_type=resolved.value,
+    )
+
+
+_FACEBOOK_VIDEO_FORMAT_PATH = "/{post_id}/platform-posts/{platform_post_id}/facebook-video-format"
+
+
+@router.get(_FACEBOOK_VIDEO_FORMAT_PATH, response=FacebookVideoFormatResponse, summary="Read Facebook video format")
+def read_facebook_video_format(request, post_id: uuid.UUID, platform_post_id: uuid.UUID):
+    enforce_http_rate_limits(request, is_write=False)
+    post = _get_workspace_post(request, post_id)
+    child = get_object_or_404(
+        post.platform_posts,
+        id=platform_post_id,
+        social_account__platform="facebook",
+        social_account__workspace=post.workspace,
+    )
+    result = _facebook_video_format_response(post, child)
+    log_audit_entry(request, action="post.facebook_video_format.read", target_id=child.id, status_code=200)
+    return result
+
+
+@router.patch(
+    _FACEBOOK_VIDEO_FORMAT_PATH, response=FacebookVideoFormatResponse, summary="Set a draft Facebook video format"
+)
+def update_facebook_video_format(
+    request, post_id: uuid.UUID, platform_post_id: uuid.UUID, payload: FacebookVideoFormatRequest
+):
+    """Edit one unsent draft child, without withdrawing approval or publishing.
+
+    Other platform children, including published siblings, remain unchanged.
+    Generic platform_extra values are neither accepted nor returned.
+    """
+    from django.db import transaction
+    from django.http import Http404
+
+    from apps.composer.models import PlatformPost, PostMedia
+    from apps.media_library.models import MediaAsset
+    from providers.facebook import FACEBOOK_REEL_MAX_DURATION_SEC, FACEBOOK_REEL_MIN_DURATION_SEC
+
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "create_posts")
+    scoped_post = _get_workspace_post(request, post_id)
+    with transaction.atomic():
+        post = Post.objects.select_for_update().get(id=scoped_post.id)
+        if post.workspace_id != request.api_key.workspace_id:
+            raise Http404()
+        if post.author_id != request.user.id:
+            _require_perm(request, "edit_others_posts")
+        children = list(PlatformPost.objects.select_for_update().select_related("social_account").filter(post=post))
+        allowed_ids = set(request.api_key.social_accounts.values_list("id", flat=True))
+        if any(child.social_account_id not in allowed_ids for child in children):
+            raise Http404()
+        child = next((child for child in children if child.id == platform_post_id), None)
+        if (
+            child is None
+            or child.social_account.platform != "facebook"
+            or child.social_account.workspace_id != post.workspace_id
+        ):
+            raise Http404()
+        if child.status != "draft" or any(
+            (child.platform_post_id, child.published_at, child.scheduled_at, child.next_retry_at, child.retry_count)
+        ):
+            raise HttpError(409, "Only an unsent draft Facebook child can change video format.")
+
+        attachments = list(PostMedia.objects.select_for_update().filter(post=post))
+        if len(attachments) != 1:
+            raise HttpError(422, "Facebook video format requires exactly one completed video.")
+        asset = MediaAsset.objects.select_for_update().get(id=attachments[0].media_asset_id)
+        if not (
+            asset.workspace_id == post.workspace_id
+            or (asset.workspace_id is None and asset.organization_id == post.workspace.organization_id)
+        ):
+            raise Http404()
+        if asset.media_type != "video" or asset.processing_status != "completed" or not asset.file:
+            raise HttpError(422, "Facebook video format requires exactly one completed video.")
+        if (
+            payload.publish_as == "reel"
+            and asset.duration
+            and not (FACEBOOK_REEL_MIN_DURATION_SEC <= asset.duration <= FACEBOOK_REEL_MAX_DURATION_SEC)
+        ):
+            raise HttpError(422, "Facebook Reels must be between 3 and 90 seconds when duration is known.")
+
+        extra = dict(child.platform_extra or {})
+        if payload.publish_as == "reel":
+            extra["post_type"] = "reel"
+        else:
+            extra.pop("post_type", None)
+        if child.platform_extra != extra:
+            child.platform_extra = extra
+            child.save(update_fields=["platform_extra", "updated_at"])
+        result = _facebook_video_format_response(post, child)
+        log_audit_entry(request, action="post.facebook_video_format.update", target_id=child.id, status_code=200)
+    return result
 
 
 @router.patch("/{post_id}", response=PostResponse, summary="Update draft fields")
