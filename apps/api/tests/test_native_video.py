@@ -183,8 +183,10 @@ def test_changed_content_cannot_reset_ambiguous_session(native_case, tmp_path, c
 
 
 @pytest.mark.django_db
-def test_engine_uses_storage_local_path_without_refresh_or_http_download(native_case, tmp_path):
+def test_engine_uses_storage_local_path_without_refresh_or_http_download(native_case, tmp_path, settings):
     from unittest.mock import MagicMock
+
+    from django.core.files.base import ContentFile
 
     from apps.composer.models import PostMedia
     from apps.media_library.models import MediaAsset
@@ -192,10 +194,11 @@ def test_engine_uses_storage_local_path_without_refresh_or_http_download(native_
     from providers.instagram import InstagramProvider
     from providers.types import PublishResult
 
+    settings.MEDIA_ROOT = tmp_path / "media"
     asset = MediaAsset.objects.create(
         workspace=native_case[1],
         organization=native_case[1].organization,
-        file="native/reaction.mp4",
+        file=ContentFile(b"video", name="reaction.mp4"),
         filename="reaction.mp4",
         media_type="video",
         duration=54.5,
@@ -207,7 +210,7 @@ def test_engine_uses_storage_local_path_without_refresh_or_http_download(native_
     cache = MagicMock()
     cache.path_for.return_value = str(local)
     provider = InstagramProvider({"ig_user_id": "1784", "facebook_user_access_token": "synthetic-bound-user-grant"})
-    provider.publish_post = MagicMock(return_value=PublishResult(platform_post_id="result1"))
+    provider.publish_post = MagicMock(return_value=PublishResult(platform_post_id="555", needs_confirmation=True))
     with (
         patch("apps.publisher.engine.get_provider", return_value=provider),
         patch("apps.publisher.engine._resolve_publish_credentials", return_value=provider.credentials),

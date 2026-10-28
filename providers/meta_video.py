@@ -139,7 +139,7 @@ def publish_native_video(provider, content, *, target, token, kind, create, wait
             raise PublishError(
                 "Invalid native publication checkpoint; reconcile before retrying.", platform=platform, retryable=False
             )
-        return PublishResult(platform_post_id=media_id, extra={"video_id": media_id})
+        return PublishResult(platform_post_id=media_id, extra={"video_id": media_id}, needs_confirmation=True)
     # A confirmed receipt needs no live grant. Incomplete sessions must be
     # authorized even before read-only processing polls, and again per POST.
     if authorize is not None:

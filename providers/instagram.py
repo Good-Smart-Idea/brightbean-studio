@@ -19,6 +19,7 @@ from .meta_comments import (
     find_own_instagram_comment,
     resolve_comment_reply_target,
 )
+from .meta_confirmation import instagram_media_status
 from .meta_insights import fetch_insights_safe
 from .meta_messaging import (
     InstagramMessageBatch,
@@ -103,6 +104,7 @@ class InstagramProvider(SocialProvider):
     # native video modes prepare local bytes through the engine cache.
     needs_local_media = False
     binary_video_post_types = frozenset({PostType.REEL, PostType.VIDEO})
+    supports_publish_confirmation = True
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -348,7 +350,9 @@ class InstagramProvider(SocialProvider):
                 # A Graph media ID is not an Instagram shortcode/permalink.
                 # Native readback can resolve the real link separately.
                 return PublishResult(
-                    platform_post_id=result.platform_post_id, extra={"video_id": result.platform_post_id}
+                    platform_post_id=result.platform_post_id,
+                    extra={"video_id": result.platform_post_id},
+                    needs_confirmation=True,
                 )
 
             return publish_native_video(
@@ -412,7 +416,9 @@ class InstagramProvider(SocialProvider):
         self._wait_for_container(access_token, container_id)
 
         # Step 3: publish
-        return self._publish_container(access_token, ig_user_id, container_id)
+        return self._publish_container(
+            access_token, ig_user_id, container_id, needs_confirmation=content.post_type != PostType.STORY
+        )
 
     def _publish_carousel(self, access_token: str, ig_user_id: str, content: PublishContent) -> PublishResult:
         """Publish a carousel post with multiple media items."""
@@ -490,7 +496,9 @@ class InstagramProvider(SocialProvider):
             should_stop=should_stop,
         )
 
-    def _publish_container(self, access_token: str, ig_user_id: str, container_id: str) -> PublishResult:
+    def _publish_container(
+        self, access_token: str, ig_user_id: str, container_id: str, *, needs_confirmation=True
+    ) -> PublishResult:
         resp = self._request(
             "POST",
             f"{BASE_URL}/{ig_user_id}/media_publish",
@@ -503,7 +511,13 @@ class InstagramProvider(SocialProvider):
             platform_post_id=media_id,
             url=f"https://www.instagram.com/p/{media_id}/",
             extra=data,
+            needs_confirmation=needs_confirmation,
         )
+
+    def check_publish_status(self, access_token: str, handle: str):
+        if self.credentials.get("require_native_user_confirmation"):
+            access_token = require_instagram_native_token(self.credentials)
+        return instagram_media_status(self, access_token, handle)
 
     # ------------------------------------------------------------------
     # Comments

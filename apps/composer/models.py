@@ -11,6 +11,7 @@ Models:
     CSVImportJob - Tracks bulk CSV import jobs.
 """
 
+import json
 import uuid
 from urllib.parse import urlsplit
 
@@ -536,6 +537,35 @@ class PlatformPost(models.Model):
 
     def __str__(self):
         return f"PlatformPost({self.social_account.platform}): {self.status}"
+
+    @property
+    def native_post_url(self):
+        """Only an internally audited confirmation can supply a native link."""
+        from providers.meta_confirmation import permalink
+
+        account = self.social_account
+        if self.status != self.Status.PUBLISHED or account.platform not in {"facebook", "instagram"}:
+            return ""
+        for log in self.publish_logs.filter(
+            status_code=200, error_message="", response_body__startswith='{"kind":"native_publish_confirmation"'
+        ).order_by("-created_at")[:10]:
+            try:
+                proof = json.loads(log.response_body)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(proof, dict) or (
+                proof.get("kind") != "native_publish_confirmation"
+                or proof.get("platform") != account.platform
+                or proof.get("child_id") != str(self.pk)
+                or proof.get("account_id") != str(account.pk)
+                or proof.get("workspace_id") != str(self.post.workspace_id)
+                or account.workspace_id != self.post.workspace_id
+                or proof.get("native_id") != self.platform_post_id
+                or proof.get("owner_id") != account.account_platform_id
+            ):
+                continue
+            return permalink(proof.get("permalink"), facebook=account.platform == "facebook")
+        return ""
 
     @property
     def is_reschedulable(self):
