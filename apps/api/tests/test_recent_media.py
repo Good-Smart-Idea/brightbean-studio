@@ -47,16 +47,13 @@ def setup(db, user, organization):
 
 
 def get(setup, account=None, suffix="recent-media"):
-    return setup.client.get(
-        f"/api/v1/accounts/{(account or setup.ig).id}/{suffix}", secure=True
-    )
+    return setup.client.get(f"/api/v1/accounts/{(account or setup.ig).id}/{suffix}", secure=True)
 
 
 def fake_provider(monkeypatch, *bodies):
     provider = Mock()
     provider._request.side_effect = [
-        body if isinstance(body, Exception) else Mock(json=Mock(return_value=body))
-        for body in bodies
+        body if isinstance(body, Exception) else Mock(json=Mock(return_value=body)) for body in bodies
     ]
     monkeypatch.setattr(adapter, "get_provider", Mock(return_value=provider))
     monkeypatch.setattr(adapter, "_resolve_publish_credentials", Mock(return_value={}))
@@ -78,9 +75,7 @@ def ig_item():
 
 @pytest.mark.django_db
 def test_native_ig_mapping_and_get_only(setup, monkeypatch):
-    provider = fake_provider(
-        monkeypatch, {"id": "123", "username": "owner"}, {"data": [ig_item()]}
-    )
+    provider = fake_provider(monkeypatch, {"id": "123", "username": "owner"}, {"data": [ig_item()]})
     response = get(setup)
     assert response.status_code == 200
     body = response.json()
@@ -127,15 +122,8 @@ def test_input_bounds_before_provider(setup, monkeypatch, query):
 @pytest.mark.django_db
 def test_auth_and_allowlist_denied_before_provider(setup, monkeypatch):
     provider = fake_provider(monkeypatch)
-    assert (
-        Client()
-        .get(f"/api/v1/accounts/{setup.ig.id}/recent-media", secure=True)
-        .status_code
-        == 401
-    )
-    other = SocialAccount.objects.create(
-        workspace=setup.ws, platform="instagram", account_platform_id="999"
-    )
+    assert Client().get(f"/api/v1/accounts/{setup.ig.id}/recent-media", secure=True).status_code == 401
+    other = SocialAccount.objects.create(workspace=setup.ws, platform="instagram", account_platform_id="999")
     assert get(setup, other).status_code == 403
     provider._request.assert_not_called()
 
@@ -223,9 +211,7 @@ def fb_post(setup):
 
 
 @pytest.mark.django_db
-def test_exact_fb_receipt_bound_to_account_no_visibility_inference(
-    setup, fb_post, monkeypatch
-):
+def test_exact_fb_receipt_bound_to_account_no_visibility_inference(setup, fb_post, monkeypatch):
     provider = fake_provider(
         monkeypatch,
         {"id": "456", "name": "GSI"},
@@ -253,16 +239,11 @@ def test_exact_fb_receipt_bound_to_account_no_visibility_inference(
     assert response.status_code == 200
     body = response.json()
     assert body["published"] is True and body["owner_id"] == "456"
-    assert (
-        body["receipt_node_type"] == "post" and body["canonical_post_id"] == "456_987"
-    )
+    assert body["receipt_node_type"] == "post" and body["canonical_post_id"] == "456_987"
     assert body["post_is_published"] is False and body["post_is_hidden"] is True
     assert body["timeline_visibility"] == "hidden"
     assert body["video_id"] == "654" and body["video_lookup_status"] == "available"
-    assert (
-        body["permalink"]
-        == "https://www.facebook.com/permalink.php?story_fbid=987&id=456"
-    )
+    assert body["permalink"] == "https://www.facebook.com/permalink.php?story_fbid=987&id=456"
     assert body["privacy"] == "EVERYONE"
     assert body["public_visibility_verified"] is False
     assert "never-return" not in str(body)
@@ -299,9 +280,7 @@ def test_exact_fb_wrong_native_owner_redacted(setup, fb_post, monkeypatch):
     assert response.status_code == 502
     assert "never-return" not in response.content.decode()
     assert "<REPLACE_WITH_SECRET>" not in response.content.decode()
-    assert (
-        provider._request.call_count == 2
-    )  # Do not follow a foreign Post's object_id.
+    assert provider._request.call_count == 2  # Do not follow a foreign Post's object_id.
 
 
 @pytest.mark.django_db
@@ -351,12 +330,8 @@ def video_node(**changes):
         ),
     ],
 )
-def test_bare_video_only_after_definitive_missing_or_type_post(
-    setup, fb_post, monkeypatch, upstream_error
-):
-    provider = fake_provider(
-        monkeypatch, {"id": "456"}, upstream_error, video_node(id="987")
-    )
+def test_bare_video_only_after_definitive_missing_or_type_post(setup, fb_post, monkeypatch, upstream_error):
+    provider = fake_provider(monkeypatch, {"id": "456"}, upstream_error, video_node(id="987"))
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 200
     body = response.json()
@@ -410,9 +385,7 @@ def test_no_alternate_native_probe_on_generic_exception(setup, fb_post, monkeypa
 
 
 @pytest.mark.django_db
-def test_verified_post_without_object_is_not_video_absence_or_public_proof(
-    setup, fb_post, monkeypatch
-):
+def test_verified_post_without_object_is_not_video_absence_or_public_proof(setup, fb_post, monkeypatch):
     provider = fake_provider(monkeypatch, {"id": "456"}, page_post(object_id=None))
     body = get(setup, setup.fb, f"published-media/{fb_post.id}").json()
     assert body["receipt_node_type"] == "post" and body["post_is_published"] is True
@@ -423,12 +396,8 @@ def test_verified_post_without_object_is_not_video_absence_or_public_proof(
 
 
 @pytest.mark.django_db
-def test_video_read_failure_keeps_explicitly_partial_verified_post_proof(
-    setup, fb_post, monkeypatch
-):
-    error = APIError(
-        "never-return", status_code=403, raw_response={"error": {"code": 200}}
-    )
+def test_video_read_failure_keeps_explicitly_partial_verified_post_proof(setup, fb_post, monkeypatch):
+    error = APIError("never-return", status_code=403, raw_response={"error": {"code": 200}})
     provider = fake_provider(monkeypatch, {"id": "456"}, page_post(), error)
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 200
@@ -442,12 +411,8 @@ def test_video_read_failure_keeps_explicitly_partial_verified_post_proof(
 
 
 @pytest.mark.django_db
-def test_foreign_video_owner_not_exposed_even_after_owned_post(
-    setup, fb_post, monkeypatch
-):
-    provider = fake_provider(
-        monkeypatch, {"id": "456"}, page_post(), video_node(**{"from": {"id": "999"}})
-    )
+def test_foreign_video_owner_not_exposed_even_after_owned_post(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(), video_node(**{"from": {"id": "999"}}))
     assert get(setup, setup.fb, f"published-media/{fb_post.id}").status_code == 502
     assert provider._request.call_count == 3
 
@@ -529,9 +494,7 @@ def ambiguous_post_error():
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("owner,expected", [("456", 200), ("999", 502)])
-def test_ambiguous_post_can_only_establish_owner_verified_video(
-    setup, fb_post, monkeypatch, owner, expected
-):
+def test_ambiguous_post_can_only_establish_owner_verified_video(setup, fb_post, monkeypatch, owner, expected):
     provider = fake_provider(
         monkeypatch,
         {"id": "456"},
@@ -550,9 +513,7 @@ def test_ambiguous_post_can_only_establish_owner_verified_video(
 
 @pytest.mark.django_db
 def test_both_node_reads_unavailable_never_claim_absence(setup, fb_post, monkeypatch):
-    provider = fake_provider(
-        monkeypatch, {"id": "456"}, ambiguous_post_error(), ambiguous_post_error()
-    )
+    provider = fake_provider(monkeypatch, {"id": "456"}, ambiguous_post_error(), ambiguous_post_error())
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 502
     assert provider._request.call_count == 3
@@ -560,12 +521,8 @@ def test_both_node_reads_unavailable_never_claim_absence(setup, fb_post, monkeyp
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize(
-    "stage", ["configuration", "receipt", "destination", "post", "video"]
-)
-def test_receipt_diagnostics_each_stage_preserves_history(
-    setup, fb_post, monkeypatch, stage, caplog
-):
+@pytest.mark.parametrize("stage", ["configuration", "receipt", "destination", "post", "video"])
+def test_receipt_diagnostics_each_stage_preserves_history(setup, fb_post, monkeypatch, stage, caplog):
     failure = APIError(
         "never-return https://private.example/?access_token=never-return",
         status_code=403,
@@ -580,9 +537,7 @@ def test_receipt_diagnostics_each_stage_preserves_history(
     )
     if stage == "configuration":
         provider = fake_provider(monkeypatch)
-        monkeypatch.setattr(
-            adapter, "_client", Mock(side_effect=ValueError("never-return"))
-        )
+        monkeypatch.setattr(adapter, "_client", Mock(side_effect=ValueError("never-return")))
         reason = "configuration_invalid"
     elif stage == "receipt":
         provider = fake_provider(monkeypatch)
@@ -617,30 +572,24 @@ def test_receipt_diagnostics_each_stage_preserves_history(
     [
         (APIError("never-return", status_code=401), "provider_authentication"),
         (
-            APIError(
-                "never-return", status_code=400, raw_response={"error": {"code": 190}}
-            ),
+            APIError("never-return", status_code=400, raw_response={"error": {"code": 190}}),
             "provider_authentication",
         ),
         (APIError("never-return", status_code=403), "provider_permission"),
         (APIError("never-return", status_code=429), "provider_rate_limit"),
         (APIError("never-return", status_code=503), "provider_unavailable"),
         (
-            APIError(
-                "never-return", status_code=400, raw_response={"error": {"code": 4}}
-            ),
+            APIError("never-return", status_code=400, raw_response={"error": {"code": 4}}),
             "provider_rate_limit",
         ),
         (ambiguous_post_error(), "node_unavailable_or_type"),
         (
-            APIError(
-                "never-return", status_code=400, raw_response={"error": {"code": 100}}
-            ),
+            APIError("never-return", status_code=400, raw_response={"error": {"code": 100}}),
             "provider_request_rejected",
         ),
         (RuntimeError("never-return"), "transport_or_internal_error"),
         (ValueError("never-return"), "native_response_invalid"),
-        (adapter.NativeOwnerMismatch("never-return"), "owner_mismatch"),
+        (adapter.NativeOwnerMismatchError("never-return"), "owner_mismatch"),
     ],
 )
 def test_fixed_receipt_diagnostic_reasons(error, reason):
@@ -649,16 +598,12 @@ def test_fixed_receipt_diagnostic_reasons(error, reason):
     assert "never-return" not in failure.model_dump_json()
 
 
-@pytest.mark.parametrize(
-    "value", [True, False, "190", -1, 2147483648, 1.5, None, {}, []]
-)
+@pytest.mark.parametrize("value", [True, False, "190", -1, 2147483648, 1.5, None, {}, []])
 def test_receipt_provider_codes_are_strict_bounded_integers(value):
     exc = APIError(
         "never-return",
         status_code=value,
-        raw_response={
-            "error": {"code": value, "error_subcode": value, "message": "never-return"}
-        },
+        raw_response={"error": {"code": value, "error_subcode": value, "message": "never-return"}},
     )
     failure = adapter._receipt_failure("post", exc)
     assert failure.provider_http_status is None
@@ -671,9 +616,7 @@ def test_receipt_provider_codes_are_strict_bounded_integers(value):
     [[], "never-return", {"error": []}, {"error": "never-return"}, {"error": None}],
 )
 def test_malformed_provider_error_body_does_not_leak_or_break_diagnostics(raw):
-    failure = adapter._receipt_failure(
-        "post", APIError("never-return", status_code=400, raw_response=raw)
-    )
+    failure = adapter._receipt_failure("post", APIError("never-return", status_code=400, raw_response=raw))
     assert failure.reason == "provider_request_rejected"
     assert failure.provider_code is None and failure.provider_subcode is None
     assert "never-return" not in failure.model_dump_json()
@@ -681,9 +624,7 @@ def test_malformed_provider_error_body_does_not_leak_or_break_diagnostics(raw):
 
 @pytest.mark.django_db
 def test_owner_mismatch_diagnostic_keeps_scope_boundary(setup, fb_post, monkeypatch):
-    provider = fake_provider(
-        monkeypatch, {"id": "456"}, page_post(**{"from": {"id": "999"}})
-    )
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(**{"from": {"id": "999"}}))
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 502
     assert response.json()["stage"] == "post"

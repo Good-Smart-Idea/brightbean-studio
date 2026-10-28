@@ -32,9 +32,7 @@ router = Router(tags=["accounts"])
 def list_accounts(request):
     enforce_http_rate_limits(request, is_write=False)
     api_key = request.api_key
-    accounts = [
-        AccountSummary.from_social_account(sa) for sa in api_key.social_accounts.all()
-    ]
+    accounts = [AccountSummary.from_social_account(sa) for sa in api_key.social_accounts.all()]
     log_audit_entry(request, action="accounts.list", target_id=None, status_code=200)
     return AccountsListResponse(accounts=accounts)
 
@@ -70,12 +68,8 @@ def recent_media(
     except Exception:
         # Provider exceptions may contain request URLs/tokens or app details.
         # Never send or log those raw details through the agent surface.
-        raise HttpError(
-            502, "Native media could not be read. No post was changed or retried."
-        ) from None
-    log_audit_entry(
-        request, action="accounts.recent_media", target_id=account.id, status_code=200
-    )
+        raise HttpError(502, "Native media could not be read. No post was changed or retried.") from None
+    log_audit_entry(request, action="accounts.recent_media", target_id=account.id, status_code=200)
     return result
 
 
@@ -93,9 +87,7 @@ def published_media(request, account_id: uuid.UUID, platform_post_id: uuid.UUID)
     _require_perm(request, "view_analytics")
     account = _resolve_account(request, account_id)
     if account.platform != "facebook":
-        raise HttpError(
-            422, "Exact native video reconciliation is supported only for Facebook."
-        )
+        raise HttpError(422, "Exact native video reconciliation is supported only for Facebook.")
     # No arbitrary provider IDs: only a receipt already belonging to this exact
     # allowlisted account/workspace can be inspected with its credential.
     platform_post = get_object_or_404(
@@ -109,9 +101,7 @@ def published_media(request, account_id: uuid.UUID, platform_post_id: uuid.UUID)
     except NativeReceiptLookupError as exc:
         return 502, exc.diagnostic
     except Exception:
-        raise HttpError(
-            502, "Native video could not be verified. No post was changed or retried."
-        ) from None
+        raise HttpError(502, "Native video could not be verified. No post was changed or retried.") from None
     log_audit_entry(
         request,
         action="accounts.published_media",
