@@ -14,6 +14,7 @@ aggregate ``status`` property derived from its children (see
 """
 
 import contextlib
+import json
 import logging
 import math
 import os
@@ -37,6 +38,7 @@ from apps.composer.models import PlatformPost
 from apps.composer.services import publish_blocker, usable_media_types
 from apps.credentials.models import resolve_platform_credentials
 from apps.media_library.storage import download_to_path
+from apps.publisher import meta_receipts
 from apps.publisher.native_uploads import NativeUploadCache
 from apps.social_accounts.error_messages import (
     FIRST_COMMENT_GENERIC_MESSAGE,
@@ -608,6 +610,11 @@ class PublishEngine:
 
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
+            if result["success"] and result.get("meta_attempt"):
+                meta_receipts.accept(platform_post, result, duration_ms=duration_ms)
+                self._update_rate_limit(account, result)
+                return result
+
             if result["success"]:
                 platform_post.platform_post_id = result.get("platform_post_id", "")
                 response_extra = result.get("response")
@@ -642,7 +649,18 @@ class PublishEngine:
                 else:
                     platform_post.status = PlatformPost.Status.PUBLISHED
                     platform_post.published_at = timezone.now()
-                platform_post.save()
+                platform_post.save(
+                    update_fields=[
+                        "platform_post_id",
+                        "platform_extra",
+                        "retry_count",
+                        "next_retry_at",
+                        "publish_error",
+                        "status",
+                        "published_at",
+                        "updated_at",
+                    ]
+                )
 
                 if not result.get("async_publish"):
                     # A published post leaves the queue: drop the QueueEntry that
@@ -743,7 +761,9 @@ class PublishEngine:
         """
         account = platform_post.social_account
         platform = account.platform
-        attachments = list(platform_post.post.media_attachments.select_related("media_asset").order_by("position"))
+        attachments = list(
+            platform_post.post.media_attachments.select_related("media_asset").order_by("position", "pk")
+        )
 
         # Every scheduled row passes through here, however it was scheduled, so
         # this is where a post the platform can only refuse is stopped for
@@ -924,15 +944,61 @@ class PublishEngine:
                 post_type.value,
                 len(media_files),
             )
+            meta_attempt = None
+            confirm_meta = getattr(provider, "supports_publish_confirmation", False) is True and (
+                platform == "facebook"
+                and post_type in (PostType.VIDEO, PostType.REEL)
+                or platform == "instagram"
+                and post_type != PostType.STORY
+            )
+            if confirm_meta:
+                grant_kind = (
+                    "facebook_user"
+                    if platform == "instagram" and post_type in getattr(provider, "binary_video_post_types", ())
+                    else "account"
+                )
+                digest = meta_receipts.binding(
+                    platform_post, grant_kind=grant_kind, content_type=post_type.value, attachments=attachments
+                )
+                meta_attempt = meta_receipts.begin(
+                    platform_post,
+                    expected_binding=digest,
+                    grant_kind=grant_kind,
+                    content_type=post_type.value,
+                    native_resume=post_type in getattr(provider, "binary_video_post_types", ()),
+                )
+                if meta_attempt.get("replay"):
+                    marker = meta_attempt["marker"]
+                    return {
+                        "success": True,
+                        "platform_post_id": marker["receipt_id"],
+                        "public_post_id": marker.get("public_post_id", marker["receipt_id"]),
+                        "async_publish": True,
+                        "response": {},
+                        "meta_attempt": meta_attempt,
+                    }
             result = provider.publish_post(access_token, content)
+            receipt = (
+                result.confirmation_handle
+                if result.needs_confirmation is True and result.confirmation_handle
+                else result.platform_post_id
+            )
+            if not isinstance(receipt, str) or not receipt.strip() or len(receipt) > 255:
+                raise PublishError(
+                    "Publish outcome has no valid receipt; reconcile before retrying.",
+                    platform=provider.platform_name,
+                    retryable=False,
+                )
             return {
                 "success": True,
-                "platform_post_id": result.platform_post_id,
+                "platform_post_id": receipt,
+                "public_post_id": result.platform_post_id,
+                "meta_attempt": meta_attempt,
                 "url": result.url,
                 "response": result.extra,
                 # True when platform_post_id is a handle for work still in
                 # progress rather than a published post's id.
-                "async_publish": provider.publish_is_async,
+                "async_publish": provider.publish_is_async or result.needs_confirmation is True,
             }
         finally:
             # Per-child temp files (thumbnail, cover) are ours either way. The
@@ -1172,7 +1238,7 @@ class PublishEngine:
         # once next_retry_at passes.
         platform_post.status = PlatformPost.Status.SCHEDULED
         platform_post.publish_error = (user_message or PUBLISH_GENERIC_MESSAGE)[:2000]
-        platform_post.save()
+        platform_post.save(update_fields=["retry_count", "next_retry_at", "status", "publish_error", "updated_at"])
 
         logger.info(
             "Scheduled retry %d for PlatformPost %s in %d seconds",
@@ -1285,13 +1351,40 @@ class PublishEngine:
                 return True
             return False
 
+        confirmation_binding = None
+        accepted = None
         try:
-            provider, access_token = _provider_and_access_token(account)
+            if account.platform in {"facebook", "instagram"}:
+                accepted = meta_receipts.accepted_attempt(platform_post)
+                if not accepted:
+                    if platform_post.updated_at < unconfirmed_before:
+                        self._give_up_unconfirmed(
+                            platform_post, "Meta receipt has no trusted accepted-attempt provenance."
+                        )
+                        return True
+                    return False
+                confirmation_binding = meta_receipts.binding(
+                    platform_post, grant_kind=accepted["grant_kind"], content_type=accepted["content_type"]
+                )
+                if confirmation_binding != accepted["binding"]:
+                    if platform_post.updated_at < unconfirmed_before:
+                        self._give_up_unconfirmed(
+                            platform_post, "Meta receipt inputs or authorization no longer match its accepted attempt."
+                        )
+                        return True
+                    return False
+                credentials = _resolve_publish_credentials(account)
+                if account.platform == "instagram" and accepted["grant_kind"] == "facebook_user":
+                    credentials["require_native_user_confirmation"] = True
+                provider = get_provider(account.platform, credentials)
+                access_token = account.oauth_access_token
+            else:
+                provider, access_token = _provider_and_access_token(account)
         except Exception:
             logger.exception("Could not build a provider to confirm PlatformPost %s", platform_post.id)
             return False
 
-        if not provider.publish_is_async:
+        if not (provider.publish_is_async or getattr(provider, "supports_publish_confirmation", False) is True):
             # A synchronous provider has no status endpoint to ask, so we cannot
             # confirm anything. A handle is NOT proof this attempt succeeded: it
             # survives a transition back to ``scheduled``, so it may belong to an
@@ -1342,8 +1435,16 @@ class PublishEngine:
             return False
 
         if status.state is PublishState.COMPLETE:
-            self._mark_confirmed_published(platform_post, status.platform_post_id or handle)
-            return True
+            return self._mark_confirmed_published(
+                platform_post,
+                (accepted.get("public_post_id") or status.platform_post_id or handle)
+                if confirmation_binding is not None
+                else (status.platform_post_id or handle),
+                expected_handle=handle,
+                expected_binding=confirmation_binding,
+                accepted_attempt=accepted if confirmation_binding is not None else None,
+                confirmation=status.raw,
+            )
 
         if status.state in (PublishState.FAILED, PublishState.INBOX):
             self._fail_permanently(
@@ -1356,6 +1457,12 @@ class PublishEngine:
                 reason=status.state.value,
             )
             return True
+
+        if status.state is PublishState.UNCONFIRMED:
+            if platform_post.updated_at < unconfirmed_before:
+                self._give_up_unconfirmed(platform_post, status.error or "Native publication could not be confirmed.")
+                return True
+            return False
 
         # Still processing. Normal for the first minutes after an upload.
         if platform_post.updated_at < confirm_before:
@@ -1388,18 +1495,97 @@ class PublishEngine:
             reason="unconfirmed",
         )
 
-    def _mark_confirmed_published(self, platform_post, platform_post_id: str):
-        """Finish a publish the platform has confirmed, exactly as the sync path does."""
-        platform_post.platform_post_id = platform_post_id
-        platform_post.status = PlatformPost.Status.PUBLISHED
-        platform_post.published_at = timezone.now()
-        platform_post.publish_error = ""
-        platform_post.save()
+    def _mark_confirmed_published(
+        self,
+        platform_post,
+        platform_post_id: str,
+        *,
+        expected_handle=None,
+        expected_binding=None,
+        accepted_attempt=None,
+        confirmation=None,
+    ):
+        """Commit native confirmation only while the same receipt is pending."""
+        from django.db import transaction
 
-        self._drop_queue_entry(platform_post)
-        self._sync_parent_published_at(platform_post.post)
-        self._maybe_schedule_first_comment(platform_post)
-        logger.info("Confirmed publish of PlatformPost %s as %s", platform_post.id, platform_post_id)
+        expected_handle = expected_handle or platform_post.platform_post_id
+        with transaction.atomic():
+            current = (
+                PlatformPost.objects.select_for_update()
+                .select_related("post__workspace", "social_account")
+                .get(pk=platform_post.pk)
+            )
+            if (
+                current.status != PlatformPost.Status.PUBLISHING
+                or current.platform_post_id != expected_handle
+                or current.social_account_id != platform_post.social_account_id
+                or current.post.workspace_id != platform_post.post.workspace_id
+                or current.post.workspace.is_archived
+                or current.social_account.workspace_id != current.post.workspace_id
+                or current.social_account.needs_reconnect
+                or (
+                    expected_binding is not None
+                    and (
+                        not accepted_attempt
+                        or meta_receipts.binding(
+                            current,
+                            grant_kind=accepted_attempt["grant_kind"],
+                            content_type=accepted_attempt["content_type"],
+                        )
+                        != expected_binding
+                    )
+                )
+            ):
+                return False
+            if current.social_account.platform in {"facebook", "instagram"}:
+                from providers.meta_confirmation import permalink
+
+                proof = confirmation if isinstance(confirmation, dict) else {}
+                link = permalink(proof.get("permalink"), facebook=current.social_account.platform == "facebook")
+                if (
+                    expected_binding is None
+                    or proof.get("id") != expected_handle
+                    or proof.get("owner_id") != current.social_account.account_platform_id
+                    or not link
+                ):
+                    return False
+                # This is the actual successful native confirmation GET, not
+                # an upload checkpoint or an invented historical response.
+                receipt = {
+                    "kind": "native_publish_confirmation",
+                    "platform": current.social_account.platform,
+                    "child_id": str(current.pk),
+                    "account_id": str(current.social_account_id),
+                    "workspace_id": str(current.post.workspace_id),
+                    "receipt_id": expected_handle,
+                    "native_id": platform_post_id,
+                    "owner_id": proof["owner_id"],
+                    "permalink": link,
+                }
+                body = json.dumps(receipt, separators=(",", ":"))
+                if len(body) > 1000:
+                    return False
+                attempt = (
+                    current.publish_logs.order_by("-created_at").values_list("attempt_number", flat=True).first() or 1
+                )
+                PublishLog.objects.create(
+                    platform_post=current, attempt_number=attempt, status_code=200, response_body=body
+                )
+            current.platform_post_id = platform_post_id
+            current.status = PlatformPost.Status.PUBLISHED
+            current.published_at = timezone.now()
+            current.publish_error = ""
+            current.save(update_fields=["platform_post_id", "status", "published_at", "publish_error", "updated_at"])
+        # No external provider work or task scheduling runs under the row lock.
+        platform_post.status = current.status
+        platform_post.platform_post_id = current.platform_post_id
+        platform_post.published_at = current.published_at
+        platform_post.publish_error = current.publish_error
+        self._drop_queue_entry(current)
+        self._sync_parent_published_at(current.post)
+        self._maybe_schedule_first_comment(current)
+        logger.info("Confirmed publish of PlatformPost %s as %s", current.id, platform_post_id)
+        return True
 
     def _update_rate_limit(self, account, result):
         """Update rate limit state from API response headers."""

@@ -10,6 +10,7 @@ from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
+from .meta_confirmation import facebook_video_status
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import (
     build_send_payload,
@@ -104,6 +105,7 @@ class FacebookProvider(SocialProvider):
     # native video modes prepare local bytes through the engine cache.
     needs_local_media = False
     binary_video_post_types = frozenset({PostType.REEL})
+    supports_publish_confirmation = True
 
     def __init__(self, credentials: dict | None = None):
         creds = dict(credentials or {})
@@ -438,6 +440,9 @@ class FacebookProvider(SocialProvider):
             except Exception:
                 logger.warning("Failed to clean up staged Facebook photo %s", photo_id)
 
+    def check_publish_status(self, access_token: str, handle: str):
+        return facebook_video_status(self, access_token, handle)
+
     def _publish_video(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
         payload: dict = {"file_url": content.media_urls[0]}
         if content.text:
@@ -473,6 +478,8 @@ class FacebookProvider(SocialProvider):
         url = video_fields.get("permalink_url") or f"https://www.facebook.com/{graph_post_id}"
         return PublishResult(
             platform_post_id=post_id,
+            needs_confirmation=True,
+            confirmation_handle=video_id,
             url=url,
             extra={**data, **video_fields, "video_id": video_id},
         )
@@ -531,6 +538,8 @@ class FacebookProvider(SocialProvider):
                     )
                 return PublishResult(
                     platform_post_id=self._stored_post_id(video_id),
+                    needs_confirmation=True,
+                    confirmation_handle=video_id,
                     url=f"https://www.facebook.com/reel/{video_id}",
                     extra={"video_id": video_id},
                 )
@@ -614,6 +623,8 @@ class FacebookProvider(SocialProvider):
         graph_post_id = video_fields.get("post_id") or video_id
         return PublishResult(
             platform_post_id=self._stored_post_id(graph_post_id),
+            needs_confirmation=True,
+            confirmation_handle=video_id,
             url=video_fields.get("permalink_url") or f"https://www.facebook.com/reel/{video_id}",
             # Only identifiers. The engine merges this dict into
             # PlatformPost.platform_extra, which is an *input* channel that

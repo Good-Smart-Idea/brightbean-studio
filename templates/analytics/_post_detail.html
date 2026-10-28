@@ -50,5 +50,11 @@
 </div>
 
 <div style="padding: 14px 20px; border-top: 1px solid var(--neutral-100); display: flex; gap: 10px; flex-shrink: 0;">
-    <a href="{% if account.platform == 'youtube' %}https://www.youtube.com/watch?v={{ post.platform_post_id|urlencode }}{% else %}#{% endif %}" target="_blank" rel="noopener noreferrer" class="btn-outline" style="padding: 9px 16px; width: auto;">View on {{ account.get_platform_display }}</a>
+    {% if account.platform == 'youtube' %}
+    <a href="https://www.youtube.com/watch?v={{ post.platform_post_id|urlencode }}" target="_blank" rel="noopener noreferrer" class="btn-outline" style="padding: 9px 16px; width: auto;">View on {{ account.get_platform_display }}</a>
+    {% elif post.native_post_url %}
+    <a href="{{ post.native_post_url }}" target="_blank" rel="noopener noreferrer" class="btn-outline" style="padding: 9px 16px; width: auto;">View on {{ account.get_platform_display }}</a>
+    {% else %}
+    <span class="btn-outline" aria-disabled="true" style="padding: 9px 16px; width: auto;">Native link not confirmed</span>
+    {% endif %}
 </div>

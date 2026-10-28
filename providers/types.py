@@ -81,6 +81,10 @@ class PublishResult:
     platform_post_id: str
     url: str | None = None
     extra: dict = field(default_factory=dict)
+    # Accepted receipt, not yet confirmed native publication.
+    needs_confirmation: bool = False
+    # May differ from the final feed-post ID (e.g. Facebook Video node ID).
+    confirmation_handle: str = ""
 
 
 class PublishState(enum.StrEnum):
@@ -88,6 +92,7 @@ class PublishState(enum.StrEnum):
 
     COMPLETE = "complete"
     PENDING = "pending"
+    UNCONFIRMED = "unconfirmed"  # Accepted receipt whose native outcome cannot be established.
     FAILED = "failed"
     # The platform accepted the upload but parked it as a draft the creator has
     # to finish by hand (TikTok's SEND_TO_USER_INBOX). Nothing we do will make
