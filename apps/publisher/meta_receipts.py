@@ -297,6 +297,13 @@ def begin(row, *, expected_binding, grant_kind, content_type, manifest, native_r
                     "Previous Meta submission outcome is unconfirmed; no publish request was repeated.", retryable=False
                 )
             return {"marker": started, "recovered": phase == "complete"}
+        typed_history = Q()
+        for kind in (STARTED, ACCEPTED, RECOVERED):
+            typed_history |= Q(response_body__startswith='{"kind":"' + kind + '"')
+        if current.publish_logs.filter(typed_history).exists():
+            raise PublishError(
+                "Invalid or unmatched Meta attempt provenance is unconfirmed; no request was repeated.", retryable=False
+            )
         if current.platform_post_id:
             raise PublishError(
                 "Existing Meta receipt has no trusted attempt provenance; reconcile before retrying.", retryable=False

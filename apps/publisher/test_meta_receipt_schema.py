@@ -6,8 +6,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from apps.composer.models import PlatformPost
 from apps.publisher import meta_receipts
 from apps.publisher.models import PublishLog
+from providers.exceptions import PublishError
 
 from .test_meta_confirmation import receipt_case as receipt_case
 from .test_meta_confirmation import sweep
@@ -132,3 +134,34 @@ def test_valid_pair_survives_many_unrelated_logs(receipt_case):
     assert expected is not None
     PublishLog.objects.bulk_create([PublishLog(platform_post=case.child, response_body="unrelated") for _ in range(40)])
     assert meta_receipts.accepted_attempt(case.child) == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"kind":"meta_publish_started"}',
+        '{"kind":"meta_publish_started","attempt_id":null}',
+        '{"kind":"meta_publish_started",',
+        '{"kind":"meta_publish_accepted","receipt_id":"555"}',
+        '{"kind":"meta_publish_recovered","receipt_id":"555"}',
+    ],
+)
+def test_partial_or_unmatched_intent_cannot_allow_a_fresh_submission(receipt_case, body):
+    case = receipt_case
+    case.child.publish_logs.all().delete()
+    PlatformPost.objects.filter(pk=case.child.pk).update(platform_post_id="", native_upload_state={})
+    case.child.refresh_from_db()
+    PublishLog.objects.create(platform_post=case.child, response_body=body)
+    digest = meta_receipts.binding(case.child, grant_kind="account", content_type="video", manifest=[])
+    with pytest.raises(PublishError) as error:
+        meta_receipts.begin(
+            case.child,
+            expected_binding=digest,
+            grant_kind="account",
+            content_type="video",
+            manifest=[],
+            native_resume=False,
+        )
+    assert error.value.retryable is False
+    assert case.child.publish_logs.count() == 1
