@@ -1,4 +1,4 @@
-"""``/api/v1/posts/*`` — create, read, update, schedule, cancel.
+"""``/api/v1/posts/*`` — compose, review, approve internally, schedule, cancel.
 
 Every write path:
 
@@ -7,7 +7,7 @@ Every write path:
 3. Checks workspace permission via the shared ``@require_permission`` helper.
 4. Validates the target ``SocialAccount`` is in the key's allowlist.
 5. Checks per-platform 24h quota.
-6. Calls the composer service layer (single source of truth for state).
+6. Calls the existing composer/approval service layer for state transitions.
 7. Writes an audit log row.
 8. Persists the response under the idempotency key if one was passed.
 
@@ -605,6 +605,146 @@ def return_to_draft(request, post_id: uuid.UUID):
 
     post.refresh_from_db()
     log_audit_entry(request, action="post.return_to_draft", target_id=post.id, status_code=200)
+    return _post_to_response(request, post)
+
+
+class ApprovePostRequest(Schema):
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+    class Config:
+        extra = "forbid"
+
+
+def _locked_approval_actor(request):
+    """Fresh explicit-key/live-member intersection, held until decision commit.
+
+    Lock order: key, actual user, membership, custom role, workspace, post,
+    children, accounts, allowlist rows. Parent FK locks also serialize child
+    and allowlist insertion; through-row locks serialize scope deletion.
+    """
+    from apps.accounts.models import User
+    from apps.api_keys.models import ApiKey
+    from apps.members.models import CustomRole, WorkspaceMembership
+
+    authenticated = request.api_key
+    key = ApiKey.objects.select_for_update().filter(id=authenticated.id).first()
+    if (
+        key is None
+        or not key.is_active
+        or key.issued_by_id != request.user.id
+        or key.workspace_id != authenticated.workspace_id
+        or key.token_hash != authenticated.token_hash
+    ):
+        raise HttpError(403, "The API approval actor is no longer authorized.")
+    actor = User.objects.select_for_update().filter(id=key.issued_by_id, is_active=True).first()
+    membership = (
+        WorkspaceMembership.objects.select_for_update()
+        .filter(user_id=key.issued_by_id, workspace_id=key.workspace_id)
+        .first()
+    )
+    if actor is None or membership is None:
+        raise HttpError(403, "The API approval actor is no longer authorized.")
+    if membership.custom_role_id is not None:
+        membership.custom_role = CustomRole.objects.select_for_update().get(id=membership.custom_role_id)
+    effective = set(key.permissions or []) & {
+        permission for permission, allowed in membership.effective_permissions.items() if allowed
+    }
+    if not {"create_posts", "approve_posts"}.issubset(effective):
+        raise HttpError(403, "Permission denied: create_posts and approve_posts are required.")
+    return key, actor, effective
+
+
+def _has_approval_publish_evidence(child):
+    """Approval never adopts or resets evidence of a prior publish attempt."""
+    return any(
+        (
+            child.platform_post_id,
+            child.published_at,
+            child.scheduled_at,
+            child.retry_count,
+            child.next_retry_at,
+            child.publish_error,
+            child.native_upload_state,
+            child.first_comment_status != "none",
+            child.first_comment_id,
+            child.first_comment_error,
+            child.first_comment_retry_count,
+            child.first_comment_posted_at,
+        )
+    )
+
+
+@router.post("/{post_id}/approve", response=PostResponse, summary="Approve a submitted internal review")
+def approve(request, post_id: uuid.UUID, payload: ApprovePostRequest):
+    """An audited API-issuer decision; never approve a client stage or publish.
+
+    The existing approval service owns transitions, mandatory ApprovalAction,
+    and normal two-stage client reminders/notifications. All-approved retries
+    are no-ops; a two-stage internal decision returns pending_client honestly.
+    """
+    from django.db import transaction
+    from django.http import Http404
+
+    from apps.approvals.services import approve_post
+    from apps.composer.models import PlatformPost
+    from apps.publisher.models import PublishLog
+    from apps.workspaces.models import Workspace
+
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "create_posts")
+    _require_perm(request, "approve_posts")
+    reason = payload.reason.strip()
+    if not reason:
+        raise HttpError(422, "An approval reason is required.")
+    scoped_post = _get_workspace_post(request, post_id)
+    with transaction.atomic():
+        key, actor, effective = _locked_approval_actor(request)
+        workspace = Workspace.objects.select_for_update().get(id=key.workspace_id)
+        post = get_object_or_404(Post.objects.select_for_update(), id=scoped_post.id)
+        if post.workspace_id != workspace.id:
+            raise Http404()
+        if post.author_id != actor.id and "edit_others_posts" not in effective:
+            raise HttpError(403, "Permission denied: edit_others_posts")
+        children = list(PlatformPost.objects.select_for_update().filter(post=post).order_by("id"))
+        account_ids = {child.social_account_id for child in children}
+        accounts = list(SocialAccount.objects.select_for_update().filter(id__in=account_ids).order_by("id"))
+        # Do not use the auth object's potentially cached/prefetched allowlist.
+        through = key.social_accounts.through
+        allowed_ids = set(
+            through.objects.select_for_update().filter(apikey_id=key.id).values_list("socialaccount_id", flat=True)
+        )
+        if (
+            not children
+            or not account_ids.issubset(allowed_ids)
+            or len(accounts) != len(account_ids)
+            or any(account.workspace_id != workspace.id for account in accounts)
+        ):
+            raise Http404()
+        if (
+            post.scheduled_at is not None
+            or post.published_at is not None
+            # PublishLog is the append-only attempt ledger (including Meta
+            # STARTED before provider I/O), not merely an HTTP response cache.
+            # Any retained row contradicts this operation's strict unsent
+            # contract. Never interpret malformed/unmatched history as absent.
+            # Locked child FK parents serialize new ledger-row commits.
+            or PublishLog.objects.filter(platform_post_id__in=[child.id for child in children]).exists()
+            or any(
+                child.status not in {"pending_review", "approved"} or _has_approval_publish_evidence(child)
+                for child in children
+            )
+        ):
+            raise HttpError(409, "Only unsent pending-review or already-approved targets can be approved internally.")
+        moved = any(child.status == "pending_review" for child in children)
+        if moved:
+            approve_post(post, actor, workspace, reason)
+        # Attribute the request audit to the same freshly authorized real key.
+        request.api_key = key
+        request.user = actor
+    post.refresh_from_db()
+    log_audit_entry(
+        request, action="post.approve" if moved else "post.approve.noop", target_id=post.id, status_code=200
+    )
     return _post_to_response(request, post)
 
 
