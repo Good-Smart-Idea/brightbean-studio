@@ -252,6 +252,15 @@ def validate_meta_upload_uri(uri, upload_id, *, kind, version="v25.0", platform)
         raise PublishError("Meta returned an invalid video upload session.", platform=platform, retryable=False)
     try:
         parsed = urlsplit(uri)
+        paths = {f"/{kind}/{version}/{upload_id}", f"/{kind}/{upload_id}"}
+        # Graph v25 creates can return the distinct v26 upload protocol.
+        v26_path = f"/{kind}/v26.0/{upload_id}"
+        if (
+            version == "v25.0"
+            and kind in {"video-upload", "ig-api-upload"}
+            and uri == f"https://rupload.facebook.com{v26_path}"
+        ):
+            paths.add(v26_path)
         invalid = (
             parsed.scheme != "https"
             or parsed.hostname != "rupload.facebook.com"
@@ -260,7 +269,7 @@ def validate_meta_upload_uri(uri, upload_id, *, kind, version="v25.0", platform)
             or parsed.port is not None
             or parsed.query
             or parsed.fragment
-            or parsed.path not in {f"/{kind}/{version}/{upload_id}", f"/{kind}/{upload_id}"}
+            or parsed.path not in paths
         )
     except ValueError:
         invalid = True
