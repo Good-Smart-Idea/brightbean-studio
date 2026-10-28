@@ -952,19 +952,38 @@ class PublishEngine:
                 and post_type != PostType.STORY
             )
             if confirm_meta:
+                from providers.meta_confirmation import native_id
+
+                key = "page_id" if platform == "facebook" else "ig_user_id"
+                requested = content.extra.get(key)
+                canonical = str(account.account_platform_id)
+                if (
+                    isinstance(requested, bool)
+                    or not native_id(str(requested))
+                    or not native_id(canonical)
+                    or str(requested) != canonical
+                ):
+                    raise PublishError("Meta publish target does not match the selected account.", retryable=False)
+                content.extra[key] = canonical
                 grant_kind = (
                     "facebook_user"
                     if platform == "instagram" and post_type in getattr(provider, "binary_video_post_types", ())
                     else "account"
                 )
+                manifest = meta_receipts.prepared_manifest(attachments, media_files)
                 digest = meta_receipts.binding(
-                    platform_post, grant_kind=grant_kind, content_type=post_type.value, attachments=attachments
+                    platform_post,
+                    grant_kind=grant_kind,
+                    content_type=post_type.value,
+                    manifest=manifest,
+                    attachments=attachments,
                 )
                 meta_attempt = meta_receipts.begin(
                     platform_post,
                     expected_binding=digest,
                     grant_kind=grant_kind,
                     content_type=post_type.value,
+                    manifest=manifest,
                     native_resume=post_type in getattr(provider, "binary_video_post_types", ()),
                 )
                 if meta_attempt.get("replay"):
@@ -1364,13 +1383,23 @@ class PublishEngine:
                         return True
                     return False
                 confirmation_binding = meta_receipts.binding(
-                    platform_post, grant_kind=accepted["grant_kind"], content_type=accepted["content_type"]
+                    platform_post,
+                    grant_kind=accepted["grant_kind"],
+                    content_type=accepted["content_type"],
+                    manifest=accepted.get("manifest", []),
                 )
                 if confirmation_binding != accepted["binding"]:
                     if platform_post.updated_at < unconfirmed_before:
                         self._give_up_unconfirmed(
                             platform_post, "Meta receipt inputs or authorization no longer match its accepted attempt."
                         )
+                        return True
+                    return False
+                if not accepted.get("media_bytes_verified") or not meta_receipts.verify_media(
+                    platform_post, accepted.get("manifest")
+                ):
+                    if platform_post.updated_at < unconfirmed_before:
+                        self._give_up_unconfirmed(platform_post, "Meta media byte identity is unavailable or changed.")
                         return True
                     return False
                 credentials = _resolve_publish_credentials(account)
@@ -1438,7 +1467,7 @@ class PublishEngine:
             return self._mark_confirmed_published(
                 platform_post,
                 (accepted.get("public_post_id") or status.platform_post_id or handle)
-                if confirmation_binding is not None
+                if accepted is not None
                 else (status.platform_post_id or handle),
                 expected_handle=handle,
                 expected_binding=confirmation_binding,
@@ -1509,6 +1538,10 @@ class PublishEngine:
         from django.db import transaction
 
         expected_handle = expected_handle or platform_post.platform_post_id
+        if expected_binding is not None and (
+            not accepted_attempt or not meta_receipts.verify_media(platform_post, accepted_attempt.get("manifest"))
+        ):
+            return False
         with transaction.atomic():
             current = (
                 PlatformPost.objects.select_for_update()
@@ -1531,6 +1564,7 @@ class PublishEngine:
                             current,
                             grant_kind=accepted_attempt["grant_kind"],
                             content_type=accepted_attempt["content_type"],
+                            manifest=accepted_attempt.get("manifest", []),
                         )
                         != expected_binding
                     )

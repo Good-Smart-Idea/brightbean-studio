@@ -6,7 +6,7 @@ ask Meta to fetch BrightBean's hosted asset URL. Instagram Login, images,
 carousels, stories, and regular Facebook Page videos retain their existing paths.
 This change does not alter Cloudflare Access or make media public. Native Instagram
 Reels explicitly request `share_to_feed=true`; actual profile/feed placement still
-requires native verification. Native results retain the confirmed media ID
+requires native verification. Native results retain the accepted API media ID
 and return no fabricated permalink; a numeric Graph ID is not an Instagram
 shortcode.
 
@@ -38,10 +38,11 @@ worker instances. No caption, token, local path, or media URL is stored.
 
 Each short transaction locks the child, rechecks workspace/account/content and
 publishing state, and compares the previous checkpoint. Locks are released before
-network I/O. The phases are creating, created, uploading, uploaded, publishing,
-and complete. IDs are retained for reconciliation. Incomplete upload sessions
+network I/O. The upload protocol phases are creating, created, uploading, uploaded, publishing,
+and complete (`complete` means the API returned a receipt, not that the post is Live).
+IDs are retained for reconciliation. Incomplete upload sessions
 expire after one hour; expiry blocks reuse and never silently creates another
-session. Confirmed publication receipts do not expire with the upload session.
+session. Accepted API receipt IDs do not expire with the upload session.
 They can be recovered after natural grant expiry with no provider request, but
 only when the persisted binding is unchanged. Incomplete sessions require a
 valid configured grant even before a processing-status read.
@@ -50,8 +51,10 @@ A processing timeout leaves `uploaded` intact. A new worker polls the same
 container and then publishes it once. Before every external write its phase is
 committed; a checkpoint failure stops the next write. Ambiguous create, binary
 upload, or final publish outcomes are nonretryable and retain their phase. They
-require reconciliation rather than blind replay. A completed checkpoint returns
-the same media ID if a local outcome save was interrupted. PublishLog remains
+require reconciliation rather than blind replay. A `complete` upload checkpoint returns
+the same accepted media ID if a local outcome save was interrupted. It does not
+establish native publication: PlatformPost remains `publishing` until the
+account-scoped confirmation GET succeeds. See [publication confirmation](meta-publication-confirmation.md). PublishLog remains
 HTTP outcome history and is not used as progress storage.
 
 Upload destinations must be HTTPS on exactly `rupload.facebook.com`, with an

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from django.core.files.base import ContentFile
 from django.db import connection
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -14,6 +15,7 @@ from apps.accounts.models import User
 from apps.composer.models import PlatformPost, Post, PostMedia
 from apps.media_library.models import MediaAsset
 from apps.organizations.models import Organization
+from apps.publisher import meta_receipts
 from apps.publisher.engine import PublishEngine
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
@@ -23,7 +25,8 @@ from providers.types import PublishState, PublishStatus
 
 
 @pytest.fixture
-def receipt_case(db):
+def receipt_case(db, settings, tmp_path):
+    settings.MEDIA_ROOT = tmp_path / "media"
     org = Organization.objects.create(name="Meta confirmation")
     workspace = Workspace.objects.create(organization=org, name="Meta workspace")
     account = SocialAccount.objects.create(
@@ -35,10 +38,54 @@ def receipt_case(db):
         oauth_access_token="synthetic-page-grant",
     )
     post = Post.objects.create(workspace=workspace, caption="Owner approved caption")
-    child = PlatformPost.objects.create(post=post, social_account=account, status="publishing", platform_post_id="555")
+    child = PlatformPost.objects.create(
+        post=post,
+        social_account=account,
+        status="publishing",
+        platform_post_id="",
+        platform_extra={"post_type": "reel"},
+    )
     provider = FacebookProvider({"page_id": "111"})
     provider.publish_post = MagicMock(side_effect=AssertionError("confirmation must never send a post"))
-    return SimpleNamespace(org=org, workspace=workspace, account=account, post=post, child=child, provider=provider)
+    asset = MediaAsset.objects.create(
+        workspace=workspace,
+        organization=org,
+        file=ContentFile(b"ftyp-synthetic-test-video", name="video.mp4"),
+        filename="video.mp4",
+        media_type="video",
+        processing_status="completed",
+    )
+    attachment = PostMedia.objects.create(post=post, media_asset=asset)
+    case = SimpleNamespace(
+        org=org,
+        workspace=workspace,
+        account=account,
+        post=post,
+        child=child,
+        provider=provider,
+        asset=asset,
+        attachment=attachment,
+    )
+    admit(case)
+    return case
+
+
+def admit(case):
+    case.child.refresh_from_db()
+    case.child.platform_post_id = ""
+    case.child.save(update_fields=["platform_post_id"])
+    manifest = meta_receipts.prepared_manifest([case.attachment], [case.asset.file.path])
+    digest = meta_receipts.binding(case.child, grant_kind="account", content_type="reel", manifest=manifest)
+    case.context = meta_receipts.begin(
+        case.child,
+        expected_binding=digest,
+        grant_kind="account",
+        content_type="reel",
+        manifest=manifest,
+        native_resume=True,
+    )
+    result = {"meta_attempt": case.context, "platform_post_id": "555", "public_post_id": "555"}
+    meta_receipts.accept(case.child, result, duration_ms=0)
 
 
 def native_row(**changes):
@@ -130,15 +177,7 @@ def test_failed_timeout_or_unavailable_never_resends(receipt_case, settings, mod
 @pytest.mark.parametrize("mode", ["owner", "grant", "caption", "media_owner", "hold", "handle", "author"])
 def test_get_commit_race_cannot_promote_changed_receipt(receipt_case, mode):
     case = receipt_case
-    asset = MediaAsset.objects.create(
-        workspace=case.workspace,
-        organization=case.org,
-        file="test/video.mp4",
-        filename="video.mp4",
-        media_type="video",
-        processing_status="completed",
-    )
-    PostMedia.objects.create(post=case.post, media_asset=asset)
+    asset = case.asset
 
     def confirm(*args):
         if mode == "owner":
@@ -173,9 +212,10 @@ def test_get_commit_race_cannot_promote_changed_receipt(receipt_case, mode):
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize("state", ["published", "failed", "draft", "approved"])
+@pytest.mark.parametrize("state", ["publishing", "published", "failed", "draft", "approved"])
 def test_legacy_status_is_not_reconciled_or_promoted(receipt_case, state):
     case = receipt_case
+    case.child.publish_logs.all().delete()
     PlatformPost.objects.filter(pk=case.child.pk).update(status=state)
     case.provider._request = MagicMock(side_effect=AssertionError("not pending"))
     assert sweep(case) == 0

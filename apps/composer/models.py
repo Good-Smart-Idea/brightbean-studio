@@ -546,7 +546,9 @@ class PlatformPost(models.Model):
         account = self.social_account
         if self.status != self.Status.PUBLISHED or account.platform not in {"facebook", "instagram"}:
             return ""
-        for log in self.publish_logs.filter(status_code=200, error_message="").order_by("-created_at")[:10]:
+        for log in self.publish_logs.filter(
+            status_code=200, error_message="", response_body__startswith='{"kind":"native_publish_confirmation"'
+        ).order_by("-created_at")[:10]:
             try:
                 proof = json.loads(log.response_body)
             except (TypeError, ValueError):
