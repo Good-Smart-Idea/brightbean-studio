@@ -1,6 +1,7 @@
 """Malformed durable provenance must never authorize confirmation or a resend."""
 
 import json
+import uuid
 from copy import deepcopy
 from unittest.mock import MagicMock
 
@@ -165,3 +166,37 @@ def test_partial_or_unmatched_intent_cannot_allow_a_fresh_submission(receipt_cas
         )
     assert error.value.retryable is False
     assert case.child.publish_logs.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("conflict", ["new_started", "malformed_started", "receipt", "binding", "overflow"])
+def test_contradictory_or_overflowed_ledger_cannot_fall_back_to_old_pair(receipt_case, conflict):
+    case = receipt_case
+    original = records(case)
+    if conflict == "malformed_started":
+        PublishLog.objects.create(platform_post=case.child, response_body='{"kind":"meta_publish_started"}')
+    elif conflict == "new_started":
+        marker = deepcopy(original[0][1])
+        marker["attempt_id"] = str(uuid.uuid4())
+        PublishLog.objects.create(platform_post=case.child, response_body=json.dumps(marker, separators=(",", ":")))
+    elif conflict in {"receipt", "binding"}:
+        marker = deepcopy(original[-1][1])
+        marker["receipt_id" if conflict == "receipt" else "binding"] = "666" if conflict == "receipt" else "a" * 64
+        PublishLog.objects.create(
+            platform_post=case.child, status_code=200, response_body=json.dumps(marker, separators=(",", ":"))
+        )
+    else:
+        marker = deepcopy(original[-1][1])
+        PublishLog.objects.bulk_create(
+            [
+                PublishLog(
+                    platform_post=case.child, status_code=200, response_body=json.dumps(marker, separators=(",", ":"))
+                )
+                for _ in range(31)
+            ]
+        )
+    assert meta_receipts.accepted_attempt(case.child) is None
+    case.provider._request = MagicMock(side_effect=AssertionError("ambiguous ledger cannot authorize GET"))
+    assert sweep(case) == 0
+    case.provider._request.assert_not_called()
+    assert case.child.status == "publishing"

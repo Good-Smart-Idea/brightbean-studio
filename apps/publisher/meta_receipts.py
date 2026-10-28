@@ -205,22 +205,35 @@ def _valid_marker(value):
 
 
 def _entries(row):
-    entries = []
     typed = Q()
     for kind in (STARTED, ACCEPTED, RECOVERED):
         typed |= Q(response_body__startswith='{"kind":"' + kind + '"')
-    for log in row.publish_logs.filter(typed).order_by("-created_at")[:30]:
+    logs = list(row.publish_logs.filter(typed).order_by("-created_at")[:31])
+    if len(logs) > 30:
+        return []  # Never age a contradiction out of the bounded ledger.
+    entries = []
+    for log in logs:
         try:
             value = json.loads(log.response_body)
         except (TypeError, ValueError):
-            continue
+            return []
         if not _valid_marker(value) or log.error_message:
-            continue
+            return []
         if value["kind"] == ACCEPTED and not (isinstance(log.status_code, int) and 200 <= log.status_code < 300):
-            continue
+            return []
         if value["kind"] in {STARTED, RECOVERED} and log.status_code is not None:
-            continue
+            return []
         entries.append(value)
+    started = next((x for x in entries if x["kind"] == STARTED), None)
+    if not started:
+        return []
+    # The protocol permits one nonce/input family per child. Ordering is not
+    # proof that an older accepted attempt supersedes a newer uncertain one.
+    if any(any(x[k] != started[k] for k in started if k != "kind") for x in entries):
+        return []
+    receipts = {(x["receipt_id"], x["public_post_id"]) for x in entries if x["kind"] != STARTED}
+    if len(receipts) > 1:
+        return []
     return entries
 
 
