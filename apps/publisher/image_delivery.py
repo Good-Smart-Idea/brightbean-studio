@@ -1,4 +1,4 @@
-"""Internal inspection of scoped original image bytes; no publishing integration.
+"""Scoped original image inspection and exact Facebook single-photo preparation.
 
 The limits below are application inspection budgets, not Meta format limits.
 A valid local image still has no approved/verified delivery route. The result
@@ -10,8 +10,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
 
 from django.conf import settings
@@ -24,6 +25,7 @@ from apps.media_library.validators import sniff_mime
 if TYPE_CHECKING:
     from apps.media_library.models import MediaAsset
     from apps.workspaces.models import Workspace
+    from providers.types import PreparedPhotoUpload
 
 # Intentionally smaller than the default upload/decode budgets. A configured
 # lower application cap wins. Neither limit is a provider-content contract.
@@ -68,10 +70,46 @@ class StoredImageEvidence:
 
 
 def inspect_stored_image(asset: MediaAsset, *, workspace: Workspace) -> StoredImageEvidence:
+    """Return local evidence only; valid bytes do not imply delivery readiness."""
+    return _inspect_stored_image(asset, workspace=workspace)
+
+
+def prepare_facebook_photo(
+    asset: MediaAsset, *, workspace: Workspace, owner_id: str, caption: str, authorize_write: Callable[[], None]
+) -> PreparedPhotoUpload:
+    """Own the exact bounded bytes we inspected, without changing the original."""
+    from providers.exceptions import PublishError
+    from providers.types import PreparedPhotoUpload
+
+    retained: list[bytes] = []
+    evidence = _inspect_stored_image(asset, workspace=workspace, retained=retained)
+    if (
+        evidence.local_status != "valid"
+        or evidence.mime_type not in {"image/jpeg", "image/png"}
+        or not retained
+        or type(evidence.sha256) is not str
+    ):
+        raise PublishError(
+            "Facebook single photos require a scoped, completed JPEG or PNG within inspection limits.", retryable=False
+        )
+    return PreparedPhotoUpload(
+        str(asset.pk),
+        retained[0],
+        evidence.sha256,
+        cast(Literal["image/jpeg", "image/png"], evidence.mime_type),
+        owner_id,
+        caption,
+        authorize_write,
+    )
+
+
+def _inspect_stored_image(
+    asset: MediaAsset, *, workspace: Workspace, retained: list[bytes] | None = None
+) -> StoredImageEvidence:
     """Inspect ``asset.file`` only, using a trusted authorized workspace context.
 
     This internal helper grants no access. Callers must supply their authorized
-    workspace and current model metadata; no API or publisher path calls it yet.
+    workspace and current model metadata; results establish local byte validity only.
     Legacy assets without an organization fail closed. No FieldFile handle is
     opened/repositioned: local reads own a separate storage handle, and S3 reads
     use the existing ranged stream instead of django-storages' eager spool.
@@ -149,6 +187,8 @@ def inspect_stored_image(asset: MediaAsset, *, workspace: Workspace) -> StoredIm
                         return blocked("pixel_limit")
                     image.load()
                     orientation = image.getexif().get(274)
+                    if retained is not None:
+                        retained.append(body.getvalue())
                     return StoredImageEvidence(
                         "valid",
                         None,

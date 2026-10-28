@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode, urlparse
@@ -10,7 +11,7 @@ from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
-from .meta_confirmation import facebook_video_status
+from .meta_confirmation import facebook_photo_status, facebook_story_id, facebook_video_status, native_id
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import (
     build_send_payload,
@@ -101,8 +102,8 @@ FACEBOOK_MAX_ATTACHED_MEDIA = 10
 class FacebookProvider(SocialProvider):
     """Facebook Graph API v25.0 provider."""
 
-    # Images and legacy modes use hosted URLs. Only the explicitly listed
-    # native video modes prepare local bytes through the engine cache.
+    # Single photos use an explicit scoped byte payload. Legacy multi-photo
+    # and other hosted modes retain their separate paths; no global toggle.
     needs_local_media = False
     binary_video_post_types = frozenset({PostType.REEL})
     supports_publish_confirmation = True
@@ -313,7 +314,7 @@ class FacebookProvider(SocialProvider):
                 retryable=False,
             )
 
-        if content.post_type == PostType.IMAGE and content.media_urls:
+        if content.post_type == PostType.IMAGE:
             return self._publish_photo(access_token, page_id, content)
         if content.post_type == PostType.REEL:
             return self._publish_reel(access_token, page_id, content)
@@ -340,25 +341,67 @@ class FacebookProvider(SocialProvider):
         )
 
     def _publish_photo(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
-        if len(content.media_urls) > 1:
+        if content.prepared_photo is None and len(content.media_urls) > 1:
             return self._publish_multi_photo(access_token, page_id, content)
 
-        payload: dict = {"url": content.media_urls[0]}
-        if content.text:
-            payload["message"] = content.text
-        resp = self._request(
-            "POST",
-            f"{BASE_URL}/{page_id}/photos",
-            access_token=access_token,
-            json=payload,
-        )
-        data = resp.json()
-        graph_post_id = data.get("post_id", data["id"])
-        post_id = self._stored_post_id(graph_post_id)
+        photo = content.prepared_photo
+        target = self.credentials.get("page_id")
+        if (
+            photo is None
+            or content.media_urls
+            or content.media_files
+            or not native_id(target)
+            or page_id != target
+            or photo.owner_id != target
+            or photo.caption != content.text
+            or self.credentials.get("native_video_account_connected") is False
+            or not access_token
+            or not callable(photo.authorize_write)
+        ):
+            raise PublishError("Facebook single photos require an authorized prepared byte copy.", retryable=False)
+        if (
+            type(photo.data) is not bytes
+            or not 0 < len(photo.data) <= 2 * 1024 * 1024
+            or photo.mime_type not in {"image/jpeg", "image/png"}
+            or hashlib.sha256(photo.data).hexdigest() != photo.sha256
+        ):
+            raise PublishError("Facebook photo byte identity is invalid.", retryable=False)
+        if content.should_stop and content.should_stop():
+            raise PublishError("Facebook photo interrupted before submission.", retryable=False)
+        # Fresh durable-attempt/grant/content checks immediately before the one write.
+        photo.authorize_write()
+        try:
+            extension = "jpg" if photo.mime_type == "image/jpeg" else "png"
+            response = self._request(
+                "POST",
+                f"{BASE_URL}/{target}/photos",
+                access_token=access_token,
+                data={"caption": photo.caption, "published": "true"},
+                files={"source": ("photo." + extension, photo.data, photo.mime_type)},
+            )
+            data = response.json()
+            if (
+                not 200 <= response.status_code < 300
+                or type(data) is not dict
+                or "error" in data
+                or not native_id(data.get("id"))
+                or not facebook_story_id(data.get("post_id"), target)
+            ):
+                raise ValueError("Unconfirmed photo receipt")
+        except Exception:
+            # A partial numeric Photo ID without post_id cannot enter the existing
+            # ACCEPTED schema. STARTED remains durable; reconciliation must retain
+            # that uncertainty, never invent a story or repeat the upload.
+            raise PublishError(
+                "Facebook photo write outcome is unconfirmed; reconcile before retrying.",
+                platform=self.platform_name,
+                retryable=False,
+            ) from None
         return PublishResult(
-            platform_post_id=post_id,
-            url=f"https://www.facebook.com/{graph_post_id}",
-            extra=data,
+            platform_post_id=data["post_id"],
+            confirmation_handle=data["id"],
+            needs_confirmation=True,
+            status_code=response.status_code,
         )
 
     def _publish_multi_photo(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
@@ -441,6 +484,8 @@ class FacebookProvider(SocialProvider):
                 logger.warning("Failed to clean up staged Facebook photo %s", photo_id)
 
     def check_publish_status(self, access_token: str, handle: str):
+        if self.credentials.get("native_photo_story_id") is not None:
+            return facebook_photo_status(self, access_token, handle)
         return facebook_video_status(self, access_token, handle)
 
     def _publish_video(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:

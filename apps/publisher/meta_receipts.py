@@ -16,7 +16,7 @@ from django.db.models import Q
 from apps.composer.models import PlatformPost
 from apps.publisher.models import PublishLog
 from providers.exceptions import PublishError
-from providers.meta_confirmation import native_id
+from providers.meta_confirmation import facebook_story_id, native_id
 
 STARTED = "meta_publish_started"
 ACCEPTED = "meta_publish_accepted"
@@ -95,7 +95,7 @@ def prepared_manifest(attachments, files):
     return manifest
 
 
-def verify_media(row, manifest):
+def verify_media(row, manifest, *, facebook_photo=False):
     """Private storage reads occur outside any ledger row-lock transaction."""
     if not isinstance(manifest, list) or not manifest:
         return False
@@ -106,12 +106,23 @@ def verify_media(row, manifest):
     ]
     if len(assets) != len(manifest):
         return False
+    image = facebook_photo
+    if image and (row.social_account.platform != "facebook" or len(assets) != 1):
+        return False
     for asset, expected in zip(assets, manifest, strict=True):
         if not isinstance(expected, dict) or expected.get("asset_id") != str(asset.pk):
             return False
         try:
-            with asset.file.open("rb") as stream:
-                digest, size = _hash(stream)
+            if image:
+                from apps.publisher.image_delivery import inspect_stored_image
+
+                evidence = inspect_stored_image(asset, workspace=row.post.workspace)
+                if evidence.local_status != "valid" or evidence.mime_type not in {"image/jpeg", "image/png"}:
+                    return False
+                digest, size = evidence.sha256, evidence.byte_size
+            else:
+                with asset.file.open("rb") as stream:
+                    digest, size = _hash(stream)
         except Exception:
             # Storage failures are unconfirmed identity, never publication proof.
             return False
@@ -180,11 +191,14 @@ def _valid_marker(value):
         return False
     if value.get("grant_kind") not in ({"account", "facebook_user"} if platform == "instagram" else {"account"}):
         return False
-    modes = {"video", "reel"} if platform == "facebook" else {"image", "carousel", "video", "reel"}
+    image = platform == "facebook" and value.get("content_type") == "image"
+    modes = {"image", "video", "reel"} if platform == "facebook" else {"image", "carousel", "video", "reel"}
     if value.get("content_type") not in modes or type(value.get("media_bytes_verified")) is not bool:
         return False
     manifest = value.get("manifest")
     if not isinstance(manifest, list) or len(manifest) > 10 or bool(manifest) != value["media_bytes_verified"]:
+        return False
+    if image and (len(manifest) != 1 or not value["media_bytes_verified"] or kind == RECOVERED):
         return False
     ids = set()
     for item in manifest:
@@ -198,9 +212,15 @@ def _valid_marker(value):
             or not 0 < item["size"] <= 1024**3
         ):
             return False
+        if image and item["size"] > 2 * 1024 * 1024:
+            return False
         if item["asset_id"] in ids:
             return False
         ids.add(item["asset_id"])
+    if image:
+        return kind == STARTED or (
+            native_id(value.get("receipt_id")) and facebook_story_id(value.get("public_post_id"), value["owner_id"])
+        )
     return kind == STARTED or (native_id(value.get("receipt_id")) and native_id(value.get("public_post_id")))
 
 
@@ -271,7 +291,8 @@ def accepted_attempt(row):
 
 def begin(row, *, expected_binding, grant_kind, content_type, manifest, native_resume):
     """Commit intent before provider I/O, or fail closed on an uncertain prior write."""
-    bytes_verified = verify_media(row, manifest) if manifest else False
+    image = row.social_account.platform == "facebook" and content_type == "image"
+    bytes_verified = verify_media(row, manifest, facebook_photo=image) if manifest else False
     with transaction.atomic():
         current = (
             PlatformPost.objects.select_for_update().select_related("post__workspace", "social_account").get(pk=row.pk)
@@ -285,7 +306,7 @@ def begin(row, *, expected_binding, grant_kind, content_type, manifest, native_r
             or binding(current, grant_kind=grant_kind, content_type=content_type, manifest=manifest) != expected_binding
         ):
             raise PublishError("Meta publish inputs or authorization changed before submission.", retryable=False)
-        if native_resume and not bytes_verified:
+        if (native_resume or image) and not bytes_verified:
             raise PublishError(
                 "Native media bytes do not match the prepared asset; no publish request was sent.", retryable=False
             )
@@ -317,6 +338,10 @@ def begin(row, *, expected_binding, grant_kind, content_type, manifest, native_r
             raise PublishError(
                 "Invalid or unmatched Meta attempt provenance is unconfirmed; no request was repeated.", retryable=False
             )
+        if image and current.publish_logs.exists():
+            raise PublishError(
+                "Previous Facebook photo history is unconfirmed; no upload was repeated.", retryable=False
+            )
         if current.platform_post_id:
             raise PublishError(
                 "Existing Meta receipt has no trusted attempt provenance; reconcile before retrying.", retryable=False
@@ -325,7 +350,7 @@ def begin(row, *, expected_binding, grant_kind, content_type, manifest, native_r
             raise PublishError(
                 "Legacy native upload has no current attempt provenance; reconcile before retrying.", retryable=False
             )
-        if native_resume and not bytes_verified:
+        if (native_resume or image) and not bytes_verified:
             raise PublishError(
                 "Native media bytes do not match the prepared asset; no publish request was sent.", retryable=False
             )
@@ -360,8 +385,22 @@ def accept(row, result, *, duration_ms):
     if not native_id(receipt):
         raise PublishError("Meta returned no valid native receipt; reconcile before retrying.", retryable=False)
     public_id = result.get("public_post_id")
-    public_id = public_id if native_id(public_id) else receipt
-    bytes_match = verify_media(row, marker.get("manifest")) if marker.get("media_bytes_verified") else True
+    image = marker.get("platform") == "facebook" and marker.get("content_type") == "image"
+    if image:
+        status = result.get("status_code")
+        if not context.get("replay") and (type(status) is not int or not 200 <= status < 300):
+            raise PublishError(
+                "Facebook photo has no exact successful HTTP receipt; reconcile before retrying.", retryable=False
+            )
+        if not facebook_story_id(public_id, marker.get("owner_id")):
+            raise PublishError(
+                "Facebook photo has no exact retained story receipt; reconcile before retrying.", retryable=False
+            )
+    else:
+        public_id = public_id if native_id(public_id) else receipt
+    bytes_match = (
+        verify_media(row, marker.get("manifest"), facebook_photo=image) if marker.get("media_bytes_verified") else True
+    )
     with transaction.atomic():
         current = (
             PlatformPost.objects.select_for_update().select_related("post__workspace", "social_account").get(pk=row.pk)
@@ -412,3 +451,40 @@ def accept(row, result, *, duration_ms):
                 update_fields=["platform_post_id", "retry_count", "next_retry_at", "publish_error", "updated_at"]
             )
         row.refresh_from_db()
+
+
+def authorize_facebook_photo(row, marker):
+    """Recheck the committed one-write image intent against fresh local state."""
+    from django.utils import timezone
+
+    fresh = PlatformPost.objects.select_related("post__workspace", "social_account").get(pk=row.pk)
+    if not _scoped(marker, fresh) or not verify_media(fresh, marker.get("manifest"), facebook_photo=True):
+        raise PublishError("Facebook photo bytes changed before submission.", retryable=False)
+    with transaction.atomic():
+        current = (
+            PlatformPost.objects.select_for_update().select_related("post__workspace", "social_account").get(pk=row.pk)
+        )
+        entries = _entries(current)
+        expiry = current.social_account.token_expires_at
+        if (
+            marker.get("platform") != "facebook"
+            or marker.get("content_type") != "image"
+            or marker.get("kind") != STARTED
+            or entries != [marker]
+            or current.status != PlatformPost.Status.PUBLISHING
+            or current.platform_post_id
+            or current.post.workspace.is_archived
+            or current.social_account.needs_reconnect
+            or not current.social_account.oauth_access_token
+            or (expiry is not None and expiry <= timezone.now())
+            or any(
+                scope in current.social_account.missing_scopes
+                for scope in ("pages_manage_posts", "pages_read_engagement", "pages_show_list")
+            )
+            or not _scoped(marker, current)
+            or not _media_scope_valid(current)
+            or current.post.platform_posts.filter(status=PlatformPost.Status.ON_HOLD).exists()
+            or binding(current, grant_kind="account", content_type="image", manifest=marker["manifest"])
+            != marker["binding"]
+        ):
+            raise PublishError("Facebook photo inputs or authorization changed before submission.", retryable=False)

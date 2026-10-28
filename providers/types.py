@@ -6,7 +6,7 @@ import enum
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import urlparse
 
 # Extension heuristic for spotting video URLs.
@@ -85,6 +85,8 @@ class PublishResult:
     needs_confirmation: bool = False
     # May differ from the final feed-post ID (e.g. Facebook Video node ID).
     confirmation_handle: str = ""
+    # Optional exact write status; existing provider/default behavior is unchanged.
+    status_code: int | None = None
 
 
 class PublishState(enum.StrEnum):
@@ -191,6 +193,19 @@ class UploadCache(Protocol):
     def set(self, key: str, value: str, timeout: int) -> None: ...
 
 
+@dataclass(frozen=True)
+class PreparedPhotoUpload:
+    """Internal scoped single-photo copy; never an API/platform_extra input."""
+
+    asset_id: str
+    data: bytes = field(repr=False)
+    sha256: str
+    mime_type: Literal["image/jpeg", "image/png"]
+    owner_id: str
+    caption: str = field(repr=False)
+    authorize_write: Callable[[], None] = field(repr=False, compare=False)
+
+
 @dataclass
 class PublishContent:
     """Content payload passed to publish_post()."""
@@ -221,6 +236,7 @@ class PublishContent:
     # the attempt is rescheduled inside the shutdown grace period instead of
     # being killed mid-publish.
     should_stop: Callable[[], bool] | None = None
+    prepared_photo: PreparedPhotoUpload | None = None
 
     def is_video(self, index: int = 0) -> bool:
         """Whether media item ``index`` is a video.

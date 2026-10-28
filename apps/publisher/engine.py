@@ -39,6 +39,7 @@ from apps.composer.services import publish_blocker, usable_media_types
 from apps.credentials.models import resolve_platform_credentials
 from apps.media_library.storage import download_to_path
 from apps.publisher import meta_receipts
+from apps.publisher.image_delivery import prepare_facebook_photo
 from apps.publisher.native_uploads import NativeUploadCache
 from apps.social_accounts.error_messages import (
     FIRST_COMMENT_GENERIC_MESSAGE,
@@ -590,6 +591,7 @@ class PublishEngine:
         Returns dict: {"success": bool, "platform_post_id": str, "error": str}
         """
         start_time = time.monotonic()
+        photo_outcome = False
         account = platform_post.social_account
 
         # Check rate limits
@@ -612,6 +614,8 @@ class PublishEngine:
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
             if result["success"] and result.get("meta_attempt"):
+                marker = result["meta_attempt"]["marker"]
+                photo_outcome = marker.get("platform") == "facebook" and marker.get("content_type") == "image"
                 meta_receipts.accept(platform_post, result, duration_ms=duration_ms)
                 self._update_rate_limit(account, result)
                 return result
@@ -705,7 +709,14 @@ class PublishEngine:
                 self._schedule_retry(platform_post, error_msg, user_message=PUBLISH_GENERIC_MESSAGE)
                 return result
 
-        except Exception as e:
+        except Exception as caught:
+            e = (
+                PublishError(
+                    "Facebook photo receipt could not be safely retained; reconcile before retrying.", retryable=False
+                )
+                if photo_outcome
+                else caught
+            )
             duration_ms = int((time.monotonic() - start_time) * 1000)
             error_msg = str(e)
 
@@ -783,6 +794,13 @@ class PublishEngine:
         # Refreshes an expiring token first — covers OAuth2 providers *and*
         # session providers like Bluesky, whose accessJwt expires after only a
         # few hours and must be renewed before each publish.
+        if (
+            platform == "facebook"
+            and len(attachments) == 1
+            and attachments[0].media_asset.media_type == "image"
+            and not attachments[0].media_asset.file
+        ):
+            raise PublishError("Facebook single photo has no stored original.", retryable=False)
         initial_assets = [pm.media_asset for pm in attachments if pm.media_asset.file]
         initial_type = self._resolve_post_type(
             platform=platform,
@@ -796,7 +814,13 @@ class PublishEngine:
             or platform == "facebook"
             and initial_type == PostType.REEL
         )
-        if native_video:
+        native_photo = platform == "facebook" and initial_type == PostType.IMAGE and len(attachments) == 1
+        if native_photo and (
+            account.workspace_id != platform_post.post.workspace_id
+            or platform_post.post.workspace.organization_id is None
+        ):
+            raise PublishError("Facebook photo target is outside the selected workspace scope.", retryable=False)
+        if native_video or native_photo:
             # Native Meta video uses only the existing same-account grant.
             # Configuration preflight and dispatch never refresh or widen it.
             provider = get_provider(platform, _resolve_publish_credentials(account))
@@ -839,11 +863,37 @@ class PublishEngine:
         )
         needs_local_media = provider.needs_local_media or post_type in getattr(provider, "binary_video_post_types", ())
 
+        prepared_photo = None
+        meta_attempt = None
+        photo_authorized = False
+        photo_lock = threading.Lock()
+
+        def authorize_photo():
+            nonlocal photo_authorized
+            with photo_lock:
+                if photo_authorized:
+                    raise PublishError("Facebook photo write was already authorized once.", retryable=False)
+                photo_authorized = True
+            if meta_attempt is None:
+                raise PublishError("Facebook photo has no durable intent.", retryable=False)
+            meta_receipts.authorize_facebook_photo(platform_post, meta_attempt["marker"])
+
         primary_video_duration = None
         app_url = getattr(settings, "APP_URL", "").rstrip("/")
         try:
             for pm in attachments:
                 asset = pm.media_asset
+                if native_photo:
+                    prepared_photo = prepare_facebook_photo(
+                        asset,
+                        workspace=platform_post.post.workspace,
+                        owner_id=account.account_platform_id,
+                        caption=platform_post.effective_caption or "",
+                        authorize_write=authorize_photo,
+                    )
+                    media_types.append("image")
+                    continue  # No URL lookup, generic download or hosted fallback.
+
                 if not asset.file:
                     continue
                 # Capture the first video's duration so providers can enforce
@@ -886,7 +936,7 @@ class PublishEngine:
             # Resolve thumbnail_asset_id → temp file path for providers that
             # need to upload a custom thumbnail (YouTube).
             thumb_asset_id = extra.pop("thumbnail_asset_id", None)
-            if thumb_asset_id:
+            if thumb_asset_id and not native_photo:
                 from apps.media_library.models import MediaAsset
 
                 try:
@@ -903,7 +953,7 @@ class PublishEngine:
 
             # Resolve cover_image_asset_id → temp file (Pinterest video pins)
             cover_asset_id = extra.pop("cover_image_asset_id", None)
-            if cover_asset_id:
+            if cover_asset_id and not native_photo:
                 try:
                     cover_asset = MediaAsset.objects.get(id=cover_asset_id)
                     if cover_asset.file:
@@ -937,6 +987,7 @@ class PublishEngine:
                     else _provider_upload_cache
                 ),
                 should_stop=SHUTDOWN_REQUESTED.is_set,
+                prepared_photo=prepared_photo,
             )
 
             logger.info(
@@ -949,7 +1000,7 @@ class PublishEngine:
             meta_attempt = None
             confirm_meta = getattr(provider, "supports_publish_confirmation", False) is True and (
                 platform == "facebook"
-                and post_type in (PostType.VIDEO, PostType.REEL)
+                and (post_type in (PostType.VIDEO, PostType.REEL) or native_photo)
                 or platform == "instagram"
                 and post_type != PostType.STORY
             )
@@ -972,7 +1023,17 @@ class PublishEngine:
                     if platform == "instagram" and post_type in getattr(provider, "binary_video_post_types", ())
                     else "account"
                 )
-                manifest = meta_receipts.prepared_manifest(attachments, media_files)
+                manifest = (
+                    [
+                        {
+                            "asset_id": prepared_photo.asset_id,
+                            "sha256": prepared_photo.sha256,
+                            "size": len(prepared_photo.data),
+                        }
+                    ]
+                    if prepared_photo is not None
+                    else meta_receipts.prepared_manifest(attachments, media_files)
+                )
                 digest = meta_receipts.binding(
                     platform_post,
                     grant_kind=grant_kind,
@@ -1014,6 +1075,7 @@ class PublishEngine:
                 "success": True,
                 "platform_post_id": receipt,
                 "public_post_id": result.platform_post_id,
+                **({"status_code": result.status_code} if native_photo else {}),
                 "meta_attempt": meta_attempt,
                 "url": result.url,
                 "response": result.extra,
@@ -1398,7 +1460,9 @@ class PublishEngine:
                         return True
                     return False
                 if not accepted.get("media_bytes_verified") or not meta_receipts.verify_media(
-                    platform_post, accepted.get("manifest")
+                    platform_post,
+                    accepted.get("manifest"),
+                    facebook_photo=accepted.get("platform") == "facebook" and accepted.get("content_type") == "image",
                 ):
                     if platform_post.updated_at < unconfirmed_before:
                         self._give_up_unconfirmed(platform_post, "Meta media byte identity is unavailable or changed.")
@@ -1407,6 +1471,9 @@ class PublishEngine:
                 credentials = _resolve_publish_credentials(account)
                 if account.platform == "instagram" and accepted["grant_kind"] == "facebook_user":
                     credentials["require_native_user_confirmation"] = True
+                if account.platform == "facebook" and accepted["content_type"] == "image":
+                    credentials["native_photo_story_id"] = accepted["public_post_id"]
+                    credentials["native_photo_caption"] = platform_post.effective_caption or ""
                 provider = get_provider(account.platform, credentials)
                 access_token = account.oauth_access_token
             else:
@@ -1541,7 +1608,13 @@ class PublishEngine:
 
         expected_handle = expected_handle or platform_post.platform_post_id
         if expected_binding is not None and (
-            not accepted_attempt or not meta_receipts.verify_media(platform_post, accepted_attempt.get("manifest"))
+            not accepted_attempt
+            or not meta_receipts.verify_media(
+                platform_post,
+                accepted_attempt.get("manifest"),
+                facebook_photo=accepted_attempt.get("platform") == "facebook"
+                and accepted_attempt.get("content_type") == "image",
+            )
         ):
             return False
         with transaction.atomic():
@@ -1583,6 +1656,19 @@ class PublishEngine:
                     or proof.get("id") != expected_handle
                     or proof.get("owner_id") != current.social_account.account_platform_id
                     or not link
+                ):
+                    return False
+                if (
+                    accepted_attempt
+                    and accepted_attempt.get("platform") == "facebook"
+                    and accepted_attempt.get("content_type") == "image"
+                    and (
+                        proof.get("story_id") != accepted_attempt.get("public_post_id")
+                        or platform_post_id != accepted_attempt.get("public_post_id")
+                        or proof.get("caption_verified") is not True
+                        or proof.get("is_published") is not True
+                        or proof.get("is_hidden") is not False
+                    )
                 ):
                     return False
                 # This is the actual successful native confirmation GET, not

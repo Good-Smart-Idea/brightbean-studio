@@ -110,34 +110,19 @@ def test_publish_multi_photo_post_requires_feed_post_id():
         )
 
 
-def test_publish_single_photo_uses_photos_edge_without_staging():
-    """A single image must publish directly via /photos (no unpublished staging, no attached_media)."""
-    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
-    provider._request = MagicMock(
-        return_value=MagicMock(json=MagicMock(return_value={"id": "photo-1", "post_id": "page-1_post-1"}))
-    )
-
-    result = provider.publish_post(
-        "page-token",
-        PublishContent(
-            text="Single image caption",
-            media_urls=["https://cdn.example.com/one.jpg"],
-            post_type=PostType.IMAGE,
-            extra={"page_id": "page-1"},
-        ),
-    )
-
-    assert result.platform_post_id == "post-1"
-    assert result.url == "https://www.facebook.com/page-1_post-1"
-    provider._request.assert_called_once_with(
-        "POST",
-        "https://graph.facebook.com/v25.0/page-1/photos",
-        access_token="page-token",
-        json={"url": "https://cdn.example.com/one.jpg", "message": "Single image caption"},
-    )
-    sent = provider._request.call_args.kwargs["json"]
-    assert "published" not in sent
-    assert "attached_media" not in sent
+def test_publish_single_photo_requires_prepared_bytes_and_never_falls_back_to_feed():
+    """Hosted single photos are refused; multipart coverage lives in the photo contract tests."""
+    provider = FacebookProvider({"page_id": "123"})
+    provider._request = MagicMock()
+    for urls in ([], ["https://cdn.example.com/one.jpg"]):
+        with pytest.raises(PublishError, match="prepared byte copy"):
+            provider.publish_post(
+                "synthetic",
+                PublishContent(
+                    text="Single image caption", media_urls=urls, post_type=PostType.IMAGE, extra={"page_id": "123"}
+                ),
+            )
+    provider._request.assert_not_called()
 
 
 def test_is_video_url_ignores_query_string():
