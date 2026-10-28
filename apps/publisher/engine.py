@@ -55,6 +55,7 @@ from apps.social_accounts.error_messages import (
 from apps.social_accounts.native_video import instagram_native_credentials
 from providers import VIDEO_POST_TYPES, get_provider
 from providers.exceptions import ProviderError, PublishError, RateLimitError
+from providers.meta_video import native_failure_log_fields
 from providers.types import PostType, PublishContent, PublishState
 
 from .models import PublishLog, RateLimitState
@@ -713,6 +714,7 @@ class PublishEngine:
                 attempt_number=platform_post.retry_count + 1,
                 error_message=error_msg,
                 duration_ms=duration_ms,
+                **native_failure_log_fields(e),
             )
 
             user_message = friendly_publish_error(e)
