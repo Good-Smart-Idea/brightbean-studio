@@ -44,7 +44,8 @@ def instagram():
     return InstagramProvider({"ig_user_id": "1784", "facebook_user_access_token": "synthetic-user-grant"})
 
 
-def test_instagram_raw_upload_uses_user_grant_and_no_public_url(content):
+@pytest.mark.parametrize("upload_version", ["v25.0", "v26.0"])
+def test_instagram_raw_upload_uses_user_grant_and_no_public_url(content, upload_version):
     provider = instagram()
     seen = []
 
@@ -57,7 +58,9 @@ def test_instagram_raw_upload_uses_user_grant_and_no_public_url(content):
                 "upload_type": "resumable",
                 "share_to_feed": True,
             }
-            return response({"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"})
+            return response(
+                {"id": "container1", "uri": f"https://rupload.facebook.com/ig-api-upload/{upload_version}/container1"}
+            )
         if "rupload" in url:
             assert kwargs["headers"]["Authorization"] == "OAuth synthetic-user-grant"
             assert kwargs["headers"]["offset"] == "0"
@@ -186,12 +189,18 @@ def test_target_override_never_contacts_meta(content):
     provider._request.assert_not_called()
 
 
-def test_facebook_binary_reel_uses_page_grant(content):
+@pytest.mark.parametrize("upload_version", ["v25.0", "v26.0"])
+def test_facebook_binary_reel_uses_page_grant(content, upload_version):
     content.extra["page_id"] = "page1"
     provider = FacebookProvider({"page_id": "page1"})
     provider._request = MagicMock(
         side_effect=[
-            response({"video_id": "video1", "upload_url": "https://rupload.facebook.com/video-upload/v25.0/video1"}),
+            response(
+                {
+                    "video_id": "video1",
+                    "upload_url": f"https://rupload.facebook.com/video-upload/{upload_version}/video1",
+                }
+            ),
             response({"success": True}),
             response({"success": True}),
         ]
@@ -249,7 +258,8 @@ def test_grant_expiry_during_processing_blocks_final_post(content):
     assert json.loads(next(iter(content.upload_cache.data.values())))["phase"] == "uploaded"
 
 
-def test_actual_http_client_does_not_follow_upload_redirect(content):
+@pytest.mark.parametrize("upload_version", ["v25.0", "v26.0"])
+def test_actual_http_client_does_not_follow_upload_redirect(content, upload_version):
     from unittest.mock import patch
 
     import httpx
@@ -260,7 +270,11 @@ def test_actual_http_client_does_not_follow_upload_redirect(content):
         seen.append((str(request.url), request.headers.get("Authorization")))
         if request.url.path.endswith("/media"):
             return httpx.Response(
-                200, json={"id": "container1", "uri": "https://rupload.facebook.com/ig-api-upload/v25.0/container1"}
+                200,
+                json={
+                    "id": "container1",
+                    "uri": f"https://rupload.facebook.com/ig-api-upload/{upload_version}/container1",
+                },
             )
         if request.url.host == "rupload.facebook.com":
             return httpx.Response(302, headers={"Location": "https://attacker.invalid/receive"})
@@ -347,3 +361,68 @@ def test_natural_grant_expiry_allows_only_confirmed_receipt_recovery(content, co
     provider._request.assert_not_called()
     provider._wait_for_container.assert_not_called()
     assert content.upload_cache.data == original
+
+
+@pytest.mark.parametrize("kind", ["video-upload", "ig-api-upload"])
+@pytest.mark.parametrize("path_version", ["", "v25.0/", "v26.0/"])
+def test_exact_upload_protocol_destinations(kind, path_version):
+    uri = f"https://rupload.facebook.com/{kind}/{path_version}123456789"
+    assert validate_meta_upload_uri(uri, "123456789", kind=kind, platform="synthetic") == uri
+
+
+@pytest.mark.parametrize("kind", ["video-upload", "ig-api-upload"])
+@pytest.mark.parametrize(
+    "uri_template",
+    [
+        "http://rupload.facebook.com/{kind}/v26.0/123",
+        "https://foreign.invalid/{kind}/v26.0/123",
+        "https://rupload.facebook.com.evil.invalid/{kind}/v26.0/123",
+        "https://user:private@rupload.facebook.com/{kind}/v26.0/123",
+        "https://rupload.facebook.com:443/{kind}/v26.0/123",
+        "https://rupload.facebook.com/{kind}/v26.0/other",
+        "https://rupload.facebook.com/{kind}/v26.0/123?private=value",
+        "https://rupload.facebook.com/{kind}/v26.0/123#private",
+        "https://rupload.facebook.com/{kind}/v26.1/123",
+        "https://rupload.facebook.com/{kind}/v27.0/123",
+        "https://rupload.facebook.com/{kind}/v026.0/123",
+        "https://rupload.facebook.com/{kind}/v26.0/123/extra",
+        "https://rupload.facebook.com/wrong-kind/v26.0/123",
+        "https://rupload.facebook.com/{kind}/v26.0/%31%32%33",
+        "https://rupload.facebook.com/{kind}/v26%2E0/123",
+        "//rupload.facebook.com/{kind}/v26.0/123",
+        "https://rupload.facebook.com:invalid/{kind}/v26.0/123",
+        "https://rupload.facebook.com:/{kind}/v26.0/123",
+        "https://rupload.facebook.com/{kind}/v26.0/123?",
+        "https://rupload.facebook.com/{kind}/v26.0/123#",
+        " https://rupload.facebook.com/{kind}/v26.0/123",
+        "https://rupload.facebook.com/{kind}/v26.0/123\n",
+        "https://rupload.face\tbook.com/{kind}/v26.0/123",
+    ],
+)
+def test_v26_protocol_preserves_destination_restrictions(kind, uri_template):
+    uri = uri_template.format(kind=kind)
+    with pytest.raises(PublishError) as error:
+        validate_meta_upload_uri(uri, "123", kind=kind, platform="synthetic")
+    assert error.value.retryable is False
+    assert uri not in str(error.value) and "private" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "kind,version", [("other-kind", "v25.0"), ("video-upload", "v24.0"), ("ig-api-upload", "v27.0")]
+)
+def test_v26_exception_does_not_expand_other_kinds_or_graph_versions(kind, version):
+    with pytest.raises(PublishError):
+        validate_meta_upload_uri(
+            f"https://rupload.facebook.com/{kind}/v26.0/123", "123", kind=kind, version=version, platform="synthetic"
+        )
+    # Existing callers with an explicit request version retain their own path.
+    uri = f"https://rupload.facebook.com/{kind}/{version}/123"
+    assert validate_meta_upload_uri(uri, "123", kind=kind, version=version, platform="synthetic") == uri
+
+
+@pytest.mark.parametrize("kind,other", [("video-upload", "ig-api-upload"), ("ig-api-upload", "video-upload")])
+def test_v26_rejects_other_valid_upload_kind(kind, other):
+    with pytest.raises(PublishError):
+        validate_meta_upload_uri(
+            f"https://rupload.facebook.com/{other}/v26.0/123", "123", kind=kind, platform="synthetic"
+        )
