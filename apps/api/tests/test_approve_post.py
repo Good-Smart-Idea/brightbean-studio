@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from time import monotonic, sleep
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from django.db import close_old_connections, connection, transaction
@@ -14,6 +15,8 @@ from apps.api_keys.models import ApiKey, ApiKeyAuditLog
 from apps.approvals.models import ApprovalAction, ApprovalReminder
 from apps.composer.models import PlatformPost, Post
 from apps.members.models import CustomRole, WorkspaceMembership
+from apps.publisher import meta_receipts
+from apps.publisher.models import PublishLog
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
@@ -203,6 +206,88 @@ def test_publish_or_retry_evidence_is_never_adopted_or_cleared(approval_case, fi
     child.refresh_from_db()
     assert getattr(child, field) == value
     assert_undecided(approval_case)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("kind", [meta_receipts.STARTED, meta_receipts.ACCEPTED, meta_receipts.RECOVERED])
+def test_clean_pending_review_cannot_adopt_a_typed_publish_ledger(approval_case, kind):
+    account = approval_case[2]
+    account.platform = "facebook"
+    account.account_platform_id = "12345"
+    account.save(update_fields=["platform", "account_platform_id"])
+    marker = {
+        "kind": kind,
+        "attempt_id": str(uuid4()),
+        "child_id": str(approval_case[6].id),
+        "account_id": str(account.id),
+        "workspace_id": str(approval_case[1].id),
+        "owner_id": "12345",
+        "platform": "facebook",
+        "grant_kind": "account",
+        "content_type": "reel",
+        "binding": "a" * 64,
+        "manifest": [],
+        "media_bytes_verified": False,
+    }
+    if kind != meta_receipts.STARTED:
+        marker.update(receipt_id="555", public_post_id="555")
+    body = meta_receipts._encode(marker)
+    log = PublishLog.objects.create(
+        platform_post=approval_case[6], status_code=200 if kind == meta_receipts.ACCEPTED else None, response_body=body
+    )
+    with patch("apps.approvals.services.approve_post") as service:
+        assert approve(approval_case).status_code == 409
+        service.assert_not_called()
+    log.refresh_from_db()
+    assert log.response_body == body
+    assert approval_case[6].publish_logs.count() == 1
+    assert_undecided(approval_case)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"kind":"meta_publish_started"}',
+        '{"kind":"meta_publish_started","attempt_id":null}',
+        '{"kind":"meta_publish_started",',
+        '{"kind":"meta_publish_accepted","receipt_id":"555"}',
+        '{"kind":"meta_publish_recovered","receipt_id":"555"}',
+        '{ "unexpected": true, "kind": "meta_publish_started" }',
+        "not JSON",
+        "",
+        "untyped provider failure",
+    ],
+)
+def test_any_malformed_partial_or_untyped_ledger_blocks_unsent_approval(approval_case, body):
+    log = PublishLog.objects.create(platform_post=approval_case[6], response_body=body)
+    assert approve(approval_case).status_code == 409
+    log.refresh_from_db()
+    assert log.response_body == body
+    assert_undecided(approval_case)
+
+
+@pytest.mark.django_db
+def test_history_on_one_child_blocks_every_target_without_changing_history(approval_case):
+    other = sibling(approval_case)
+    log = PublishLog.objects.create(platform_post=other, response_body='{"kind":"meta_publish_started"}')
+    before = list(PublishLog.objects.filter(platform_post__post=approval_case[5]).values())
+    assert approve(approval_case).status_code == 409
+    assert set(approval_case[5].platform_posts.values_list("status", flat=True)) == {"pending_review"}
+    assert list(PublishLog.objects.filter(platform_post__post=approval_case[5]).values()) == before
+    assert PublishLog.objects.filter(id=log.id).exists()
+    assert_undecided(approval_case)
+
+
+@pytest.mark.django_db
+def test_already_approved_noop_still_refuses_publish_history(approval_case):
+    child = approval_case[6]
+    child.status = "approved"
+    child.save(update_fields=["status"])
+    log = PublishLog.objects.create(platform_post=child, response_body='{"kind":"meta_publish_started"}')
+    assert approve(approval_case).status_code == 409
+    assert not ApprovalAction.objects.filter(post=approval_case[5]).exists()
+    assert PublishLog.objects.filter(id=log.id).exists()
 
 
 @pytest.mark.django_db
@@ -427,7 +512,7 @@ def test_postgres_concurrent_approvals_record_one_decision(approval_case):
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("mutation", ["child_insert", "scope_insert", "scope_delete"])
+@pytest.mark.parametrize("mutation", ["child_insert", "scope_insert", "scope_delete", "ledger_insert"])
 def test_postgres_parent_and_through_locks_serialize_scope_mutators(approval_case, mutation):
     if connection.vendor != "postgresql":
         pytest.skip("Real FK/through-row concurrency requires PostgreSQL.")
@@ -455,6 +540,10 @@ def test_postgres_parent_and_through_locks_serialize_scope_mutators(approval_cas
                 PlatformPost.objects.create(post_id=approval_case[5].id, social_account=extra_account, status="draft")
             elif mutation == "scope_insert":
                 ApiKey.objects.get(id=approval_case[3].id).social_accounts.add(extra_account)
+            elif mutation == "ledger_insert":
+                PublishLog.objects.create(
+                    platform_post_id=approval_case[6].id, response_body='{"kind":"meta_publish_started"}'
+                )
             else:
                 ApiKey.objects.get(id=approval_case[3].id).social_accounts.remove(approval_case[2])
         mutator_done.set()

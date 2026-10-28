@@ -687,6 +687,7 @@ def approve(request, post_id: uuid.UUID, payload: ApprovePostRequest):
 
     from apps.approvals.services import approve_post
     from apps.composer.models import PlatformPost
+    from apps.publisher.models import PublishLog
     from apps.workspaces.models import Workspace
 
     enforce_http_rate_limits(request, is_write=True)
@@ -722,6 +723,12 @@ def approve(request, post_id: uuid.UUID, payload: ApprovePostRequest):
         if (
             post.scheduled_at is not None
             or post.published_at is not None
+            # PublishLog is the append-only attempt ledger (including Meta
+            # STARTED before provider I/O), not merely an HTTP response cache.
+            # Any retained row contradicts this operation's strict unsent
+            # contract. Never interpret malformed/unmatched history as absent.
+            # Locked child FK parents serialize new ledger-row commits.
+            or PublishLog.objects.filter(platform_post_id__in=[child.id for child in children]).exists()
             or any(
                 child.status not in {"pending_review", "approved"} or _has_approval_publish_evidence(child)
                 for child in children
