@@ -12,13 +12,20 @@ from ninja import Field, Schema
 
 from apps.publisher.engine import _resolve_publish_credentials
 from providers import get_provider
-from providers.exceptions import APIError
+from providers.exceptions import APIError, RateLimitError
 
 FIELDS = "id,caption,timestamp,media_type,media_product_type,permalink"
-HOSTS = {"instagram": "https://graph.facebook.com/v25.0", "instagram_login": "https://graph.instagram.com/v25.0"}
+HOSTS = {
+    "instagram": "https://graph.facebook.com/v25.0",
+    "instagram_login": "https://graph.instagram.com/v25.0",
+}
 FACEBOOK_HOST = "https://graph.facebook.com/v25.0"
-FACEBOOK_VIDEO_FIELDS = "id,description,created_time,permalink_url,published,status,privacy,from"
-FACEBOOK_POST_FIELDS = "id,object_id,permalink_url,is_published,is_hidden,timeline_visibility,privacy,from"
+FACEBOOK_VIDEO_FIELDS = (
+    "id,description,created_time,permalink_url,published,status,privacy,from"
+)
+FACEBOOK_POST_FIELDS = (
+    "id,object_id,permalink_url,is_published,is_hidden,timeline_visibility,privacy,from"
+)
 
 
 class NativeDestination(Schema):
@@ -52,7 +59,9 @@ class RecentMediaResponse(Schema):
 
 
 def valid_cursor(value: str | None) -> bool:
-    return value is None or (0 < len(value) <= 2048 and not any(c.isspace() for c in value))
+    return value is None or (
+        0 < len(value) <= 2048 and not any(c.isspace() for c in value)
+    )
 
 
 def _permalink(value, *, facebook=False) -> str:
@@ -62,7 +71,11 @@ def _permalink(value, *, facebook=False) -> str:
         parsed = urlsplit(value)
     except ValueError:
         return ""
-    hosts = ("www.facebook.com", "facebook.com") if facebook else ("www.instagram.com", "instagram.com")
+    hosts = (
+        ("www.facebook.com", "facebook.com")
+        if facebook
+        else ("www.instagram.com", "instagram.com")
+    )
     if facebook and value.startswith("/") and not parsed.netloc:
         parsed = parsed._replace(scheme="https", netloc="www.facebook.com")
     if parsed.scheme != "https" or parsed.netloc not in hosts:
@@ -73,7 +86,10 @@ def _permalink(value, *, facebook=False) -> str:
         [
             (key, value)
             for key, value in parse_qsl(parsed.query)
-            if facebook and key in ("v", "id", "story_fbid") and value.isascii() and value.isdecimal()
+            if facebook
+            and key in ("v", "id", "story_fbid")
+            and value.isascii()
+            and value.isdecimal()
         ]
     )
     return urlunsplit(("https", parsed.netloc, parsed.path, query, ""))
@@ -94,7 +110,9 @@ def _destination(provider, token, identifier, *, platform):
     facebook = platform == "facebook"
     host = FACEBOOK_HOST if facebook else HOSTS[platform]
     fields = "id,name,link" if facebook else "id,username,name"
-    raw = provider._request("GET", f"{host}/{identifier}", access_token=token, params={"fields": fields}).json()
+    raw = provider._request(
+        "GET", f"{host}/{identifier}", access_token=token, params={"fields": fields}
+    ).json()
     if not isinstance(raw, dict) or str(raw.get("id", "")) != identifier:
         raise ValueError("Native destination does not match scoped account")
     return NativeDestination(
@@ -113,7 +131,9 @@ def _video_status(row):
     return value[:64] if isinstance(value, str) else ""
 
 
-def fetch_recent_media(account, *, limit: int, after: str | None) -> RecentMediaResponse:
+def fetch_recent_media(
+    account, *, limit: int, after: str | None
+) -> RecentMediaResponse:
     """One GET to the explicitly scoped account's native /media edge.
 
     A page proves presence only. Follow cursors until the target time window
@@ -127,7 +147,9 @@ def fetch_recent_media(account, *, limit: int, after: str | None) -> RecentMedia
     params = {"fields": FACEBOOK_VIDEO_FIELDS if facebook else FIELDS, "limit": limit}
     if after:
         params["after"] = after
-    response = provider._request("GET", f"{host}/{identifier}/{edge}", access_token=token, params=params)
+    response = provider._request(
+        "GET", f"{host}/{identifier}/{edge}", access_token=token, params=params
+    )
     body = response.json()
     rows = body.get("data") if isinstance(body, dict) else None
     if not isinstance(rows, list) or len(rows) > limit:
@@ -136,7 +158,9 @@ def fetch_recent_media(account, *, limit: int, after: str | None) -> RecentMedia
     for row in rows:
         if not isinstance(row, dict) or not str(row.get("id", "")).isdecimal():
             raise ValueError("Invalid media item")
-        stamp = parse_datetime(str(row.get("created_time" if facebook else "timestamp", "")))
+        stamp = parse_datetime(
+            str(row.get("created_time" if facebook else "timestamp", ""))
+        )
         if stamp is None or stamp.tzinfo is None:
             raise ValueError("Invalid media timestamp")
         items.append(
@@ -146,15 +170,22 @@ def fetch_recent_media(account, *, limit: int, after: str | None) -> RecentMedia
                 timestamp=stamp,
                 media_type="VIDEO" if facebook else str(row.get("media_type", "")),
                 media_product_type=str(row.get("media_product_type", "")),
-                permalink=_permalink(row.get("permalink_url" if facebook else "permalink", ""), facebook=facebook),
-                published=row.get("published") if isinstance(row.get("published"), bool) else None,
+                permalink=_permalink(
+                    row.get("permalink_url" if facebook else "permalink", ""),
+                    facebook=facebook,
+                ),
+                published=row.get("published")
+                if isinstance(row.get("published"), bool)
+                else None,
                 video_status=_video_status(row) if facebook else "",
             )
         )
     paging = body.get("paging") or {}
     has_more = bool(paging.get("next"))
     cursor = (paging.get("cursors") or {}).get("after") if has_more else None
-    if has_more and (not isinstance(cursor, str) or not valid_cursor(cursor) or cursor == after):
+    if has_more and (
+        not isinstance(cursor, str) or not valid_cursor(cursor) or cursor == after
+    ):
         raise ValueError("Invalid media pagination")
     stamps = [item.timestamp for item in items]
     return RecentMediaResponse(
@@ -170,6 +201,89 @@ def fetch_recent_media(account, *, limit: int, after: str | None) -> RecentMedia
     )
 
 
+ReceiptStage = Literal["configuration", "receipt", "destination", "post", "video"]
+ReceiptReason = Literal[
+    "configuration_invalid",
+    "receipt_invalid",
+    "owner_mismatch",
+    "native_response_invalid",
+    "provider_authentication",
+    "provider_permission",
+    "provider_rate_limit",
+    "provider_unavailable",
+    "node_unavailable_or_type",
+    "provider_request_rejected",
+    "transport_or_internal_error",
+]
+
+
+class NativeReceiptFailure(Schema):
+    error: Literal["native_receipt_unverified"] = "native_receipt_unverified"
+    detail: str = "Native video could not be verified. No post was changed or retried."
+    stage: ReceiptStage
+    reason: ReceiptReason
+    provider_http_status: int | None = Field(None, ge=100, le=599, strict=True)
+    provider_code: int | None = Field(None, ge=0, le=2147483647, strict=True)
+    provider_subcode: int | None = Field(None, ge=0, le=2147483647, strict=True)
+
+
+class NativeReceiptLookupError(Exception):
+    def __init__(self, diagnostic: NativeReceiptFailure):
+        self.diagnostic = diagnostic
+        super().__init__("Native receipt remains unverified")
+
+
+class NativeOwnerMismatch(ValueError):
+    pass
+
+
+def _bounded_int(value, low, high):
+    return value if type(value) is int and low <= value <= high else None
+
+
+def _receipt_failure(stage: ReceiptStage, exc: Exception) -> NativeReceiptFailure:
+    # Closed reasons and strict bounded integers only. Never stringify errors,
+    # messages, URLs, trace IDs, request parameters, tokens or response bodies.
+    status = _bounded_int(getattr(exc, "status_code", None), 100, 599)
+    raw = getattr(exc, "raw_response", None)
+    raw = raw if isinstance(raw, dict) else {}
+    error = raw.get("error")
+    error = error if isinstance(error, dict) else {}
+    code = _bounded_int(error.get("code"), 0, 2147483647)
+    subcode = _bounded_int(error.get("error_subcode"), 0, 2147483647)
+    reason: ReceiptReason = "transport_or_internal_error"
+    if isinstance(exc, NativeOwnerMismatch):
+        reason = "owner_mismatch"
+    elif isinstance(exc, RateLimitError) or status == 429 or code in (4, 17, 32, 613):
+        reason = "provider_rate_limit"
+    elif status == 401 or code in (102, 190):
+        reason = "provider_authentication"
+    elif status == 403 or code in (10, 200):
+        reason = "provider_permission"
+    elif status is not None and status >= 500:
+        reason = "provider_unavailable"
+    elif isinstance(exc, APIError):
+        reason = (
+            "node_unavailable_or_type"
+            if _post_type_probe_allowed(exc)
+            else "provider_request_rejected"
+        )
+    elif isinstance(exc, ValueError):
+        if stage == "configuration":
+            reason = "configuration_invalid"
+        elif stage == "receipt":
+            reason = "receipt_invalid"
+        else:
+            reason = "native_response_invalid"
+    return NativeReceiptFailure(
+        stage=stage,
+        reason=reason,
+        provider_http_status=status,
+        provider_code=code,
+        provider_subcode=subcode,
+    )
+
+
 class NativeVideoResponse(Schema):
     account_id: uuid.UUID
     platform_post_id: uuid.UUID
@@ -179,16 +293,20 @@ class NativeVideoResponse(Schema):
     receipt_node_type: Literal["post", "video"] = "video"
     canonical_post_id: str = ""
     post_object_id: str = Field(
-        "", description="Object reference from the verified Page Post; not proof of video ownership."
+        "",
+        description="Object reference from the verified Page Post; not proof of video ownership.",
     )
     post_is_published: bool | None = None
     post_is_hidden: bool | None = None
     timeline_visibility: Literal["", "hidden", "normal", "forced_allow"] = ""
     post_privacy: str = ""
     video_id: str = ""
-    video_lookup_status: Literal["available", "no_object_id", "unavailable"] = "available"
+    video_lookup_status: Literal["available", "no_object_id", "unavailable"] = (
+        "available"
+    )
     published: bool | None = Field(
-        None, description="Video-node published flag, independent of the Page Post's visibility."
+        None,
+        description="Video-node published flag, independent of the Page Post's visibility.",
     )
     video_status: str = ""
     privacy: str = ""
@@ -217,13 +335,16 @@ def _owned_node(row, expected_id, identifier):
         raise ValueError("Invalid native node")
     owner = row.get("from") or {}
     if not isinstance(owner, dict) or str(owner.get("id", "")) != identifier:
-        raise ValueError("Native owner does not match scoped Page")
+        raise NativeOwnerMismatch("Native owner does not match scoped Page")
     return row
 
 
 def _read_video(provider, token, identifier, video_id):
     row = provider._request(
-        "GET", f"{FACEBOOK_HOST}/{video_id}", access_token=token, params={"fields": FACEBOOK_VIDEO_FIELDS}
+        "GET",
+        f"{FACEBOOK_HOST}/{video_id}",
+        access_token=token,
+        params={"fields": FACEBOOK_VIDEO_FIELDS},
     ).json()
     return _owned_node(row, video_id, identifier)
 
@@ -265,7 +386,9 @@ def _post_type_probe_allowed(exc):
 def _video_values(row):
     return dict(
         video_id=str(row["id"]),
-        published=row.get("published") if isinstance(row.get("published"), bool) else None,
+        published=row.get("published")
+        if isinstance(row.get("published"), bool)
+        else None,
         video_status=_video_status(row),
         privacy=_privacy(row),
     )
@@ -278,63 +401,81 @@ def fetch_facebook_video(account, platform_post) -> NativeVideoResponse:
     otherwise a bare Video ID. One Page identity read plus at most two node
     reads settles that distinction without a write, history rewrite or retry.
     """
-    provider, token, identifier = _client(account)
-    remote_id = platform_post.platform_post_id
-    canonical_id, leaf = _receipt_ids(remote_id, identifier)
-    destination = _destination(provider, token, identifier, platform="facebook")
-    base = dict(
-        account_id=account.id,
-        platform_post_id=platform_post.id,
-        destination=destination,
-        remote_id=remote_id,
-        owner_id=identifier,
-    )
+    stage: ReceiptStage = "configuration"
     try:
-        post = provider._request(
-            "GET", f"{FACEBOOK_HOST}/{canonical_id}", access_token=token, params={"fields": FACEBOOK_POST_FIELDS}
-        ).json()
-    except APIError as exc:
-        if not _post_type_probe_allowed(exc):
-            raise
-        video = _read_video(provider, token, identifier, leaf)
-        return NativeVideoResponse(
-            **base,
-            **_video_values(video),
-            receipt_node_type="video",
-            permalink=_permalink(video.get("permalink_url", ""), facebook=True),
+        provider, token, identifier = _client(account)
+        stage = "receipt"
+        remote_id = platform_post.platform_post_id
+        canonical_id, leaf = _receipt_ids(remote_id, identifier)
+        stage = "destination"
+        destination = _destination(provider, token, identifier, platform="facebook")
+        base = dict(
+            account_id=account.id,
+            platform_post_id=platform_post.id,
+            destination=destination,
+            remote_id=remote_id,
+            owner_id=identifier,
         )
+        stage = "post"
+        try:
+            post = provider._request(
+                "GET",
+                f"{FACEBOOK_HOST}/{canonical_id}",
+                access_token=token,
+                params={"fields": FACEBOOK_POST_FIELDS},
+            ).json()
+        except APIError as exc:
+            if not _post_type_probe_allowed(exc):
+                raise
+            stage = "video"
+            video = _read_video(provider, token, identifier, leaf)
+            return NativeVideoResponse(
+                **base,
+                **_video_values(video),
+                receipt_node_type="video",
+                permalink=_permalink(video.get("permalink_url", ""), facebook=True),
+            )
 
-    # Verify the Page-owned Post before trusting its object_id. A foreign
-    # owner or malformed 2xx is not a reason to try a different native node.
-    post = _owned_node(post, canonical_id, identifier)
-    visibility = post.get("timeline_visibility", "")
-    result = NativeVideoResponse(
-        **base,
-        receipt_node_type="post",
-        canonical_post_id=canonical_id,
-        post_is_published=post.get("is_published") if isinstance(post.get("is_published"), bool) else None,
-        post_is_hidden=post.get("is_hidden") if isinstance(post.get("is_hidden"), bool) else None,
-        timeline_visibility=visibility if visibility in ("hidden", "normal", "forced_allow") else "",
-        post_privacy=_privacy(post),
-        permalink=_permalink(post.get("permalink_url", ""), facebook=True)
-        or f"https://www.facebook.com/{canonical_id}",
-        video_lookup_status="no_object_id",
-    )
-    video_id = str(post.get("object_id") or "")
-    if not video_id:
+        # Verify the Page-owned Post before trusting its object_id. A foreign
+        # owner or malformed 2xx is not a reason to try a different native node.
+        post = _owned_node(post, canonical_id, identifier)
+        visibility = post.get("timeline_visibility", "")
+        result = NativeVideoResponse(
+            **base,
+            receipt_node_type="post",
+            canonical_post_id=canonical_id,
+            post_is_published=post.get("is_published")
+            if isinstance(post.get("is_published"), bool)
+            else None,
+            post_is_hidden=post.get("is_hidden")
+            if isinstance(post.get("is_hidden"), bool)
+            else None,
+            timeline_visibility=visibility
+            if visibility in ("hidden", "normal", "forced_allow")
+            else "",
+            post_privacy=_privacy(post),
+            permalink=_permalink(post.get("permalink_url", ""), facebook=True)
+            or f"https://www.facebook.com/{canonical_id}",
+            video_lookup_status="no_object_id",
+        )
+        video_id = str(post.get("object_id") or "")
+        if not video_id:
+            return result
+        if not video_id.isascii() or not video_id.isdecimal():
+            raise ValueError("Invalid native Post object reference")
+        result.post_object_id = video_id
+        stage = "video"
+        try:
+            video = _read_video(provider, token, identifier, video_id)
+        except APIError:
+            # The verified Post is useful evidence even if its Video cannot be
+            # read. This is explicitly partial, with no alternate ID request or
+            # claim that the video is absent or publicly visible.
+            result.video_lookup_status = "unavailable"
+            return result
+        for key, value in _video_values(video).items():
+            setattr(result, key, value)
+        result.video_lookup_status = "available"
         return result
-    if not video_id.isascii() or not video_id.isdecimal():
-        raise ValueError("Invalid native Post object reference")
-    result.post_object_id = video_id
-    try:
-        video = _read_video(provider, token, identifier, video_id)
-    except APIError:
-        # The verified Post is useful evidence even if its Video cannot be
-        # read. This is explicitly partial, with no alternate ID request or
-        # claim that the video is absent or publicly visible.
-        result.video_lookup_status = "unavailable"
-        return result
-    for key, value in _video_values(video).items():
-        setattr(result, key, value)
-    result.video_lookup_status = "available"
-    return result
+    except Exception as exc:
+        raise NativeReceiptLookupError(_receipt_failure(stage, exc)) from None
