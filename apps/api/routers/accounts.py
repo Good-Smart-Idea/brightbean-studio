@@ -10,6 +10,8 @@ from ninja.errors import HttpError
 from apps.api.limits import enforce_http_rate_limits
 from apps.api.middleware import log_audit_entry
 from apps.api.recent_media import (
+    NativeReceiptFailure,
+    NativeReceiptLookupError,
     NativeVideoResponse,
     RecentMediaResponse,
     fetch_facebook_video,
@@ -55,7 +57,10 @@ def recent_media(
     _require_perm(request, "view_analytics")
     account = _resolve_account(request, account_id)
     if account.platform not in ("instagram", "instagram_login", "facebook"):
-        raise HttpError(422, "Native recent media is supported only for Instagram and Facebook accounts.")
+        raise HttpError(
+            422,
+            "Native recent media is supported only for Instagram and Facebook accounts.",
+        )
     if not valid_cursor(after):
         raise HttpError(422, "Invalid pagination cursor.")
     try:
@@ -70,7 +75,7 @@ def recent_media(
 
 @router.get(
     "/{account_id}/published-media/{platform_post_id}",
-    response=NativeVideoResponse,
+    response={200: NativeVideoResponse, 502: NativeReceiptFailure},
     summary="Read native Facebook video receipt and destination without retrying",
 )
 def published_media(request, account_id: uuid.UUID, platform_post_id: uuid.UUID):
@@ -93,9 +98,17 @@ def published_media(request, account_id: uuid.UUID, platform_post_id: uuid.UUID)
     )
     try:
         result = fetch_facebook_video(account, platform_post)
+    except NativeReceiptLookupError as exc:
+        log_audit_entry(request, action="accounts.published_media", target_id=account.id, status_code=502)
+        return 502, exc.diagnostic
     except Exception:
         raise HttpError(502, "Native video could not be verified. No post was changed or retried.") from None
-    log_audit_entry(request, action="accounts.published_media", target_id=account.id, status_code=200)
+    log_audit_entry(
+        request,
+        action="accounts.published_media",
+        target_id=account.id,
+        status_code=200,
+    )
     return result
 
 
@@ -127,5 +140,10 @@ def native_video_readiness(request, account_id: uuid.UUID):
     if account.workspace_id != request.api_key.workspace_id:
         raise Http404()
     result = native_video_configuration(account)
-    log_audit_entry(request, action="accounts.native_video_configuration", target_id=account.id, status_code=200)
+    log_audit_entry(
+        request,
+        action="accounts.native_video_configuration",
+        target_id=account.id,
+        status_code=200,
+    )
     return result

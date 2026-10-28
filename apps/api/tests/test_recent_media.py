@@ -22,13 +22,25 @@ def setup(db, user, organization):
     OrgMembership.objects.create(user=user, organization=organization, org_role="owner")
     WorkspaceMembership.objects.create(user=user, workspace=ws, workspace_role="owner")
     ig = SocialAccount.objects.create(
-        workspace=ws, platform="instagram", account_platform_id="123", account_name="IG", oauth_access_token="test-only"
+        workspace=ws,
+        platform="instagram",
+        account_platform_id="123",
+        account_name="IG",
+        oauth_access_token="test-only",
     )
     fb = SocialAccount.objects.create(
-        workspace=ws, platform="facebook", account_platform_id="456", account_name="FB", oauth_access_token="test-only"
+        workspace=ws,
+        platform="facebook",
+        account_platform_id="456",
+        account_name="FB",
+        oauth_access_token="test-only",
     )
     key = services.issue_api_key(
-        workspace=ws, social_accounts=[ig, fb], issued_by=user, name="native", permissions=list(PERMISSION_KEYS)
+        workspace=ws,
+        social_accounts=[ig, fb],
+        issued_by=user,
+        name="native",
+        permissions=list(PERMISSION_KEYS),
     )
     client = Client(HTTP_AUTHORIZATION=f"Bearer {key.plaintext_token}")
     return SimpleNamespace(ws=ws, user=user, ig=ig, fb=fb, client=client)
@@ -83,7 +95,13 @@ def test_cursor_metadata_and_no_next_url_following(setup, monkeypatch):
     provider = fake_provider(
         monkeypatch,
         {"id": "123"},
-        {"data": [ig_item()], "paging": {"next": "https://untrusted/secret", "cursors": {"after": "safe-cursor"}}},
+        {
+            "data": [ig_item()],
+            "paging": {
+                "next": "https://untrusted/secret",
+                "cursors": {"after": "safe-cursor"},
+            },
+        },
     )
     body = get(setup).json()
     assert body["has_more"] is True and body["next_cursor"] == "safe-cursor"
@@ -184,7 +202,11 @@ def test_facebook_video_page_maps_destination_status(setup, monkeypatch):
 def fb_post(setup):
     post = Post.objects.create(workspace=setup.ws, author=setup.user, caption="HVAC")
     return PlatformPost.objects.create(
-        post=post, social_account=setup.fb, platform_post_id="987", status="published", published_at=timezone.now()
+        post=post,
+        social_account=setup.fb,
+        platform_post_id="987",
+        status="published",
+        published_at=timezone.now(),
     )
 
 
@@ -248,7 +270,11 @@ def test_exact_fb_wrong_native_owner_redacted(setup, fb_post, monkeypatch):
     provider = fake_provider(
         monkeypatch,
         {"id": "456"},
-        {"id": "456_987", "object_id": "654", "from": {"id": "999", "name": "never-return"}},
+        {
+            "id": "456_987",
+            "object_id": "654",
+            "from": {"id": "999", "name": "never-return"},
+        },
     )
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 502
@@ -296,7 +322,10 @@ def video_node(**changes):
             "redacted",
             status_code=400,
             raw_response={
-                "error": {"code": 100, "message": "Tried accessing nonexisting field (object_id) on node type (Video)"}
+                "error": {
+                    "code": 100,
+                    "message": "Tried accessing nonexisting field (object_id) on node type (Video)",
+                }
             },
         ),
     ],
@@ -334,7 +363,11 @@ def test_bare_video_only_after_definitive_missing_or_type_post(setup, fb_post, m
 def test_no_bare_video_probe_on_auth_quota_server_or_unrelated_error(
     setup, fb_post, monkeypatch, status, code, message
 ):
-    error = APIError("never-return", status_code=status, raw_response={"error": {"code": code, "message": message}})
+    error = APIError(
+        "never-return",
+        status_code=status,
+        raw_response={"error": {"code": code, "message": message}},
+    )
     provider = fake_provider(monkeypatch, {"id": "456"}, error)
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 502
@@ -406,7 +439,11 @@ def test_foreign_page_prefix_never_probed(setup, fb_post, monkeypatch):
 
 @pytest.mark.django_db
 def test_non_numeric_object_reference_never_followed(setup, fb_post, monkeypatch):
-    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(object_id="https://foreign.example/never-return"))
+    provider = fake_provider(
+        monkeypatch,
+        {"id": "456"},
+        page_post(object_id="https://foreign.example/never-return"),
+    )
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == 502
     assert "never-return" not in response.content.decode()
@@ -416,7 +453,10 @@ def test_non_numeric_object_reference_never_followed(setup, fb_post, monkeypatch
 @pytest.mark.parametrize(
     "url,expected",
     [
-        ("/watch/?v=654&access_token=never-return&t=3", "https://www.facebook.com/watch/?v=654"),
+        (
+            "/watch/?v=654&access_token=never-return&t=3",
+            "https://www.facebook.com/watch/?v=654",
+        ),
         (
             "https://facebook.com/permalink.php?story_fbid=987&id=456&access_token=never-return",
             "https://facebook.com/permalink.php?story_fbid=987&id=456",
@@ -425,7 +465,10 @@ def test_non_numeric_object_reference_never_followed(setup, fb_post, monkeypatch
             "https://www.facebook.com/story.php?story_fbid=987&id=456&fbid=999&tracking=never-return",
             "https://www.facebook.com/story.php?story_fbid=987&id=456",
         ),
-        ("https://www.facebook.com/watch/?v=never-return&id=456", "https://www.facebook.com/watch/?id=456"),
+        (
+            "https://www.facebook.com/watch/?v=never-return&id=456",
+            "https://www.facebook.com/watch/?id=456",
+        ),
         ("//foreign.example/watch/?v=654", ""),
         ("https://foreign.example/watch/?v=654", ""),
         ("https://user:never-return@www.facebook.com/watch/?v=654", ""),
@@ -453,7 +496,10 @@ def ambiguous_post_error():
 @pytest.mark.parametrize("owner,expected", [("456", 200), ("999", 502)])
 def test_ambiguous_post_can_only_establish_owner_verified_video(setup, fb_post, monkeypatch, owner, expected):
     provider = fake_provider(
-        monkeypatch, {"id": "456"}, ambiguous_post_error(), video_node(id="987", **{"from": {"id": owner}})
+        monkeypatch,
+        {"id": "456"},
+        ambiguous_post_error(),
+        video_node(id="987", **{"from": {"id": owner}}),
     )
     response = get(setup, setup.fb, f"published-media/{fb_post.id}")
     assert response.status_code == expected
@@ -472,3 +518,146 @@ def test_both_node_reads_unavailable_never_claim_absence(setup, fb_post, monkeyp
     assert response.status_code == 502
     assert provider._request.call_count == 3
     assert "never-return" not in response.content.decode()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("stage", ["configuration", "receipt", "destination", "post", "video"])
+def test_receipt_diagnostics_each_stage_preserves_history(setup, fb_post, monkeypatch, stage, caplog):
+    failure = APIError(
+        "never-return https://private.example/?access_token=never-return",
+        status_code=403,
+        raw_response={
+            "error": {
+                "code": 200,
+                "error_subcode": 33,
+                "message": "never-return",
+                "fbtrace_id": "never-return",
+            }
+        },
+    )
+    if stage == "configuration":
+        provider = fake_provider(monkeypatch)
+        monkeypatch.setattr(adapter, "_client", Mock(side_effect=ValueError("never-return")))
+        reason = "configuration_invalid"
+    elif stage == "receipt":
+        provider = fake_provider(monkeypatch)
+        fb_post.platform_post_id = "foreign_never-return"
+        fb_post.save(update_fields=["platform_post_id"])
+        reason = "receipt_invalid"
+    else:
+        bodies = [] if stage == "destination" else [{"id": "456"}]
+        if stage == "video":
+            bodies.append(ambiguous_post_error())
+        provider = fake_provider(monkeypatch, *bodies, failure)
+        reason = "provider_permission"
+    before = (fb_post.status, fb_post.platform_post_id, fb_post.published_at)
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 502
+    body = response.json()
+    assert body["stage"] == stage and body["reason"] == reason
+    assert body["error"] == "native_receipt_unverified"
+    if stage in ("destination", "post", "video"):
+        assert body["provider_http_status"] == 403
+        assert body["provider_code"] == 200 and body["provider_subcode"] == 33
+    assert "never-return" not in response.content.decode() + caplog.text
+    assert "private.example" not in response.content.decode() + caplog.text
+    assert provider._request.call_count <= 3
+    assert all(call.args[0] == "GET" for call in provider._request.call_args_list)
+    fb_post.refresh_from_db()
+    assert (fb_post.status, fb_post.platform_post_id, fb_post.published_at) == before
+
+
+@pytest.mark.parametrize(
+    "error,reason",
+    [
+        (APIError("never-return", status_code=401), "provider_authentication"),
+        (
+            APIError("never-return", status_code=400, raw_response={"error": {"code": 190}}),
+            "provider_authentication",
+        ),
+        (APIError("never-return", status_code=403), "provider_permission"),
+        (APIError("never-return", status_code=429), "provider_rate_limit"),
+        (APIError("never-return", status_code=503), "provider_unavailable"),
+        (
+            APIError("never-return", status_code=400, raw_response={"error": {"code": 4}}),
+            "provider_rate_limit",
+        ),
+        (ambiguous_post_error(), "node_unavailable_or_type"),
+        (
+            APIError("never-return", status_code=400, raw_response={"error": {"code": 100}}),
+            "provider_request_rejected",
+        ),
+        (RuntimeError("never-return"), "transport_or_internal_error"),
+        (ValueError("never-return"), "native_response_invalid"),
+        (adapter.NativeOwnerMismatchError("never-return"), "owner_mismatch"),
+    ],
+)
+def test_fixed_receipt_diagnostic_reasons(error, reason):
+    failure = adapter._receipt_failure("post", error)
+    assert failure.reason == reason
+    assert "never-return" not in failure.model_dump_json()
+
+
+@pytest.mark.parametrize("value", [True, False, "190", -1, 2147483648, 1.5, None, {}, []])
+def test_receipt_provider_codes_are_strict_bounded_integers(value):
+    exc = APIError(
+        "never-return",
+        status_code=value,
+        raw_response={"error": {"code": value, "error_subcode": value, "message": "never-return"}},
+    )
+    failure = adapter._receipt_failure("post", exc)
+    assert failure.provider_http_status is None
+    assert failure.provider_code is None and failure.provider_subcode is None
+    assert "never-return" not in failure.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [[], "never-return", {"error": []}, {"error": "never-return"}, {"error": None}],
+)
+def test_malformed_provider_error_body_does_not_leak_or_break_diagnostics(raw):
+    failure = adapter._receipt_failure("post", APIError("never-return", status_code=400, raw_response=raw))
+    assert failure.reason == "provider_request_rejected"
+    assert failure.provider_code is None and failure.provider_subcode is None
+    assert "never-return" not in failure.model_dump_json()
+
+
+@pytest.mark.django_db
+def test_owner_mismatch_diagnostic_keeps_scope_boundary(setup, fb_post, monkeypatch):
+    provider = fake_provider(monkeypatch, {"id": "456"}, page_post(**{"from": {"id": "999"}}))
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == 502
+    assert response.json()["stage"] == "post"
+    assert response.json()["reason"] == "owner_mismatch"
+    assert provider._request.call_count == 2
+
+
+def test_diagnostic_schema_rejects_open_stages_and_reasons():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        adapter.NativeReceiptFailure(stage="never-return", reason="provider_permission")
+    with pytest.raises(ValidationError):
+        adapter.NativeReceiptFailure(stage="post", reason="never-return")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("fails", [True, False])
+def test_receipt_counts_usage_once_and_audits_only_failure(setup, fb_post, monkeypatch, fails):
+    from apps.api_keys.models import ApiKeyAuditLog
+
+    usage = Mock()
+    monkeypatch.setattr("apps.api.middleware.record_usage", usage)
+    if fails:
+        fake_provider(monkeypatch, {"id": "456"}, APIError("never-return", status_code=403))
+    else:
+        fake_provider(monkeypatch, {"id": "456"}, page_post(object_id=None))
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == (502 if fails else 200)
+    usage.assert_called_once()
+    assert usage.call_args.kwargs["status_code"] == response.status_code
+    assert usage.call_args.kwargs["action"] == "accounts.published_media"
+    rows = ApiKeyAuditLog.objects.filter(action="accounts.published_media")
+    assert rows.count() == (1 if fails else 0)
+    if fails:
+        assert rows.get().status_code == 502
