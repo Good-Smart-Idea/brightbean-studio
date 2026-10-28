@@ -639,3 +639,25 @@ def test_diagnostic_schema_rejects_open_stages_and_reasons():
         adapter.NativeReceiptFailure(stage="never-return", reason="provider_permission")
     with pytest.raises(ValidationError):
         adapter.NativeReceiptFailure(stage="post", reason="never-return")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("fails", [True, False])
+def test_receipt_counts_usage_once_and_audits_only_failure(setup, fb_post, monkeypatch, fails):
+    from apps.api_keys.models import ApiKeyAuditLog
+
+    usage = Mock()
+    monkeypatch.setattr("apps.api.middleware.record_usage", usage)
+    if fails:
+        fake_provider(monkeypatch, {"id": "456"}, APIError("never-return", status_code=403))
+    else:
+        fake_provider(monkeypatch, {"id": "456"}, page_post(object_id=None))
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == (502 if fails else 200)
+    usage.assert_called_once()
+    assert usage.call_args.kwargs["status_code"] == response.status_code
+    assert usage.call_args.kwargs["action"] == "accounts.published_media"
+    rows = ApiKeyAuditLog.objects.filter(action="accounts.published_media")
+    assert rows.count() == (1 if fails else 0)
+    if fails:
+        assert rows.get().status_code == 502

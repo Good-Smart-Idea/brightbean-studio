@@ -99,6 +99,7 @@ def published_media(request, account_id: uuid.UUID, platform_post_id: uuid.UUID)
     try:
         result = fetch_facebook_video(account, platform_post)
     except NativeReceiptLookupError as exc:
+        log_audit_entry(request, action="accounts.published_media", target_id=account.id, status_code=502)
         return 502, exc.diagnostic
     except Exception:
         raise HttpError(502, "Native video could not be verified. No post was changed or retried.") from None
