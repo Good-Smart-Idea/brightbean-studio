@@ -2265,7 +2265,7 @@ def tiktok_creator_info(request, workspace_id, account_id):
     # This endpoint enriches the composer panel; the real privacy/audit gate is
     # enforced at publish time. When the creator-info lookup can't run (no
     # token, expired token, TikTok API down), degrade to a 200 with empty
-    # options and let the panel fall back to its defaults, rather than logging
+    # options so the panel stays unavailable, rather than logging
     # a 5xx in the browser on every composer load.
     def _unavailable(reason):
         return JsonResponse(
@@ -2294,14 +2294,19 @@ def tiktok_creator_info(request, workspace_id, account_id):
     except Exception:
         return _unavailable("Failed to fetch creator info")
 
+    if not isinstance(info, dict) or any(
+        type(info.get(flag)) is not bool for flag in ("comment_disabled", "duet_disabled", "stitch_disabled")
+    ):
+        return _unavailable("Invalid creator interaction settings")
+
     return JsonResponse(
         {
             "available": True,
             "creator_nickname": info.get("creator_nickname", ""),
             "privacy_level_options": info.get("privacy_level_options") or [],
-            "comment_disabled": bool(info.get("comment_disabled")),
-            "duet_disabled": bool(info.get("duet_disabled")),
-            "stitch_disabled": bool(info.get("stitch_disabled")),
+            "comment_disabled": info["comment_disabled"],
+            "duet_disabled": info["duet_disabled"],
+            "stitch_disabled": info["stitch_disabled"],
             "max_video_post_duration_sec": info.get("max_video_post_duration_sec"),
         }
     )

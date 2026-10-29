@@ -984,6 +984,7 @@
                              tt: null,
                              ttLoading: false,
                              ttLoaded: false,
+                             ttError: '',
                              ttPrivacy: platformExtras[accId]?.privacy_level || '',
                              ttAllowComment: platformExtras[accId]?.disable_comment === false,
                              ttAllowDuet: platformExtras[accId]?.disable_duet === false,
@@ -992,13 +993,52 @@
                              ttBrandOrganic: !!platformExtras[accId]?.brand_organic_toggle,
                              ttBrandContent: !!platformExtras[accId]?.brand_content_toggle,
                              ttAigc: !!platformExtras[accId]?.is_aigc,
+                             get ttCreatorValid() {
+                                 const data = this.tt;
+                                 const opts = data?.privacy_level_options;
+                                 const known = ['PUBLIC_TO_EVERYONE', 'MUTUAL_FOLLOW_FRIENDS', 'FOLLOWER_OF_CREATOR', 'SELF_ONLY'];
+                                 return data?.available === true
+                                     && typeof data.creator_nickname === 'string' && data.creator_nickname.trim().length > 0
+                                     && Array.isArray(opts) && opts.length > 0
+                                     && opts.every(level => known.includes(level)) && new Set(opts).size === opts.length
+                                     && ['comment_disabled', 'duet_disabled', 'stitch_disabled'].every(key => typeof data[key] === 'boolean')
+                                     && Number.isInteger(data.max_video_post_duration_sec) && data.max_video_post_duration_sec > 0;
+                             },
+                             get ttReady() {
+                                 return this.ttLoaded && !this.ttLoading && this.ttCreatorValid;
+                             },
                              get ttOptions() {
-                                 const fromApi = this.tt?.privacy_level_options || [];
-                                 return fromApi.length ? fromApi : ['PUBLIC_TO_EVERYONE', 'MUTUAL_FOLLOW_FRIENDS', 'SELF_ONLY'];
+                                 return this.ttReady ? this.tt.privacy_level_options : [];
+                             },
+                             get ttPrivacyValid() {
+                                 return this.ttReady && this.ttOptions.includes(this.ttPrivacy)
+                                     && !(this.ttBrandContent && this.ttPrivacy === 'SELF_ONLY');
+                             },
+                             async loadTikTokCreatorInfo() {
+                                 if (this.ttLoading) return;
+                                 this.ttLoading = true;
+                                 this.ttError = '';
+                                 this.tt = null;
+                                 try {
+                                     const response = await fetch(`/workspace/{{ workspace.id }}/compose/tiktok-creator-info/${accId}/`);
+                                     if (!response.ok) throw new Error('Account settings unavailable');
+                                     this.tt = await response.json();
+                                     if (!this.ttCreatorValid) throw new Error('Account settings unavailable');
+                                     if (this.tt.comment_disabled) this.ttAllowComment = false;
+                                     if (this.tt.duet_disabled) this.ttAllowDuet = false;
+                                     if (this.tt.stitch_disabled) this.ttAllowStitch = false;
+                                     if (this.ttPrivacy && !this.tt.privacy_level_options.includes(this.ttPrivacy)) this.ttPrivacy = '';
+                                 } catch (_) {
+                                     this.tt = null;
+                                     this.ttError = 'Could not load your TikTok account settings. Retry before choosing who can view this post.';
+                                 } finally {
+                                     this.ttLoaded = true;
+                                     this.ttLoading = false;
+                                 }
                              },
                              get ttSelfOnlyLocked() {
                                  const opts = this.tt?.privacy_level_options || [];
-                                 return this.ttLoaded && opts.length === 1 && opts[0] === 'SELF_ONLY';
+                                 return this.ttReady && opts.length === 1 && opts[0] === 'SELF_ONLY';
                              },
                              ttLabel(level) {
                                  return ({
@@ -1025,25 +1065,8 @@
                          }"
                          x-init="enforceBrandingLock();
                                  $watch('ttBrandingBlocked', () => enforceBrandingLock())"
-                         x-effect="if (charLimits[accId]?.platform === 'tiktok' && !ttLoaded && !ttLoading) {
-                             ttLoading = true;
-                             fetch(`/workspace/{{ workspace.id }}/compose/tiktok-creator-info/${accId}/`)
-                                 .then(r => r.ok ? r.json() : null)
-                                 .then(data => {
-                                     if (data) {
-                                         tt = data;
-                                         if (data.comment_disabled) ttAllowComment = false;
-                                         if (data.duet_disabled) ttAllowDuet = false;
-                                         if (data.stitch_disabled) ttAllowStitch = false;
-                                         const opts = data.privacy_level_options || [];
-                                         if (!ttPrivacy && opts.length === 1 && opts[0] === 'SELF_ONLY') ttPrivacy = 'SELF_ONLY';
-                                         if (ttPrivacy && opts.length && !opts.includes(ttPrivacy)) ttPrivacy = '';
-                                     }
-                                     ttLoaded = true;
-                                 })
-                                 .catch(() => { ttLoaded = true; })
-                                 .finally(() => { ttLoading = false; });
-                         }"
+                         x-effect="tiktokSettingsReady[accId] = ttPrivacyValid;
+                                   if (charLimits[accId]?.platform === 'tiktok' && !ttLoaded && !ttLoading) loadTikTokCreatorInfo()"
                          class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
                         <div class="flex items-center gap-2">
                             <span class="platform-icon w-5 h-5 rounded-[5px] flex items-center justify-center"
@@ -1086,6 +1109,7 @@
                                  }">
                                 <button type="button"
                                         x-ref="trigger"
+                                    :disabled="!ttReady"
                                         @click="open ? (open = false) : openMenu()"
                                         @keydown.arrow-down.prevent="openMenu()"
                                         @keydown.arrow-up.prevent="openMenu()"
@@ -1112,9 +1136,9 @@
                                                     role="option"
                                                     tabindex="-1"
                                                     :aria-selected="ttPrivacy === lvl"
-                                                    :aria-disabled="ttBrandContent && lvl === 'SELF_ONLY'"
-                                                    :disabled="ttBrandContent && lvl === 'SELF_ONLY'"
-                                                    @click="ttPrivacy = lvl; open = false; $refs.trigger.focus()"
+                                                    :aria-disabled="!ttReady || (ttBrandContent && lvl === 'SELF_ONLY')"
+                                                    :disabled="!ttReady || (ttBrandContent && lvl === 'SELF_ONLY')"
+                                                    @click="if (ttReady && ttOptions.includes(lvl)) { ttPrivacy = lvl; open = false; $refs.trigger.focus(); }"
                                                     class="w-full text-left text-sm px-3 py-2 flex items-center justify-between gap-2 transition-colors"
                                                     :class="(ttBrandContent && lvl === 'SELF_ONLY') ? 'opacity-40 cursor-not-allowed' : 'hover:bg-stone-50 cursor-pointer'">
                                                 <span x-text="ttLabel(lvl)"></span>
@@ -1132,11 +1156,16 @@
                                 <!-- Mirror input carries the value to the form and enforces the
                                      required gate now that the native <select> is gone (same
                                      sr-only pattern as the disclosure gate further below). -->
-                                <input type="text" :name="'tiktok_privacy_level_' + accId" :value="ttPrivacy"
+                                <input type="text" :name="'tiktok_privacy_level_' + accId" :value="ttPrivacyValid ? ttPrivacy : ''"
                                        :required="charLimits[accId]?.platform === 'tiktok' && selectedAccounts.includes(accId)"
                                        tabindex="-1" aria-hidden="true" class="sr-only">
                             </div>
                             <p x-show="ttLoading" class="text-[11px] text-stone-400 mt-1">Loading account settings…</p>
+                            <div x-show="ttError" x-cloak role="alert" class="mt-1 space-y-1">
+                                <p x-text="ttError" class="text-[11px] text-red-600"></p>
+                                <button type="button" @click="loadTikTokCreatorInfo()" :disabled="ttLoading"
+                                        class="text-xs font-semibold text-orange-600 underline disabled:opacity-50">Retry account settings</button>
+                            </div>
                             <p x-show="ttSelfOnlyLocked" class="text-[11px] text-amber-600 mt-1">
                                 This TikTok app hasn't passed TikTok's content audit yet — only private posting ("Only you") is available until the audit is approved.
                             </p>
@@ -1180,22 +1209,28 @@
                         <div>
                             <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1.5">Allow users to:</label>
                             <div class="space-y-2">
-                                <label class="flex items-center gap-2" :class="tt?.comment_disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
+                                <label class="flex items-center gap-2" :class="(!ttReady || tt?.comment_disabled) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
                                     <input type="checkbox" :name="'tiktok_allow_comment_' + accId" value="true"
-                                           x-model="ttAllowComment" :disabled="!!tt?.comment_disabled"
+                                           x-model="ttAllowComment" :disabled="!ttReady || !!tt?.comment_disabled"
                                            class="bb-checkbox w-4 h-4 rounded border-stone-300">
+                                    <input type="hidden" :name="'tiktok_allow_comment_' + accId" value="true"
+                                           :disabled="ttReady || !ttAllowComment">
                                     <span class="text-sm text-stone-700">Comment</span>
                                 </label>
-                                <label class="flex items-center gap-2" :class="tt?.duet_disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
+                                <label class="flex items-center gap-2" :class="(!ttReady || tt?.duet_disabled) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
                                     <input type="checkbox" :name="'tiktok_allow_duet_' + accId" value="true"
-                                           x-model="ttAllowDuet" :disabled="!!tt?.duet_disabled"
+                                           x-model="ttAllowDuet" :disabled="!ttReady || !!tt?.duet_disabled"
                                            class="bb-checkbox w-4 h-4 rounded border-stone-300">
+                                    <input type="hidden" :name="'tiktok_allow_duet_' + accId" value="true"
+                                           :disabled="ttReady || !ttAllowDuet">
                                     <span class="text-sm text-stone-700">Duet</span>
                                 </label>
-                                <label class="flex items-center gap-2" :class="tt?.stitch_disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
+                                <label class="flex items-center gap-2" :class="(!ttReady || tt?.stitch_disabled) ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'">
                                     <input type="checkbox" :name="'tiktok_allow_stitch_' + accId" value="true"
-                                           x-model="ttAllowStitch" :disabled="!!tt?.stitch_disabled"
+                                           x-model="ttAllowStitch" :disabled="!ttReady || !!tt?.stitch_disabled"
                                            class="bb-checkbox w-4 h-4 rounded border-stone-300">
+                                    <input type="hidden" :name="'tiktok_allow_stitch_' + accId" value="true"
+                                           :disabled="ttReady || !ttAllowStitch">
                                     <span class="text-sm text-stone-700">Stitch</span>
                                 </label>
                             </div>
@@ -1546,8 +1581,8 @@
 
                 {% if show_submit_button %}
                 <button type="submit" name="action" value="submit_for_approval"
-                        :disabled="selectedAccounts.length === 0"
-                        :class="selectedAccounts.length === 0 && 'opacity-50 cursor-not-allowed'"
+                        :disabled="selectedAccounts.length === 0 || !tiktokReadyToSubmit"
+                        :class="(selectedAccounts.length === 0 || !tiktokReadyToSubmit) && 'opacity-50 cursor-not-allowed'"
                         class="inline-flex items-center gap-1.5 px-2 sm:px-4 py-2 text-sm font-semibold text-orange-600 hover:text-orange-700 rounded-lg hover:bg-orange-50 transition-all duration-150 cursor-pointer flex-shrink-0">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                     <span class="hidden sm:inline">Submit for Approval</span>
@@ -1557,8 +1592,8 @@
 
                 {% if show_resubmit_button %}
                 <button type="submit" name="action" value="resubmit_for_approval"
-                        :disabled="selectedAccounts.length === 0"
-                        :class="selectedAccounts.length === 0 && 'opacity-50 cursor-not-allowed'"
+                        :disabled="selectedAccounts.length === 0 || !tiktokReadyToSubmit"
+                        :class="(selectedAccounts.length === 0 || !tiktokReadyToSubmit) && 'opacity-50 cursor-not-allowed'"
                         class="inline-flex items-center gap-1.5 px-2 sm:px-4 py-2 text-sm font-semibold text-orange-600 hover:text-orange-700 rounded-lg hover:bg-orange-50 transition-all duration-150 cursor-pointer flex-shrink-0">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"/></svg>
                     <span class="hidden sm:inline">Resubmit</span>
@@ -1570,8 +1605,8 @@
                 <div class="relative inline-flex flex-shrink-0" id="publish-anchor">
                     <!-- Mode selector (left) -->
                     <button type="button" id="publish-mode-btn"
-                            :disabled="selectedAccounts.length === 0"
-                            :class="selectedAccounts.length === 0 && 'opacity-50 cursor-not-allowed'"
+                            :disabled="selectedAccounts.length === 0 || !tiktokReadyToSubmit"
+                            :class="(selectedAccounts.length === 0 || !tiktokReadyToSubmit) && 'opacity-50 cursor-not-allowed'"
                             class="inline-flex items-center gap-1.5 pl-2 sm:pl-3 pr-1.5 sm:pr-2 py-2 text-sm font-semibold text-orange-700 bg-orange-100 rounded-l-lg hover:bg-orange-200 border border-orange-200 border-r-0 transition-all duration-150 cursor-pointer">
                         <svg id="publish-mode-icon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                         <span id="publish-mode-label" class="hidden sm:inline">Next available</span>
@@ -1579,8 +1614,8 @@
                     </button>
                     <!-- Action button (right) -->
                     <button type="submit" id="publish-action-btn" name="action" value="add_to_queue"
-                            :disabled="selectedAccounts.length === 0"
-                            :class="selectedAccounts.length === 0 && 'opacity-50 cursor-not-allowed'"
+                            :disabled="selectedAccounts.length === 0 || !tiktokReadyToSubmit"
+                            :class="(selectedAccounts.length === 0 || !tiktokReadyToSubmit) && 'opacity-50 cursor-not-allowed'"
                             class="inline-flex items-center gap-1.5 pl-3 sm:pl-4 pr-3 sm:pr-5 py-2 text-sm font-semibold text-white bg-orange-500 rounded-r-lg hover:bg-orange-600 border border-orange-500 hover:border-orange-600 shadow-sm transition-all duration-150 cursor-pointer">
                         <span id="publish-action-label">Add to Queue</span>
                     </button>
@@ -2187,6 +2222,11 @@ function composerApp() {
         overrides: {},
         advancedOpen: {},
         platformExtras: JSON.parse(document.getElementById('composer-platform-extras').textContent) || {},
+        tiktokSettingsReady: {},
+        get tiktokReadyToSubmit() {
+            return this.selectedAccounts.every(id => this.charLimits[id]?.platform !== 'tiktok'
+                || this.tiktokSettingsReady[id] === true);
+        },
         showMediaPicker: false,
         showAiPanel: false,
         showThumbnailPicker: false,
