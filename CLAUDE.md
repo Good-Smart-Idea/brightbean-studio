@@ -5,3 +5,5 @@
 Open only the doc your task needs. Don't claim "no access" before checking START-HERE §1.
 
 **This repo:** BrightBean Studio — self-hosted social media management platform (execution plane for GSI growth) · Plane project: none
+
+**GSI social ops rules** (not code): templates map and Publer cross-post rule live in mcp-servers `docs/reference/gsi-brightbean-post-templates.md` and `docs/reference/gsi-publer-crosspost.md`. Template source: `apps/composer/builtin_templates.py`.
