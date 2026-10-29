@@ -33,7 +33,6 @@ AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
 TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 API_BASE = "https://open.tiktokapis.com/v2"
 
-DEFAULT_PRIVACY_LEVEL = "PUBLIC_TO_EVERYONE"
 VALID_PRIVACY_LEVELS = frozenset(
     {
         "PUBLIC_TO_EVERYONE",
@@ -294,7 +293,13 @@ class TikTokProvider(SocialProvider):
             access_token=access_token,
             json={},
         )
-        return resp.json().get("data", {}) or {}
+        body = resp.json()
+        if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+            raise ValueError("Unknown TikTok creator response")
+        error = body.get("error")
+        if error is not None and (not isinstance(error, dict) or error.get("code") != "ok"):
+            raise ValueError("TikTok creator query was not successful")
+        return body["data"]
 
     def publish_post(self, access_token: str, content: PublishContent) -> PublishResult:
         if content.post_type != PostType.VIDEO:
@@ -304,11 +309,10 @@ class TikTokProvider(SocialProvider):
                 retryable=False,
             )
 
-        privacy_level_is_explicit = "privacy_level" in content.extra
-        privacy_level = content.extra.get("privacy_level", DEFAULT_PRIVACY_LEVEL)
-        if privacy_level not in VALID_PRIVACY_LEVELS:
+        privacy_level = content.extra.get("privacy_level")
+        if not isinstance(privacy_level, str) or privacy_level not in VALID_PRIVACY_LEVELS:
             raise PublishError(
-                f"Invalid privacy_level '{privacy_level}'. Must be one of {sorted(VALID_PRIVACY_LEVELS)}",
+                "Choose an explicit valid TikTok privacy level before publishing.",
                 platform=self.platform_name,
                 retryable=False,
             )
@@ -317,7 +321,6 @@ class TikTokProvider(SocialProvider):
             access_token,
             privacy_level,
             content,
-            privacy_level_is_explicit=privacy_level_is_explicit,
         )
 
         # Prefer FILE_UPLOAD: PULL_FROM_URL requires the source domain to be
@@ -337,38 +340,37 @@ class TikTokProvider(SocialProvider):
         access_token: str,
         privacy_level: str,
         content: PublishContent,
-        *,
-        privacy_level_is_explicit: bool,
     ) -> str:
         """Validate privacy level and video duration against creator_info.
 
-        A creator_info failure is logged and ignored — a transient outage of
-        that endpoint must not block publishing; the video init call surfaces
-        any real error and :meth:`_raise_classified_publish_error` handles it.
+        Publishing requires current, well-formed creator privacy options.
+        A failed or unknown result must stop before video init or upload.
         """
         try:
             info = self.query_creator_info(access_token)
         except Exception:
-            logger.warning("TikTok creator_info query failed; proceeding with publish", exc_info=True)
-            return privacy_level
+            raise PublishError(
+                "TikTok creator information is unavailable. Review it before publishing.",
+                platform=self.platform_name,
+                retryable=False,
+            ) from None
 
-        options = info.get("privacy_level_options") or []
-        if options and privacy_level not in options:
-            if not privacy_level_is_explicit and options == ["SELF_ONLY"]:
-                privacy_level = "SELF_ONLY"
-            else:
-                message = (
-                    f"TikTok does not allow privacy level '{privacy_level}' for this "
-                    f"account (allowed: {', '.join(options)})."
-                )
-                if options == ["SELF_ONLY"]:
-                    message = f"{message} {UNAUDITED_CLIENT_HINT}"
-                raise PublishError(
-                    message,
-                    platform=self.platform_name,
-                    raw_response=info,
-                    retryable=False,
-                )
+        options = info.get("privacy_level_options") if isinstance(info, dict) else None
+        if (
+            not isinstance(options, list)
+            or not options
+            or any(not isinstance(option, str) or option not in VALID_PRIVACY_LEVELS for option in options)
+        ):
+            raise PublishError(
+                "TikTok returned unknown privacy options. Review them before publishing.",
+                platform=self.platform_name,
+                retryable=False,
+            )
+        if privacy_level not in options:
+            message = f"TikTok does not allow privacy level '{privacy_level}' for this account."
+            if options == ["SELF_ONLY"]:
+                message = f"{message} {UNAUDITED_CLIENT_HINT}"
+            raise PublishError(message, platform=self.platform_name, retryable=False)
 
         # TikTok's UX guidelines require checking the video against the
         # creator's max post duration before uploading. Skip silently when

@@ -361,6 +361,7 @@ VIDEO_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
 
 
 def _video_content(**extra) -> PublishContent:
+    extra.setdefault("privacy_level", "PUBLIC_TO_EVERYONE")
     return PublishContent(
         text="Hello TikTok",
         media_urls=["https://cdn.example.com/video.mp4"],
@@ -420,18 +421,15 @@ class TestPublishPost:
         assert VIDEO_INIT_URL not in urls
 
     @patch.object(TikTokProvider, "_request")
-    def test_unaudited_options_use_self_only_for_implicit_default(self, mock_request):
-        mock_request.side_effect = [
-            _creator_info_response(["SELF_ONLY"]),
-            _init_response(),
-        ]
-
-        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        result = provider.publish_post("tok", _video_content())
-
-        assert result.platform_post_id == "v_pub_url~123"
-        init_call = mock_request.call_args_list[1]
-        assert init_call.kwargs["json"]["post_info"]["privacy_level"] == "SELF_ONLY"
+    @pytest.mark.parametrize("privacy", [None, "", "BOGUS", [], {}])
+    def test_missing_or_invalid_explicit_privacy_stops_before_any_request(self, mock_request, privacy):
+        content = _video_content(privacy_level=privacy)
+        if privacy is None:
+            content.extra.clear()
+        with pytest.raises(PublishError) as exc:
+            TikTokProvider({}).publish_post("tok", content)
+        assert exc.value.retryable is False
+        mock_request.assert_not_called()
 
     @patch.object(TikTokProvider, "_request")
     def test_self_only_post_allowed_when_unaudited(self, mock_request):
@@ -489,18 +487,41 @@ class TestPublishPost:
         assert result.platform_post_id == "v_pub_url~123"
 
     @patch.object(TikTokProvider, "_request")
-    def test_creator_info_failure_does_not_block_publish(self, mock_request):
-        mock_request.side_effect = [
-            APIError("creator_info down", platform="TikTok", status_code=500),
-            _init_response(),
-        ]
+    def test_creator_info_failure_blocks_init_without_leaking_error(self, mock_request):
+        mock_request.side_effect = APIError("never-return", platform="TikTok", status_code=500)
+        with pytest.raises(PublishError) as exc:
+            TikTokProvider({}).publish_post("tok", _video_content())
+        assert exc.value.retryable is False
+        assert "never-return" not in str(exc.value)
+        assert [call.args[1] for call in mock_request.call_args_list] == [CREATOR_INFO_URL]
 
-        provider = TikTokProvider({"client_key": "k", "client_secret": "s"})
-        result = provider.publish_post("tok", _video_content())
+    @patch.object(TikTokProvider, "_request")
+    @pytest.mark.parametrize("options", [None, [], "PUBLIC_TO_EVERYONE", ["FUTURE_UNKNOWN"], [None], [["SELF_ONLY"]]])
+    def test_unknown_creator_privacy_options_never_initialize(self, mock_request, options):
+        mock_request.return_value = _make_response({"data": {"privacy_level_options": options}})
+        with pytest.raises(PublishError) as exc:
+            TikTokProvider({}).publish_post("tok", _video_content())
+        assert exc.value.retryable is False
+        assert mock_request.call_count == 1
+        assert mock_request.call_args.args[1] == CREATOR_INFO_URL
 
-        assert result.platform_post_id == "v_pub_url~123"
-        urls = [call.args[1] for call in mock_request.call_args_list]
-        assert urls == [CREATOR_INFO_URL, VIDEO_INIT_URL]
+    @patch.object(TikTokProvider, "_request")
+    @pytest.mark.parametrize(
+        "body",
+        [
+            None,
+            [],
+            {},
+            {"data": None},
+            {"data": {"privacy_level_options": ["PUBLIC_TO_EVERYONE"]}, "error": {"code": "denied"}},
+        ],
+    )
+    def test_failed_or_malformed_creator_response_never_initializes(self, mock_request, body):
+        mock_request.return_value = _make_response(body)
+        with pytest.raises(PublishError) as exc:
+            TikTokProvider({}).publish_post("tok", _video_content())
+        assert exc.value.retryable is False
+        assert mock_request.call_count == 1
 
     @patch.object(TikTokProvider, "_request")
     def test_init_unaudited_error_becomes_non_retryable(self, mock_request):
@@ -675,7 +696,9 @@ class TestFileUploadStreaming:
 
         TikTokProvider({}).publish_post(
             "tok",
-            PublishContent(text="hi", post_type=PostType.VIDEO, media_files=[str(video)]),
+            PublishContent(
+                text="hi", post_type=PostType.VIDEO, media_files=[str(video)], extra={"privacy_level": "SELF_ONLY"}
+            ),
         )
 
         put_call = [c for c in mock_request.call_args_list if c.args[0] == "PUT"][0]
@@ -696,7 +719,9 @@ class TestFileUploadStreaming:
         ):
             TikTokProvider({}).publish_post(
                 "tok",
-                PublishContent(text="hi", post_type=PostType.VIDEO, media_files=[str(video)]),
+                PublishContent(
+                    text="hi", post_type=PostType.VIDEO, media_files=[str(video)], extra={"privacy_level": "SELF_ONLY"}
+                ),
             )
 
         assert exc.value.retryable is False
