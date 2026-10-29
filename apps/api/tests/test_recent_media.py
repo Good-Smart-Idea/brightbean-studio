@@ -661,3 +661,32 @@ def test_receipt_counts_usage_once_and_audits_only_failure(setup, fb_post, monke
     assert rows.count() == (1 if fails else 0)
     if fails:
         assert rows.get().status_code == 502
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("owner,video_id,expected", [("456", "987", 200), ("999", "987", 502), ("456", "654", 502)])
+def test_deprecated_post_probe_requires_exact_owner_verified_video(
+    setup, fb_post, monkeypatch, owner, video_id, expected
+):
+    error = APIError("never-return", status_code=400, raw_response={"error": {"code": 12, "message": "never-return"}})
+    provider = fake_provider(monkeypatch, {"id": "456"}, error, video_node(id=video_id, **{"from": {"id": owner}}))
+    before = (fb_post.status, fb_post.platform_post_id, fb_post.published_at)
+    response = get(setup, setup.fb, f"published-media/{fb_post.id}")
+    assert response.status_code == expected
+    assert provider._request.call_count == 3
+    assert provider._request.call_args_list[2].args[1].endswith("/987")
+    assert all(call.args[0] == "GET" for call in provider._request.call_args_list)
+    assert "never-return" not in response.content.decode()
+    if expected == 200:
+        body = response.json()
+        assert body["receipt_node_type"] == "video" and body["video_id"] == "987"
+        assert body["owner_id"] == "456" and body["public_visibility_verified"] is False
+        assert body["post_is_published"] is None
+    fb_post.refresh_from_db()
+    assert (fb_post.status, fb_post.platform_post_id, fb_post.published_at) == before
+
+
+@pytest.mark.parametrize("status,code", [(401, 12), (403, 12), (429, 12), (500, 12), (400, "12"), (400, 12.0)])
+def test_deprecated_post_probe_only_accepts_typed_code12_http400(status, code):
+    error = APIError("never-return", status_code=status, raw_response={"error": {"code": code}})
+    assert adapter._post_type_probe_allowed(error) is False
