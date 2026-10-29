@@ -28,6 +28,7 @@ def test_publish_multi_photo_post_stages_photos_then_publishes_feed_post():
             MagicMock(json=MagicMock(return_value={"id": "photo-1"})),
             MagicMock(json=MagicMock(return_value={"id": "photo-2"})),
             MagicMock(json=MagicMock(return_value={"id": "page-1_post-1"})),
+            MagicMock(json=MagicMock(return_value={})),
         ]
     )
 
@@ -42,7 +43,8 @@ def test_publish_multi_photo_post_stages_photos_then_publishes_feed_post():
     )
 
     assert result.platform_post_id == "post-1"
-    assert result.url == "https://www.facebook.com/page-1_post-1"
+    assert result.url == "https://www.facebook.com/post-1"
+    assert result.extra["permalink_url"] == "https://www.facebook.com/post-1"
     assert result.extra["photo_ids"] == ["photo-1", "photo-2"]
     provider._request.assert_has_calls(
         [
@@ -67,8 +69,76 @@ def test_publish_multi_photo_post_stages_photos_then_publishes_feed_post():
                     "message": "Caption for the album",
                 },
             ),
+            call(
+                "GET",
+                "https://graph.facebook.com/v25.0/post-1",
+                access_token="page-token",
+                params={"fields": "permalink_url"},
+            ),
         ]
     )
+
+
+FEED_POST_ID = "1729688269156252"
+FEED_FALLBACK_URL = f"https://www.facebook.com/{FEED_POST_ID}"
+
+
+def _publish_text(lookup):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(side_effect=[_resp({"id": f"111_{FEED_POST_ID}"}), lookup])
+    result = provider.publish_post(
+        "page-token",
+        PublishContent(text="hello", post_type=PostType.TEXT, extra={"page_id": "111"}),
+    )
+    return provider, result
+
+
+def test_publish_text_stores_permalink_url_when_graph_returns_one():
+    provider, result = _publish_text(
+        _resp({"permalink_url": "https://www.facebook.com/111/posts/1729688269156252?access_token=secret"})
+    )
+
+    assert result.platform_post_id == FEED_POST_ID
+    assert result.url == "https://www.facebook.com/111/posts/1729688269156252"
+    assert result.extra["permalink_url"] == result.url
+    assert "access_token" not in result.url
+    provider._request.assert_has_calls(
+        [
+            call(
+                "POST",
+                "https://graph.facebook.com/v25.0/111/feed",
+                access_token="page-token",
+                json={"message": "hello"},
+            ),
+            call(
+                "GET",
+                f"https://graph.facebook.com/v25.0/{FEED_POST_ID}",
+                access_token="page-token",
+                params={"fields": "permalink_url"},
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        _resp({}),
+        _resp({"permalink_url": ""}),
+        _resp({"permalink_url": None}),
+        _resp({"permalink_url": "   "}),
+        _resp({"permalink_url": "https://evil.invalid/1729688269156252"}),
+        _resp(["not-an-object"]),
+        APIError("permalink unavailable", platform="Facebook"),
+        MagicMock(json=MagicMock(side_effect=ValueError("not JSON"))),
+    ],
+)
+def test_publish_text_falls_back_when_permalink_missing_or_errors(lookup):
+    _provider, result = _publish_text(lookup)
+
+    assert result.platform_post_id == FEED_POST_ID
+    assert result.url == FEED_FALLBACK_URL
+    assert result.extra["permalink_url"] == FEED_FALLBACK_URL
 
 
 def test_publish_multi_photo_post_requires_staged_photo_ids():
