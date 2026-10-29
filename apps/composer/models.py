@@ -540,7 +540,7 @@ class PlatformPost(models.Model):
 
     @property
     def native_post_url(self):
-        """Only an internally audited confirmation can supply a native link."""
+        """Native link from an audited confirmation, or a recorded Facebook feed permalink."""
         from providers.meta_confirmation import permalink
 
         account = self.social_account
@@ -565,7 +565,10 @@ class PlatformPost(models.Model):
             ):
                 continue
             return permalink(proof.get("permalink"), facebook=account.platform == "facebook")
-        return ""
+        if account.platform != "facebook":
+            return ""
+        extra = self.platform_extra if isinstance(self.platform_extra, dict) else {}
+        return permalink(extra.get("permalink_url"), facebook=True)
 
     @property
     def is_reschedulable(self):

@@ -130,6 +130,9 @@ def test_acceptance_does_not_mark_published(receipt_case):
 @pytest.mark.django_db
 def test_processing_then_ready_survives_new_engine_without_resend(receipt_case):
     case = receipt_case
+    # A feed permalink recorded on the row must not outrank audited confirmation.
+    case.child.platform_extra = {"post_type": "reel", "permalink_url": "https://www.facebook.com/999"}
+    case.child.save(update_fields=["platform_extra"])
     case.provider._request = MagicMock(
         side_effect=[
             httpx.Response(200, json=native_row(status={"video_status": "processing"})),
@@ -222,6 +225,27 @@ def test_legacy_status_is_not_reconciled_or_promoted(receipt_case, state):
     assert case.child.status == state
     assert case.child.native_post_url == ""
     case.provider._request.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "stored,expected",
+    [
+        ("https://www.facebook.com/111/posts/555", "https://www.facebook.com/111/posts/555"),
+        ("https://www.facebook.com/1729688269156252", "https://www.facebook.com/1729688269156252"),
+        ("/111/posts/555", "https://www.facebook.com/111/posts/555"),
+        ("https://evil.invalid/555", ""),
+        ("", ""),
+    ],
+)
+def test_published_facebook_feed_permalink_is_native_post_url(receipt_case, stored, expected):
+    case = receipt_case
+    PlatformPost.objects.filter(pk=case.child.pk).update(
+        status="published",
+        platform_extra={"permalink_url": stored},
+    )
+    case.child.refresh_from_db()
+    assert case.child.native_post_url == expected
 
 
 @pytest.mark.django_db(transaction=True)

@@ -11,7 +11,7 @@ from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
-from .meta_confirmation import facebook_photo_status, facebook_story_id, facebook_video_status, native_id
+from .meta_confirmation import facebook_photo_status, facebook_story_id, facebook_video_status, native_id, permalink
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import (
     build_send_payload,
@@ -334,10 +334,16 @@ class FacebookProvider(SocialProvider):
         )
         data = resp.json()
         post_id = self._stored_post_id(data["id"])
+        # The feed call already succeeded. A permalink read must not raise, or the
+        # engine would retry and publish the post again.
+        url = self._published_post_url(access_token, post_id)
         return PublishResult(
             platform_post_id=post_id,
-            url=f"https://www.facebook.com/{data['id']}",
-            extra=data,
+            url=url,
+            # permalink_url is a recorded result. The engine merges ``extra`` into
+            # PlatformPost.platform_extra; publish reads only page_id from that
+            # dict, and the receipt binding ignores permalink_url.
+            extra={**data, "permalink_url": url},
         )
 
     def _publish_photo(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
@@ -466,10 +472,12 @@ class FacebookProvider(SocialProvider):
             self._delete_staged_photos(access_token, photo_ids)
             raise
 
+        post_id = self._stored_post_id(graph_post_id)
+        url = self._published_post_url(access_token, post_id)
         return PublishResult(
-            platform_post_id=self._stored_post_id(graph_post_id),
-            url=f"https://www.facebook.com/{graph_post_id}",
-            extra={**data, "photo_ids": photo_ids},
+            platform_post_id=post_id,
+            url=url,
+            extra={**data, "photo_ids": photo_ids, "permalink_url": url},
         )
 
     def _delete_staged_photos(self, access_token: str, photo_ids: list[str]) -> None:
@@ -873,6 +881,32 @@ class FacebookProvider(SocialProvider):
                     # identically, so don't issue a second doomed request.
                     break
         return {}
+
+    def _published_post_url(self, access_token: str, post_id: str) -> str:
+        """Permalink for a post that has already published.
+
+        ``GET /{post_id}?fields=permalink_url`` often returns no permalink_url.
+        ``https://www.facebook.com/{post_id}`` still resolves. Nothing here may
+        raise: the post is already live, and a propagating error would make the
+        engine retry and double-post.
+        """
+        fallback = f"https://www.facebook.com/{post_id}"
+        if not post_id:
+            return fallback
+        try:
+            payload = self._request(
+                "GET",
+                f"{BASE_URL}/{post_id}",
+                access_token=access_token,
+                params={"fields": "permalink_url"},
+            ).json()
+        except Exception as exc:
+            logger.debug("Facebook post %s permalink_url unavailable: %s", post_id, exc)
+            return fallback
+        link = payload.get("permalink_url") if isinstance(payload, dict) else None
+        if not isinstance(link, str):
+            return fallback
+        return permalink(link.strip(), facebook=True) or fallback
 
     @staticmethod
     def _stored_post_id(graph_post_id: str) -> str:
