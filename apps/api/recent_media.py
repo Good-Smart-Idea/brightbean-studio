@@ -338,7 +338,15 @@ def _post_type_probe_allowed(exc):
         return False
     if exc.status_code == 404:
         return True
-    if exc.status_code != 400 or error.get("code") != 100:
+    if exc.status_code != 400:
+        return False
+    # A deprecated composite-Post request (code 12) is not proof that the
+    # stored receipt is missing. Permit the same single Video read, whose
+    # exact ID and Page owner must still be independently verified.
+    code = error.get("code")
+    if type(code) is int and code == 12:
+        return True
+    if code != 100:
         return False
     message = str(error.get("message", "")).lower()
     return any(
