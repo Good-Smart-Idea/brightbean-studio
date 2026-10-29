@@ -1,16 +1,21 @@
 """Crash-window and immutable-byte regressions for the actual publisher seam."""
 
 import json
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from django.core.files.base import ContentFile
+from django.utils import timezone
 
-from apps.composer.models import PlatformPost, Post
+from apps.composer.models import PlatformPost, Post, PostMedia
+from apps.media_library.models import MediaAsset
 from apps.publisher import meta_receipts
 from apps.publisher.engine import PublishEngine
 from apps.publisher.models import PublishLog
 from providers.exceptions import PublishError
+from providers.instagram import InstagramProvider
 from providers.types import PublishResult, PublishState, PublishStatus
 
 from .test_meta_confirmation import native_row, sweep
@@ -348,3 +353,93 @@ def test_prewrite_target_is_only_the_canonical_account(receipt_case, platform, r
                 PublishEngine()._dispatch_to_provider(case.child, media_cache=cache)
             provider.publish_post.assert_not_called()
             assert not case.child.publish_logs.exists()
+
+
+def _hosted_ig_visual(case, content_type):
+    """IG image or carousel accepted with an empty manifest, then aged past 6h."""
+    reset(case)
+    case.account.platform = "instagram"
+    case.account.save()
+    case.child.social_account = case.account
+    case.child.platform_extra = {"post_type": content_type}
+    case.child.save(update_fields=["platform_extra"])
+    case.post.media_attachments.all().delete()
+    count = 1 if content_type == "image" else 2
+    for position in range(count):
+        asset = MediaAsset.objects.create(
+            workspace=case.workspace,
+            organization=case.org,
+            file=ContentFile(b"jpeg-hosted-bytes", name=f"photo-{position}.jpg"),
+            filename=f"photo-{position}.jpg",
+            media_type="image",
+            processing_status="completed",
+        )
+        PostMedia.objects.create(post=case.post, media_asset=asset, position=position)
+    case.child.refresh_from_db()
+    case.child.social_account = case.account
+    manifest = []
+    digest = meta_receipts.binding(case.child, grant_kind="account", content_type=content_type, manifest=manifest)
+    context = meta_receipts.begin(
+        case.child,
+        expected_binding=digest,
+        grant_kind="account",
+        content_type=content_type,
+        manifest=manifest,
+        native_resume=False,
+    )
+    assert context["marker"]["media_bytes_verified"] is False
+    assert context["marker"]["manifest"] == []
+    assert context["marker"]["content_type"] == content_type
+    meta_receipts.accept(
+        case.child,
+        {"meta_attempt": context, "platform_post_id": "555", "status_code": 200},
+        duration_ms=1,
+    )
+    case.child.refresh_from_db()
+    assert case.child.status == "publishing"
+    assert case.child.platform_post_id == "555"
+    # Past the 6h unconfirmed budget and the shorter confirm timeout.
+    PlatformPost.objects.filter(pk=case.child.pk).update(updated_at=timezone.now() - timedelta(hours=7))
+    provider = InstagramProvider({"ig_user_id": case.account.account_platform_id})
+    provider.publish_post = MagicMock(side_effect=AssertionError("confirmation must never send a post"))
+    provider._request = MagicMock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "555",
+                "owner": {"id": case.account.account_platform_id},
+                "media_type": "IMAGE" if content_type == "image" else "CAROUSEL_ALBUM",
+                "permalink": "https://www.instagram.com/p/validShortcode/",
+            },
+        )
+    )
+    case.provider = provider
+    return provider
+
+
+def _assert_hosted_ig_confirmed(case, provider):
+    assert sweep(case) == 1
+    assert case.child.status == "published"
+    assert case.child.published_at is not None
+    assert case.child.publish_error == ""
+    assert case.child.publish_logs.filter(response_body__contains="native_publish_confirmation").count() == 1
+    assert case.child.native_post_url == "https://www.instagram.com/p/validShortcode/"
+    provider.publish_post.assert_not_called()
+    assert all(call.args[0] == "GET" for call in provider._request.call_args_list)
+    provider._request.assert_called()
+
+
+@pytest.mark.django_db
+def test_ig_hosted_image_with_unverified_bytes_confirms_past_six_hours(receipt_case):
+    case = receipt_case
+    provider = _hosted_ig_visual(case, "image")
+    assert case.post.media_attachments.count() == 1
+    _assert_hosted_ig_confirmed(case, provider)
+
+
+@pytest.mark.django_db
+def test_ig_hosted_carousel_with_unverified_bytes_confirms_past_six_hours(receipt_case):
+    case = receipt_case
+    provider = _hosted_ig_visual(case, "carousel")
+    assert case.post.media_attachments.count() == 2
+    _assert_hosted_ig_confirmed(case, provider)

@@ -393,6 +393,24 @@ def _platform_executor(shared, group_size):
         yield own
 
 
+def _ig_hosted_visual_has_live_receipt(accepted, platform_post) -> bool:
+    """Hosted Instagram image and carousel posts have no local byte manifest.
+
+    Meta fetches those assets by URL, so the accepted receipt records
+    ``media_bytes_verified`` false. A live receipt or the recorded media id is
+    still enough for the confirm sweep to ask Graph. Every other Meta row,
+    including one with no receipt, keeps the byte-identity gate.
+    """
+    if not isinstance(accepted, dict) or accepted.get("media_bytes_verified") is not False:
+        return False
+    account = getattr(platform_post, "social_account", None)
+    if getattr(account, "platform", None) != "instagram" or accepted.get("platform") != "instagram":
+        return False
+    if accepted.get("content_type") not in {"image", "carousel"}:
+        return False
+    return bool(accepted.get("receipt_id") or getattr(platform_post, "platform_post_id", ""))
+
+
 class PublishEngine:
     """Orchestrates the publishing of scheduled posts."""
 
@@ -1459,10 +1477,16 @@ class PublishEngine:
                         )
                         return True
                     return False
-                if not accepted.get("media_bytes_verified") or not meta_receipts.verify_media(
-                    platform_post,
-                    accepted.get("manifest"),
-                    facebook_photo=accepted.get("platform") == "facebook" and accepted.get("content_type") == "image",
+                # Hosted IG image/carousel receipts are valid without a byte
+                # manifest. Ask Meta instead of waiting out the 6h budget.
+                if not _ig_hosted_visual_has_live_receipt(accepted, platform_post) and (
+                    not accepted.get("media_bytes_verified")
+                    or not meta_receipts.verify_media(
+                        platform_post,
+                        accepted.get("manifest"),
+                        facebook_photo=accepted.get("platform") == "facebook"
+                        and accepted.get("content_type") == "image",
+                    )
                 ):
                     if platform_post.updated_at < unconfirmed_before:
                         self._give_up_unconfirmed(platform_post, "Meta media byte identity is unavailable or changed.")
@@ -1607,13 +1631,17 @@ class PublishEngine:
         from django.db import transaction
 
         expected_handle = expected_handle or platform_post.platform_post_id
-        if expected_binding is not None and (
-            not accepted_attempt
-            or not meta_receipts.verify_media(
-                platform_post,
-                accepted_attempt.get("manifest"),
-                facebook_photo=accepted_attempt.get("platform") == "facebook"
-                and accepted_attempt.get("content_type") == "image",
+        if (
+            expected_binding is not None
+            and not _ig_hosted_visual_has_live_receipt(accepted_attempt, platform_post)
+            and (
+                not accepted_attempt
+                or not meta_receipts.verify_media(
+                    platform_post,
+                    accepted_attempt.get("manifest"),
+                    facebook_photo=accepted_attempt.get("platform") == "facebook"
+                    and accepted_attempt.get("content_type") == "image",
+                )
             )
         ):
             return False
